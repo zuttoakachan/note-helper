@@ -1,5 +1,5 @@
 const ARTICLE = "n39663ca41eb0";
-function reply(body, html = false, status = 200) { return new Response(body, { status, headers: { "Content-Type": html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff" } }); }
+function reply(body, html = false, status = 200) { return new Response(body, { status, headers: { "Content-Type": html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "same-origin", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff" } }); }
 export default { async fetch(request, env) { const url = new URL(request.url);
 if (url.pathname === "/" && request.method === "GET") {
 return reply(
