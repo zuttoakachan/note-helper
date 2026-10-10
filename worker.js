@@ -1,51 +1,55 @@
 export default {
-  async fetch(request) {
-    if (new URL(request.url).pathname !== "/") {
-      return new Response("Not found", { status: 404 });
-    }
-
-    const lines = ["記事取得テスト v2"];
+  async fetch() {
+    const lines = ["記事取得テスト v3"];
     try {
-      const response = await fetch(
+      const res = await fetch(
         "https://note.com/tag/" + encodeURIComponent("小説"),
-        {
-          redirect: "manual",
-          signal: AbortSignal.timeout(15000)
-        }
+        { signal: AbortSignal.timeout(15000) }
       );
+      lines.push("応答コード: " + res.status);
 
-      lines.push("応答コード: " + response.status);
-      const articles = new Set();
-      let title = "";
+      const links = new Set();
+      const samples = new Set();
 
       const parsed = new HTMLRewriter()
-        .on("title", {
-          text(chunk) {
-            title = (title + chunk.text).slice(0, 200);
-          }
-        })
-        .on("a[href]", {
-          element(element) {
-            const href = element.getAttribute("href");
-            try {
-              const url = new URL(href, "https://note.com");
-              if (
-                url.origin === "https://note.com" &&
-                /^\/[^/]+\/n\/n[a-f0-9]+$/.test(url.pathname)
-              ) {
-                articles.add(url.origin + url.pathname);
+        .on("*", {
+          element(el) {
+            for (const [name, value] of el.attributes) {
+              if (!value.includes("/n/")) continue;
+
+              if (samples.size < 5) {
+                samples.add(
+                  name + ": " + value.slice(0, 200)
+                );
               }
-            } catch {}
+
+              try {
+                const url = new URL(value, "https://note.com");
+                if (
+                  url.origin === "https://note.com" &&
+                  /^\/[^/]+\/n\/n[a-f0-9]+\/?$/.test(url.pathname)
+                ) {
+                  links.add(url.origin + url.pathname);
+                }
+              } catch {}
+            }
           }
         })
-        .transform(response);
+        .transform(res);
 
       await parsed.text();
-      lines.push("ページ名: " + title);
-      lines.push("記事リンク数: " + articles.size);
-      lines.push(...Array.from(articles).slice(0, 5));
+      lines.push("記事リンク数: " + links.size);
+      lines.push(...Array.from(links).slice(0, 5));
+      if (!links.size) {
+        lines.push("調査結果:");
+        lines.push(
+          ...samples.size
+            ? Array.from(samples)
+            : ["記事URLを含む属性なし"]
+        );
+      }
     } catch {
-      lines.push("取得中にエラーが発生しました。");
+      lines.push("取得中にエラーが発生しました");
     }
 
     lines.push("ログイン・スキは未実行です。");
