@@ -1,5 +1,12 @@
 {
   "name": "note-helper",
   "main": "worker.js",
-  "compatibility_date": "2026-10-10"
+  "compatibility_date": "2026-10-10",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "note-helper-db",
+      "database_id": "87e0d8a4-337d-49e3-81f9-c78a2a3353b1"
+    }
+  ]
 }
