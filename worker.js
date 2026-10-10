@@ -1,63 +1,57 @@
 export default {
-  async fetch() {
-    const lines = ["記事取得テスト v3"];
-    try {
-      const res = await fetch(
-        "https://note.com/tag/" + encodeURIComponent("小説"),
-        { signal: AbortSignal.timeout(15000) }
-      );
-      lines.push("応答コード: " + res.status);
-
-      const links = new Set();
-      const samples = new Set();
-
-      const parsed = new HTMLRewriter()
-        .on("*", {
-          element(el) {
-            for (const [name, value] of el.attributes) {
-              if (!value.includes("/n/")) continue;
-
-              if (samples.size < 5) {
-                samples.add(
-                  name + ": " + value.slice(0, 200)
-                );
-              }
-
-              try {
-                const url = new URL(value, "https://note.com");
-                if (
-                  url.origin === "https://note.com" &&
-                  /^\/[^/]+\/n\/n[a-f0-9]+\/?$/.test(url.pathname)
-                ) {
-                  links.add(url.origin + url.pathname);
-                }
-              } catch {}
-            }
-          }
-        })
-        .transform(res);
-
-      await parsed.text();
-      lines.push("記事リンク数: " + links.size);
-      lines.push(...Array.from(links).slice(0, 5));
-      if (!links.size) {
-        lines.push("調査結果:");
-        lines.push(
-          ...samples.size
-            ? Array.from(samples)
-            : ["記事URLを含む属性なし"]
-        );
-      }
-    } catch {
-      lines.push("取得中にエラーが発生しました");
-    }
-
-    lines.push("ログイン・スキは未実行です。");
-    return new Response(lines.join("\n\n"), {
+  async fetch(request, env) {
+    const reply = (text) => new Response(text, {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store"
       }
     });
+
+    if (new URL(request.url).pathname !== "/") {
+      return new Response("Not found", { status: 404 });
+    }
+
+    const lines = ["ログイン確認 v4"];
+    const session = env.NOTE_SESSION?.trim();
+
+    if (!session) {
+      return reply("ログイン確認 v4\nNOTE_SESSIONが未設定です");
+    }
+
+    if (/[\s;]/.test(session) || session.startsWith("_note_session")) {
+      return reply("ログイン確認 v4\nCookieの値だけを保存してください");
+    }
+
+    try {
+      const res = await fetch(
+        "https://note.com/api/v2/current_user",
+        {
+          headers: {
+            "Accept": "application/json",
+            "Cookie": "_note_session_v5=" + session
+          },
+          redirect: "manual",
+          signal: AbortSignal.timeout(15000)
+        }
+      );
+
+      lines.push("応答コード: " + res.status);
+      const json = await res.json().catch(() => null);
+      const user = json?.data?.user ?? json?.data;
+
+      if (res.ok && user?.id && user?.urlname) {
+        lines.push("ログイン確認: 成功");
+      } else {
+        lines.push("ログイン確認: 未確認");
+        lines.push(
+          "応答形式: " + (json ? "JSON" : "JSON以外")
+        );
+      }
+    } catch {
+      lines.push("通信エラー。ログインは確認できませんでした");
+    }
+
+    lines.push("スキは未実行です");
+    return reply(lines.join("\n\n"));
   }
 };
