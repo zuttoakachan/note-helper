@@ -8,5 +8,8 @@
       "database_name": "note-helper-db",
       "database_id": "87e0d8a4-337d-49e3-81f9-c78a2a3353b1"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
 }
