@@ -2,7 +2,21 @@ const ARTICLE = "n39663ca41eb0";
 function reply(body, html = false, status = 200) { return new Response(body, { status, headers: { "Content-Type": html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff" } }); }
 export default { async fetch(request, env) { const url = new URL(request.url);
 if (url.pathname === "/" && request.method === "GET") {
-  return reply(`<!doctype html>
+return reply(
+  '<!doctype html><html lang="ja">' +
+  '<meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+  '<title>スキのテスト v6</title>' +
+  '<h2>スキのテスト v6</h2>' +
+  '<p>対象：第3話 おにぎりと、秘密の研究所</p>' +
+  '<form method="post" action="/like">' +
+  '<p>管理用の鍵（ADMIN_KEY）</p>' +
+  '<input type="password" name="key" required autocomplete="off" autocapitalize="none">' +
+  '<p><button type="submit">この1記事にスキする</button></p>' +
+  '</form><p>自動運転は未開始です。</p></html>',
+  true
+);
+}
 if (url.pathname !== "/like" || request.method !== "POST") {
   return reply("Not found", false, 404);
 }
