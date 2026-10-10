@@ -1,69 +1,94 @@
-export default {
-  async fetch(request) {
-    if (new URL(request.url).pathname !== "/") {
-      return new Response("Not found", { status: 404 });
-    }
+const ARTICLE = "n39663ca41eb0";
+function reply(body, html = false, status = 200) { return new Response(body, { status, headers: { "Content-Type": html ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff" } }); }
+export default { async fetch(request, env) { const url = new URL(request.url);
+if (url.pathname === "/" && request.method === "GET") {
+  return reply(`<!doctype html>
+if (url.pathname !== "/like" || request.method !== "POST") {
+  return reply("Not found", false, 404);
+}
 
-    const lines = ["タグ記事取得 v5"];
-    const tags = ["小説", "短編小説", "創作", "散文"];
+if (request.headers.get("Origin") !== url.origin) {
+  return reply("操作画面から実行してください。", false, 403);
+}
 
-    for (const tag of tags) {
-      lines.push("\n#" + tag);
+if (!env.ADMIN_KEY || !env.NOTE_SESSION?.trim()) {
+  return reply("ADMIN_KEY または NOTE_SESSION が未設定です。");
+}
 
-      try {
-        const url =
-          "https://note.com/api/v3/hashtags/" +
-          encodeURIComponent(tag) +
-          "/notes?order=new&page=1";
+const form = await request.formData();
+if (form.get("key") !== env.ADMIN_KEY) {
+  return reply("管理用の鍵が違います。", false, 403);
+}
 
-        const res = await fetch(url, {
-          headers: { Accept: "application/json" },
-          redirect: "manual",
-          signal: AbortSignal.timeout(15000)
-        });
-
-        lines.push("応答コード: " + res.status);
-
-        if (!res.ok) {
-          lines.push("取得できませんでした");
-          break;
-        }
-
-        const json = await res.json();
-        const data = json.data ?? json;
-        const notes = data.notes;
-
-        if (!Array.isArray(notes)) {
-          lines.push("記事一覧の形式が想定と異なります");
-          lines.push(
-            "項目名: " + Object.keys(data).join(", ")
-          );
-          break;
-        }
-
-        lines.push("記事数: " + notes.length);
-
-        for (const note of notes.slice(0, 3)) {
-          lines.push(
-            "・" + String(note.name ?? "題名なし")
-          );
-          lines.push(
-            "記事キー: " + String(note.key ?? "なし")
-          );
-        }
-      } catch {
-        lines.push("通信またはデータ読み取りエラー");
-        break;
-      }
-    }
-
-    lines.push("\nスキは未実行です");
-
-    return new Response(lines.join("\n"), {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store"
-      }
-    });
-  }
+const headers = {
+  "Accept": "application/json",
+  "Cookie": "_note_session_v5=" + env.NOTE_SESSION.trim()
 };
+
+const get = (path) => fetch("https://note.com" + path, {
+  headers,
+  redirect: "manual",
+  signal: AbortSignal.timeout(15000)
+});
+
+try {
+  const auth = await get("/api/v2/current_user");
+  const authJson = await auth.json().catch(() => null);
+  const user = authJson?.data?.user ?? authJson?.data;
+
+  if (!auth.ok || !user?.id || !user?.urlname) {
+    return reply("ログインを確認できないため停止しました。");
+  }
+
+  const path = "/api/v3/notes/" + ARTICLE;
+  const before = await get(path);
+  const beforeJson = await before.json().catch(() => null);
+
+  if (!before.ok || !beforeJson?.data) {
+    return reply("記事を確認できないため停止しました。");
+  }
+
+  if (beforeJson.data.is_liked === true) {
+    return reply("この記事には、すでにスキしています。");
+  }
+
+  const res = await fetch("https://note.com" + path + "/likes", {
+    method: "POST",
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+      "Origin": "https://note.com",
+      "Referer": "https://note.com/"
+    },
+    body: "{}",
+    redirect: "manual",
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if (!res.ok) {
+    return reply(
+      "スキの送信で停止しました。\n応答コード: " +
+      res.status + "\n再送せず、この結果を教えてください。"
+    );
+  }
+
+  const after = await get(path);
+  const afterJson = await after.json().catch(() => null);
+  const confirmed =
+    after.ok && afterJson?.data?.is_liked === true;
+
+  return reply(
+    "スキのテスト v6\n応答コード: " + res.status +
+    (confirmed
+      ? "\n記事データでスキ済みを確認しました。"
+      : "\n送信は受け付けられました。反映はまだ未確認です。") +
+    "\n記事キー: " + ARTICLE +
+    "\n自動運転は未開始です。"
+  );
+} catch {
+  return reply(
+    "通信エラーで結果を確認できませんでした。\n" +
+    "スキが届いた可能性もあるので、再送せず結果を教えてください。"
+  );
+}
+} };
