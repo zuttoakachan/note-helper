@@ -1,5 +1,4 @@
 const TAGS = ["小説", "短編小説", "創作", "散文"];
-
 const sql = (env, query, ...args) =>
   env.DB.prepare(query).bind(...args);
 
@@ -30,21 +29,29 @@ function reply(body, html = false, status = 200) {
   });
 }
 
-function page(message = "管理用の鍵を入力してください。") {
+function page(
+  message = "管理するアカウントを選んでください。",
+  slot = "1"
+) {
   return reply([
     '<!doctype html><html lang="ja"><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>note-helper v9</title>',
+    '<title>note-helper v10</title>',
     '<style>',
     'body{font:17px system-ui;max-width:600px;margin:24px auto;padding:0 18px;line-height:1.7}',
-    'input,button{font:inherit;padding:12px;box-sizing:border-box}',
-    'input{width:100%}button{margin:12px 8px 0 0}',
+    'input,button,select{font:inherit;padding:12px;box-sizing:border-box}',
+    'input,select{width:100%}button{margin:12px 8px 0 0}',
     'pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}',
     '</style>',
-    '<h1>note-helper v9</h1>',
-    '<p>対象：小説・短編小説・創作・散文<br>通常は毎分確認、最大1件送信。制限・エラー中は待機。</p>',
+    '<h1>note-helper v10</h1>',
+    '<p>対象：小説・短編小説・創作・散文<br>設定した定期実行ごとに、各アカウント最大1件送信。制限・エラー中は待機。</p>',
     '<pre>' + esc(message) + '</pre>',
     '<form method="post" action="/control">',
+    '<label>操作するアカウント<select name="account">',
+    '<option value="1"' + (slot === "1" ? ' selected' : '') + '>1：今までのnote</option>',
+    '<option value="2"' + (slot === "2" ? ' selected' : '') + '>2：追加したnote</option>',
+    '</select></label>',
+    '<p>開始・停止は選んだアカウントだけに適用されます。</p>',
     '<label>管理用の鍵（ADMIN_KEY）',
     '<input type="password" name="key" required autocomplete="off" autocapitalize="none" spellcheck="false">',
     '</label>',
@@ -55,6 +62,24 @@ function page(message = "管理用の鍵を入力してください。") {
     '<p>停止直前に送信済みの1件は取り消されません。エラー時は待機して自動再確認します。</p>',
     '</html>'
   ].join("\n"), true);
+}
+
+function scoped(env, slot) {
+  if (slot === "1") return env;
+
+  return {
+    ...env,
+    NOTE_SESSION: env.NOTE_SESSION_2,
+    DB: {
+      prepare: query => env.DB.prepare(
+        query.replace(
+          /\b(nh_control|nh_seen|nh_retry)\b/g,
+          "$1_2"
+        )
+      ),
+      batch: statements => env.DB.batch(statements)
+    }
+  };
 }
 
 async function init(env) {
@@ -399,9 +424,7 @@ async function run(env) {
       !referer.startsWith("https://note.com/") ||
       !referer.includes("/n/" + key)
     ) {
-      throw new Error(
-        "記事URLを確認できません。記事キー: " + key
-      );
+      throw new Error("記事URLを確認できません。");
     }
 
     const gate = await sql(
@@ -444,9 +467,7 @@ async function run(env) {
     const after = await api(env, path);
 
     if (after.is_liked !== true) {
-      throw new Error(
-        "送信後のスキを確認できません。記事キー: " + key
-      );
+      throw new Error("送信後のスキを確認できません。");
     }
 
     await env.DB.batch([
@@ -473,11 +494,9 @@ async function run(env) {
       "WHERE id=1 RETURNING failures"
     ).first();
 
-    const backoff = [
-      300000,
-      900000,
-      3600000
-    ][Math.min(2, count.failures - 1)];
+    const backoff = [300000, 900000, 3600000][
+      Math.min(2, count.failures - 1)
+    ];
 
     const wait = Math.max(
       backoff,
@@ -507,11 +526,14 @@ async function run(env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, original) {
     const url = new URL(request.url);
 
     if (url.pathname === "/" && request.method === "GET") {
-      return page();
+      return page(
+        undefined,
+        url.searchParams.get("account") === "2" ? "2" : "1"
+      );
     }
 
     if (
@@ -529,7 +551,7 @@ export default {
       );
     }
 
-    if (!env.ADMIN_KEY || !env.DB) {
+    if (!original.ADMIN_KEY || !original.DB) {
       return page(
         "ADMIN_KEY または DB の設定を確認してください。"
       );
@@ -537,9 +559,29 @@ export default {
 
     const form = await request.formData();
 
-    if (form.get("key") !== env.ADMIN_KEY) {
+    if (form.get("key") !== original.ADMIN_KEY) {
       return reply("管理用の鍵が違います。", false, 403);
     }
+
+    const slot = form.get("account") || "1";
+
+    if (!["1", "2"].includes(slot)) {
+      return reply(
+        "アカウントを選んでください。",
+        false,
+        400
+      );
+    }
+
+    const env = scoped(original, slot);
+
+    const show = message => page(
+      "アカウント " + slot + "\n" +
+      (slot === "2"
+        ? message.replaceAll("NOTE_SESSION", "NOTE_SESSION_2")
+        : message),
+      slot
+    );
 
     try {
       await init(env);
@@ -553,7 +595,7 @@ export default {
         ).run();
       } else if (action === "start") {
         if (!env.NOTE_SESSION?.trim()) {
-          return page("NOTE_SESSIONが未設定です。");
+          return show("NOTE_SESSIONが未設定です。");
         }
 
         const state = await sql(
@@ -562,15 +604,33 @@ export default {
         ).first();
 
         if (state.lease > Date.now()) {
-          return page(
+          return show(
             "前の処理中です。少し待って状態を確認してください。"
           );
         }
 
         const id = await account(env);
 
+        const other = scoped(
+          original,
+          slot === "1" ? "2" : "1"
+        );
+
+        await init(other);
+
+        const otherState = await sql(
+          other,
+          "SELECT account FROM nh_control WHERE id=1"
+        ).first();
+
+        if (otherState?.account === id) {
+          return show(
+            "もう一方と同じnoteです。別のnoteのログイン情報を設定してください。"
+          );
+        }
+
         if (state.account && state.account !== id) {
-          return page(
+          return show(
             "アカウントが違います。元のNOTE_SESSIONに戻してください。"
           );
         }
@@ -609,7 +669,7 @@ export default {
           : "稼働設定ON"
         : "手動停止中";
 
-      return page(
+      return show(
         "状態：" + status +
         "\n確認済みスキ累計：" + s.total + "件" +
         "\n最終実行：" + time +
@@ -617,22 +677,25 @@ export default {
         "\n" + s.message
       );
     } catch {
-      return page(
-        "接続・ログイン・データベースの確認でエラーになりました。" +
-        "状態を再確認してください。"
+      return show(
+        "接続・ログイン・データベースの確認でエラーになりました。状態を再確認してください。"
       );
     }
   },
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      try {
-        await init(env);
-        await run(env);
-      } catch {
-        console.error(
-          "note-helper: storage/runtime failure; retry on next cron"
-        );
+      for (const slot of ["1", "2"]) {
+        try {
+          const selected = scoped(env, slot);
+          await init(selected);
+          await run(selected);
+        } catch {
+          console.error(
+            "note-helper: account " + slot +
+            " storage/runtime failure; retry on next cron"
+          );
+        }
       }
     })());
   }
