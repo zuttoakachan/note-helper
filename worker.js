@@ -82,7 +82,7 @@ try {
   if (!res.ok) {
     return reply(
       "スキの送信で停止しました。\n応答コード: " +
-      res.status + "\n再送せず、この結果を教えてください。"
+      res.status + "\n詳細: " + (await res.text()).slice(0, 1000)
     );
   }
 
