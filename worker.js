@@ -32,19 +32,17 @@ function reply(body, html = false, status = 200) {
 
 function page(message = "管理用の鍵を入力してください。") {
   return reply([
-    '<!doctype html><html lang="ja">',
-    '<meta charset="utf-8">',
+    '<!doctype html><html lang="ja"><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>note-helper v8</title>',
+    '<title>note-helper v9</title>',
     '<style>',
     'body{font:17px system-ui;max-width:600px;margin:24px auto;padding:0 18px;line-height:1.7}',
     'input,button{font:inherit;padding:12px;box-sizing:border-box}',
-    'input{width:100%}',
-    'button{margin:12px 8px 0 0}',
+    'input{width:100%}button{margin:12px 8px 0 0}',
     'pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}',
     '</style>',
-    '<h1>note-helper v8</h1>',
-    '<p>対象：小説・短編小説・創作・散文<br>毎分、タグを順番に確認。送信は最大1件。</p>',
+    '<h1>note-helper v9</h1>',
+    '<p>対象：小説・短編小説・創作・散文<br>通常は毎分確認、最大1件送信。制限・エラー中は待機。</p>',
     '<pre>' + esc(message) + '</pre>',
     '<form method="post" action="/control">',
     '<label>管理用の鍵（ADMIN_KEY）',
@@ -54,7 +52,7 @@ function page(message = "管理用の鍵を入力してください。") {
     '<button name="action" value="start">自動運転を開始</button>',
     '<button name="action" value="stop">停止</button>',
     '</form>',
-    '<p>停止直前に送信済みの1件は取り消されません。エラー時は自動停止します。</p>',
+    '<p>停止直前に送信済みの1件は取り消されません。エラー時は待機して自動再確認します。</p>',
     '</html>'
   ].join("\n"), true);
 }
@@ -83,8 +81,23 @@ async function init(env) {
     ),
     env.DB.prepare(
       "INSERT OR IGNORE INTO nh_control (id) VALUES (1)"
+    ),
+    env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS nh_retry (" +
+      "id INTEGER PRIMARY KEY, " +
+      "failures INTEGER NOT NULL DEFAULT 0)"
+    ),
+    env.DB.prepare(
+      "INSERT OR IGNORE INTO nh_retry (id) VALUES (1)"
     )
   ]);
+}
+
+class Trouble extends Error {
+  constructor(message, wait = 300000) {
+    super(message);
+    this.wait = wait;
+  }
 }
 
 async function api(
@@ -93,6 +106,10 @@ async function api(
   post = false,
   referer = "https://note.com/"
 ) {
+  if (!env.NOTE_SESSION?.trim()) {
+    throw new Trouble("NOTE_SESSIONの更新待ち", 21600000);
+  }
+
   const headers = {
     "Accept": "application/json",
     "X-Requested-With": "XMLHttpRequest",
@@ -107,25 +124,63 @@ async function api(
     });
   }
 
-  const response = await fetch("https://note.com" + path, {
-    method: post ? "POST" : "GET",
-    headers,
-    ...(post ? { body: "{}" } : {}),
-    redirect: "manual",
-    signal: AbortSignal.timeout(15000)
-  });
+  let response;
+
+  try {
+    response = await fetch("https://note.com" + path, {
+      method: post ? "POST" : "GET",
+      headers,
+      ...(post ? { body: "{}" } : {}),
+      redirect: "manual",
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch {
+    throw new Trouble("通信エラー・タイムアウト");
+  }
 
   if (!response.ok) {
-    throw new Error("noteの応答コード: " + response.status);
+    const code = response.status;
+    const retry = response.headers.get("Retry-After");
+
+    const wait = retry && /^\d+$/.test(retry)
+      ? Number(retry) * 1000
+      : Math.max(
+          0,
+          Date.parse(retry || "") - Date.now()
+        ) || 0;
+
+    await response.body?.cancel().catch(() => {});
+
+    const base = [401, 403].includes(code)
+      ? 21600000
+      : [429, 422].includes(code)
+        ? 3600000
+        : code >= 500
+          ? 300000
+          : 3600000;
+
+    throw new Trouble(
+      "note応答 " + code,
+      Math.max(base, wait)
+    );
   }
 
   if (post) {
-    await response.body?.cancel();
-    return null;
+    await response.body?.cancel().catch(() => {});
+    return;
   }
 
-  const json = await response.json();
-  return json.data ?? json;
+  try {
+    const json = await response.json();
+
+    if (!json || typeof json !== "object") {
+      throw new Error();
+    }
+
+    return json.data ?? json;
+  } catch {
+    throw new Trouble("応答形式を確認できません");
+  }
 }
 
 async function account(env) {
@@ -133,7 +188,7 @@ async function account(env) {
   const user = data.user ?? data;
 
   if (!user?.id || !user?.urlname) {
-    throw new Error("ログインを確認できません。");
+    throw new Trouble("ログイン情報の更新待ち", 21600000);
   }
 
   return String(user.id);
@@ -150,7 +205,7 @@ async function run(env) {
     "WHERE id=1 AND enabled=1 AND lease<? AND next_at<=?",
     token,
     now + 300000,
-    now + 60000,
+    Math.floor(now / 60000) * 60000 + 60000,
     now,
     now,
     now
@@ -158,7 +213,7 @@ async function run(env) {
 
   if (!locked.meta.changes) return;
 
-  let pending = "";
+  let stage = "準備";
 
   const note = message => sql(
     env,
@@ -173,20 +228,75 @@ async function run(env) {
       "SELECT * FROM nh_control WHERE id=1"
     ).first();
 
-    if (state.inflight) {
-      throw new Error(
-        "前回の送信結果が未確認です。記事キー: " +
-        state.inflight
+    stage = "ログイン確認";
+
+    if (await account(env) !== state.account) {
+      throw new Trouble(
+        "アカウントが違います。元のNOTE_SESSIONに戻してください",
+        21600000
       );
     }
 
-    if (!env.NOTE_SESSION?.trim()) {
-      throw new Error("NOTE_SESSIONが未設定です。");
+    const reset = () => sql(
+      env,
+      "UPDATE nh_retry SET failures=0 WHERE id=1"
+    ).run();
+
+    if (state.inflight) {
+      stage = "前回送信の確認";
+      let article;
+
+      try {
+        article = await api(
+          env,
+          "/api/v3/notes/" + state.inflight
+        );
+      } catch (error) {
+        if (
+          error instanceof Trouble &&
+          error.message === "note応答 404"
+        ) {
+          article = {};
+        } else {
+          throw error;
+        }
+      }
+
+      const liked = article.is_liked === true;
+
+      const previous = await sql(
+        env,
+        "SELECT status FROM nh_seen WHERE key=?",
+        state.inflight
+      ).first();
+
+      await env.DB.batch([
+        sql(
+          env,
+          "INSERT INTO nh_seen VALUES (?, ?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET status=excluded.status",
+          state.inflight,
+          liked ? "liked" : "uncertain",
+          Date.now()
+        ),
+        sql(
+          env,
+          "UPDATE nh_control " +
+          "SET inflight='', total=total+?, message=? " +
+          "WHERE id=1 AND token=?",
+          liked && previous?.status !== "liked" ? 1 : 0,
+          liked
+            ? "前回の記事のスキを確認しました"
+            : "前回の記事は再送せず除外しました",
+          token
+        )
+      ]);
+
+      await reset();
+      return;
     }
 
-    if (await account(env) !== state.account) {
-      throw new Error("ログイン中のアカウントが変わりました。");
-    }
+    stage = "記事一覧の取得";
 
     const tag = TAGS[state.cursor % TAGS.length];
 
@@ -215,6 +325,7 @@ async function run(env) {
 
     if (!keys.length) {
       await note("#" + tag + "：記事なし");
+      await reset();
       return;
     }
 
@@ -231,11 +342,36 @@ async function run(env) {
 
     if (!key) {
       await note("#" + tag + "：取得した記事は確認済み");
+      await reset();
       return;
     }
 
     const path = "/api/v3/notes/" + key;
-    const article = await api(env, path);
+
+    stage = "記事確認";
+    let article;
+
+    try {
+      article = await api(env, path);
+    } catch (error) {
+      if (
+        error instanceof Trouble &&
+        error.message === "note応答 404"
+      ) {
+        await sql(
+          env,
+          "INSERT OR IGNORE INTO nh_seen VALUES (?, 'missing', ?)",
+          key,
+          Date.now()
+        ).run();
+
+        await note("削除された記事を除外しました");
+        await reset();
+        return;
+      }
+
+      throw error;
+    }
 
     if (
       article.is_liked === true ||
@@ -249,6 +385,7 @@ async function run(env) {
       ).run();
 
       await note("#" + tag + "：スキ済み・自分の記事を除外");
+      await reset();
       return;
     }
 
@@ -279,7 +416,7 @@ async function run(env) {
 
     if (!gate.meta.changes) return;
 
-    pending = key;
+    stage = "送信予約の保存";
 
     const claimed = await sql(
       env,
@@ -298,7 +435,11 @@ async function run(env) {
       return;
     }
 
+    stage = "スキ送信";
+
     await api(env, path + "/likes", true, referer);
+
+    stage = "送信後の確認";
 
     const after = await api(env, path);
 
@@ -324,24 +465,35 @@ async function run(env) {
       )
     ]);
 
-    pending = "";
+    await reset();
   } catch (error) {
-    let message = error instanceof Error
-      ? error.message
-      : "処理エラー";
+    const count = await sql(
+      env,
+      "UPDATE nh_retry SET failures=failures+1 " +
+      "WHERE id=1 RETURNING failures"
+    ).first();
 
-    if (
-      !/^(noteの応答コード: \d+|ログインを|前回の|NOTE_SESSION|記事一覧の|記事URLを|送信後の)/.test(message)
-    ) {
-      message = "通信または保存でエラーが発生しました。";
-    }
+    const backoff = [
+      300000,
+      900000,
+      3600000
+    ][Math.min(2, count.failures - 1)];
+
+    const wait = Math.max(
+      backoff,
+      error instanceof Trouble ? error.wait : 3600000
+    );
+
+    const detail = error instanceof Trouble
+      ? error.message
+      : "通信・保存・応答内容のエラー";
 
     await sql(
       env,
-      "UPDATE nh_control SET enabled=0, message=? " +
+      "UPDATE nh_control SET next_at=?, message=? " +
       "WHERE id=1 AND token=?",
-      "自動停止：" + message +
-      (pending ? "\n再送しません。記事キー: " + pending : ""),
+      Date.now() + wait,
+      "自動再確認待ち：" + stage + "／" + detail,
       token
     ).run();
   } finally {
@@ -378,7 +530,9 @@ export default {
     }
 
     if (!env.ADMIN_KEY || !env.DB) {
-      return page("ADMIN_KEY または DB の設定を確認してください。");
+      return page(
+        "ADMIN_KEY または DB の設定を確認してください。"
+      );
     }
 
     const form = await request.formData();
@@ -413,21 +567,18 @@ export default {
           );
         }
 
-        if (state.inflight) {
+        const id = await account(env);
+
+        if (state.account && state.account !== id) {
           return page(
-            "送信結果が未確認のため再開していません。" +
-            "記事キー：" + state.inflight +
-            "\nこの画面を教えてください。"
+            "アカウントが違います。元のNOTE_SESSIONに戻してください。"
           );
         }
 
-        const id = await account(env);
-
         await sql(
           env,
-          "UPDATE nh_control SET enabled=1, account=?, " +
-          "message='開始済み。次の定期実行を待っています。' " +
-          "WHERE id=1 AND lease<=? AND inflight=''",
+          "UPDATE nh_control SET enabled=1, account=? " +
+          "WHERE id=1 AND lease<=?",
           id,
           Date.now()
         ).run();
@@ -445,10 +596,24 @@ export default {
           )
         : "まだありません";
 
+      const next = new Date(
+        Math.max(s.next_at, s.lease, Date.now())
+      ).toLocaleString(
+        "ja-JP",
+        { timeZone: "Asia/Tokyo" }
+      );
+
+      const status = s.enabled
+        ? s.next_at > Date.now()
+          ? "ON・待機中"
+          : "稼働設定ON"
+        : "手動停止中";
+
       return page(
-        "状態：" + (s.enabled ? "稼働設定ON" : "停止中") +
-        "\nこの版で確認したスキ：" + s.total + "件" +
+        "状態：" + status +
+        "\n確認済みスキ累計：" + s.total + "件" +
         "\n最終実行：" + time +
+        (s.enabled ? "\n次回確認の目安：" + next : "") +
         "\n" + s.message
       );
     } catch {
@@ -460,6 +625,15 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(run(env));
+    ctx.waitUntil((async () => {
+      try {
+        await init(env);
+        await run(env);
+      } catch {
+        console.error(
+          "note-helper: storage/runtime failure; retry on next cron"
+        );
+      }
+    })());
   }
 };
