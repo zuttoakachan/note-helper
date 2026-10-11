@@ -1,4 +1,17 @@
-const TAGS = ["小説", "短編小説", "創作", "散文"];
+const ORDERS = {
+  "1": [
+    "小説", "短編小説", "創作", "散文",
+    "エッセイ", "詩", "日記"
+  ],
+  "2": [
+    "エッセイ", "詩", "日記", "小説",
+    "短編小説", "創作", "散文"
+  ]
+};
+
+const SLOTS = ["1", "2"];
+const INTERVAL = 120000;
+
 const sql = (env, query, ...args) =>
   env.DB.prepare(query).bind(...args);
 
@@ -12,6 +25,13 @@ const esc = value => String(value ?? "").replace(
     "'": "&#39;"
   }[c])
 );
+
+const time = value => value
+  ? new Date(value).toLocaleString(
+      "ja-JP",
+      { timeZone: "Asia/Tokyo" }
+    )
+  : "まだありません";
 
 function reply(body, html = false, status = 200) {
   return new Response(body, {
@@ -30,47 +50,84 @@ function reply(body, html = false, status = 200) {
 }
 
 function page(
-  message = "管理するアカウントを選んでください。",
+  message = "管理用の鍵を入力して、状態を確認してください。",
   slot = "1"
 ) {
-  return reply([
-    '<!doctype html><html lang="ja"><meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>note-helper v10</title>',
-    '<style>',
-    'body{font:17px system-ui;max-width:600px;margin:24px auto;padding:0 18px;line-height:1.7}',
-    'input,button,select{font:inherit;padding:12px;box-sizing:border-box}',
-    'input,select{width:100%}button{margin:12px 8px 0 0}',
-    'pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}',
-    '</style>',
-    '<h1>note-helper v10</h1>',
-    '<p>対象：小説・短編小説・創作・散文<br>設定した定期実行ごとに、各アカウント最大1件送信。制限・エラー中は待機。</p>',
-    '<pre>' + esc(message) + '</pre>',
-    '<form method="post" action="/control">',
-    '<label>操作するアカウント<select name="account">',
-    '<option value="1"' + (slot === "1" ? ' selected' : '') + '>1：今までのnote</option>',
-    '<option value="2"' + (slot === "2" ? ' selected' : '') + '>2：追加したnote</option>',
-    '</select></label>',
-    '<p>開始・停止は選んだアカウントだけに適用されます。</p>',
-    '<label>管理用の鍵（ADMIN_KEY）',
-    '<input type="password" name="key" required autocomplete="off" autocapitalize="none" spellcheck="false">',
-    '</label>',
-    '<button name="action" value="status">状態を確認</button>',
-    '<button name="action" value="start">自動運転を開始</button>',
-    '<button name="action" value="stop">停止</button>',
-    '</form>',
-    '<p>停止直前に送信済みの1件は取り消されません。エラー時は待機して自動再確認します。</p>',
-    '</html>'
-  ].join("\n"), true);
+  return reply(`<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>note-helper v11</title>
+<style>
+body {
+  font:17px system-ui;
+  max-width:680px;
+  margin:24px auto;
+  padding:0 18px;
+  line-height:1.7
+}
+input,button,select {
+  font:inherit;
+  padding:12px;
+  box-sizing:border-box
+}
+input,select {width:100%}
+button {margin:12px 8px 0 0}
+pre {
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  background:#f3f4f6;
+  padding:16px
+}
+</style>
+<h1>note-helper v11</h1>
+<p>
+対象：小説・短編小説・創作・散文・エッセイ・詩・日記<br>
+2分ごとの定期実行で各アカウント最大1件。
+制限・エラー中は待機して自動確認します。
+</p>
+<pre>${esc(message)}</pre>
+<form method="post" action="/control">
+<label>
+操作するアカウント
+<select name="account">
+<option value="1"${slot === "1" ? " selected" : ""}>1：今までのnote</option>
+<option value="2"${slot === "2" ? " selected" : ""}>2：追加したnote</option>
+</select>
+</label>
+<p>
+状態確認は2アカウント分を表示。
+開始・停止は選択した方だけに適用します。
+</p>
+<label>
+管理用の鍵（ADMIN_KEY）
+<input type="password" name="key" required
+ autocomplete="off" autocapitalize="none" spellcheck="false">
+</label>
+<button name="action" value="status">両方の状態を確認</button>
+<button name="action" value="start">自動運転を開始</button>
+<button name="action" value="stop">停止</button>
+</form>
+<p>
+同じ記事は両アカウントで共有する履歴により除外します。
+送信結果が不明な記事も再送しません。
+停止直前の送信は取り消せません。
+</p>
+<p>
+表示は自動更新されません。
+ログイン期限切れや設定不備は手動での修正が必要です。
+</p>
+</html>`, true);
 }
 
 function scoped(env, slot) {
-  if (slot === "1") return env;
-
   return {
     ...env,
-    NOTE_SESSION: env.NOTE_SESSION_2,
-    DB: {
+    SLOT: slot,
+    NOTE_SESSION: slot === "2"
+      ? env.NOTE_SESSION_2
+      : env.NOTE_SESSION,
+    DB: slot === "1" ? env.DB : {
       prepare: query => env.DB.prepare(
         query.replace(
           /\b(nh_control|nh_seen|nh_retry)\b/g,
@@ -118,6 +175,57 @@ async function init(env) {
   ]);
 }
 
+async function prepare(original) {
+  for (const slot of SLOTS) {
+    await init(scoped(original, slot));
+  }
+
+  await original.DB.batch([
+    original.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS nh_shared (" +
+      "key TEXT PRIMARY KEY, " +
+      "slot TEXT NOT NULL, " +
+      "token TEXT NOT NULL, " +
+      "created INTEGER NOT NULL)"
+    ),
+    original.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS nh_migrations (" +
+      "name TEXT PRIMARY KEY)"
+    )
+  ]);
+
+  // 旧版の履歴・結果未確認の記事も、両アカウントで除外する。
+  await original.DB.batch([
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_shared " +
+      "SELECT key, '1', 'history', created FROM nh_seen " +
+      "WHERE NOT EXISTS (" +
+      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_shared " +
+      "SELECT key, '2', 'history', created FROM nh_seen_2 " +
+      "WHERE NOT EXISTS (" +
+      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_shared " +
+      "SELECT inflight, '1', 'history', checked FROM nh_control " +
+      "WHERE inflight<>'' AND NOT EXISTS (" +
+      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_shared " +
+      "SELECT inflight, '2', 'history', checked FROM nh_control_2 " +
+      "WHERE inflight<>'' AND NOT EXISTS (" +
+      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_migrations VALUES ('v11-shared')"
+    )
+  ]);
+}
+
 class Trouble extends Error {
   constructor(message, wait = 300000) {
     super(message);
@@ -132,7 +240,10 @@ async function api(
   referer = "https://note.com/"
 ) {
   if (!env.NOTE_SESSION?.trim()) {
-    throw new Trouble("NOTE_SESSIONの更新待ち", 21600000);
+    throw new Trouble(
+      "要対応：ログイン情報が未設定です",
+      21600000
+    );
   }
 
   const headers = {
@@ -165,29 +276,41 @@ async function api(
 
   if (!response.ok) {
     const code = response.status;
-    const retry = response.headers.get("Retry-After");
+    const retry = response.headers.get("Retry-After") || "";
 
-    const wait = retry && /^\d+$/.test(retry)
+    const parsed = /^\d+$/.test(retry)
       ? Number(retry) * 1000
-      : Math.max(
-          0,
-          Date.parse(retry || "") - Date.now()
-        ) || 0;
+      : Date.parse(retry) - Date.now();
+
+    const wait = Number.isFinite(parsed)
+      ? Math.max(0, parsed)
+      : 0;
 
     await response.body?.cancel().catch(() => {});
 
     const base = [401, 403].includes(code)
       ? 21600000
-      : [429, 422].includes(code)
-        ? 3600000
-        : code >= 500
-          ? 300000
-          : 3600000;
+      : code >= 500
+        ? 300000
+        : 3600000;
 
-    throw new Trouble(
-      "note応答 " + code,
+    const detail = code === 401
+      ? "：要対応・ログイン情報を確認"
+      : code === 403
+        ? "：アクセス拒否・ログイン情報や利用制限を確認"
+        : code === 429
+          ? "：回数制限の解除待ち"
+          : code === 422
+            ? "：送信内容などを受け付けられません"
+            : "";
+
+    const error = new Trouble(
+      "note応答 " + code + detail,
       Math.max(base, wait)
     );
+
+    error.code = code;
+    throw error;
   }
 
   if (post) {
@@ -213,10 +336,22 @@ async function account(env) {
   const user = data.user ?? data;
 
   if (!user?.id || !user?.urlname) {
-    throw new Trouble("ログイン情報の更新待ち", 21600000);
+    throw new Trouble(
+      "要対応：ログイン情報を更新してください",
+      21600000
+    );
   }
 
   return String(user.id);
+}
+
+async function detail(env, key) {
+  try {
+    return await api(env, "/api/v3/notes/" + key);
+  } catch (error) {
+    if (error.code === 404) return null;
+    throw error;
+  }
 }
 
 async function run(env) {
@@ -230,7 +365,7 @@ async function run(env) {
     "WHERE id=1 AND enabled=1 AND lease<? AND next_at<=?",
     token,
     now + 300000,
-    Math.floor(now / 60000) * 60000 + 60000,
+    Math.floor(now / INTERVAL) * INTERVAL + INTERVAL,
     now,
     now,
     now
@@ -247,6 +382,11 @@ async function run(env) {
     token
   ).run();
 
+  const reset = () => sql(
+    env,
+    "UPDATE nh_retry SET failures=0 WHERE id=1"
+  ).run();
+
   try {
     const state = await sql(
       env,
@@ -257,37 +397,16 @@ async function run(env) {
 
     if (await account(env) !== state.account) {
       throw new Trouble(
-        "アカウントが違います。元のNOTE_SESSIONに戻してください",
+        "要対応：元のアカウントのログイン情報に戻してください",
         21600000
       );
     }
 
-    const reset = () => sql(
-      env,
-      "UPDATE nh_retry SET failures=0 WHERE id=1"
-    ).run();
-
     if (state.inflight) {
       stage = "前回送信の確認";
-      let article;
 
-      try {
-        article = await api(
-          env,
-          "/api/v3/notes/" + state.inflight
-        );
-      } catch (error) {
-        if (
-          error instanceof Trouble &&
-          error.message === "note応答 404"
-        ) {
-          article = {};
-        } else {
-          throw error;
-        }
-      }
-
-      const liked = article.is_liked === true;
+      const article = await detail(env, state.inflight);
+      const liked = article?.is_liked === true;
 
       const previous = await sql(
         env,
@@ -323,11 +442,13 @@ async function run(env) {
 
     stage = "記事一覧の取得";
 
-    const tag = TAGS[state.cursor % TAGS.length];
+    const tags = ORDERS[env.SLOT];
+    const tag = tags[state.cursor % tags.length];
 
     await sql(
       env,
-      "UPDATE nh_control SET cursor=cursor+1 WHERE id=1 AND token=?",
+      "UPDATE nh_control SET cursor=cursor+1 " +
+      "WHERE id=1 AND token=?",
       token
     ).run();
 
@@ -339,13 +460,16 @@ async function run(env) {
     );
 
     if (!Array.isArray(data.notes)) {
-      throw new Error("記事一覧の形式を確認できません。");
+      throw new Trouble("記事一覧の形式を確認できません");
     }
 
     const keys = [...new Set(
       data.notes
         .map(n => n.key)
-        .filter(k => /^n[a-z0-9]+$/.test(k))
+        .filter(k =>
+          typeof k === "string" &&
+          /^n[a-z0-9]+$/.test(k)
+        )
     )].slice(0, 50);
 
     if (!keys.length) {
@@ -354,11 +478,15 @@ async function run(env) {
       return;
     }
 
+    const placeholders = keys.map(() => "?").join(",");
+
     const seen = await sql(
       env,
       "SELECT key FROM nh_seen WHERE key IN (" +
-      keys.map(() => "?").join(",") +
-      ")",
+      placeholders +
+      ") UNION SELECT key FROM nh_shared WHERE key IN (" +
+      placeholders + ")",
+      ...keys,
       ...keys
     ).all();
 
@@ -366,39 +494,17 @@ async function run(env) {
     const key = keys.find(k => !done.has(k));
 
     if (!key) {
-      await note("#" + tag + "：取得した記事は確認済み");
+      await note("#" + tag + "：履歴・共通予約を除く候補なし");
       await reset();
       return;
     }
 
-    const path = "/api/v3/notes/" + key;
-
     stage = "記事確認";
-    let article;
 
-    try {
-      article = await api(env, path);
-    } catch (error) {
-      if (
-        error instanceof Trouble &&
-        error.message === "note応答 404"
-      ) {
-        await sql(
-          env,
-          "INSERT OR IGNORE INTO nh_seen VALUES (?, 'missing', ?)",
-          key,
-          Date.now()
-        ).run();
-
-        await note("削除された記事を除外しました");
-        await reset();
-        return;
-      }
-
-      throw error;
-    }
+    const article = await detail(env, key);
 
     if (
+      !article ||
       article.is_liked === true ||
       String(article.user?.id ?? article.user_id) === state.account
     ) {
@@ -409,7 +515,10 @@ async function run(env) {
         Date.now()
       ).run();
 
-      await note("#" + tag + "：スキ済み・自分の記事を除外");
+      await note(
+        "#" + tag + "：削除済み・スキ済み・自分の記事を除外"
+      );
+
       await reset();
       return;
     }
@@ -420,54 +529,89 @@ async function run(env) {
         : ""
     );
 
-    if (
-      !referer.startsWith("https://note.com/") ||
-      !referer.includes("/n/" + key)
-    ) {
-      throw new Error("記事URLを確認できません。");
+    let valid = false;
+
+    try {
+      const u = new URL(referer);
+      valid =
+        u.origin === "https://note.com" &&
+        u.pathname.endsWith("/n/" + key);
+    } catch {}
+
+    if (!valid) {
+      throw new Trouble("記事URLを確認できません", 3600000);
     }
 
-    const gate = await sql(
-      env,
-      "UPDATE nh_control SET inflight=?, lease=? " +
-      "WHERE id=1 AND token=? AND enabled=1 AND lease>?",
-      key,
-      Date.now() + 300000,
-      token,
-      Date.now()
-    ).run();
+    stage = "共通送信予約の保存";
 
-    if (!gate.meta.changes) return;
-
-    stage = "送信予約の保存";
-
-    const claimed = await sql(
-      env,
-      "INSERT OR IGNORE INTO nh_seen VALUES (?, 'pending', ?)",
-      key,
-      Date.now()
-    ).run();
-
-    if (!claimed.meta.changes) {
-      await sql(
+    // 共通予約と未確認送信の記録を、送信前に一括保存する。
+    const reserved = await env.DB.batch([
+      sql(
         env,
-        "UPDATE nh_control SET inflight='' WHERE id=1 AND token=?",
+        "INSERT OR IGNORE INTO nh_shared " +
+        "(key,slot,token,created) " +
+        "SELECT ?,?,?,? FROM nh_control " +
+        "WHERE id=1 AND token=? AND enabled=1 AND lease>?",
+        key,
+        env.SLOT,
+        token,
+        Date.now(),
+        token,
+        Date.now()
+      ),
+      sql(
+        env,
+        "INSERT OR IGNORE INTO nh_seen (key,status,created) " +
+        "SELECT ?, 'pending', ? WHERE EXISTS (" +
+        "SELECT 1 FROM nh_shared WHERE key=? AND token=?)",
+        key,
+        Date.now(),
+        key,
         token
-      ).run();
+      ),
+      sql(
+        env,
+        "UPDATE nh_control SET inflight=?, lease=? " +
+        "WHERE id=1 AND token=? AND enabled=1 AND lease>? " +
+        "AND EXISTS (" +
+        "SELECT 1 FROM nh_shared WHERE key=? AND token=?)",
+        key,
+        Date.now() + 300000,
+        token,
+        Date.now(),
+        key,
+        token
+      )
+    ]);
 
+    if (
+      !reserved[0].meta.changes ||
+      !reserved[2].meta.changes
+    ) {
+      await note(
+        "共通予約済みの記事、または停止操作により送信を見送りました"
+      );
+      await reset();
       return;
     }
 
     stage = "スキ送信";
 
-    await api(env, path + "/likes", true, referer);
+    await api(
+      env,
+      "/api/v3/notes/" + key + "/likes",
+      true,
+      referer
+    );
 
     stage = "送信後の確認";
 
-    const after = await api(env, path);
+    const after = await detail(env, key);
 
-    if (after.is_liked !== true) {
-      throw new Error("送信後のスキを確認できません。");
+    if (after?.is_liked !== true) {
+      throw new Trouble(
+        "送信結果が未確認です。再送せず確認します"
+      );
     }
 
     await env.DB.batch([
@@ -503,16 +647,17 @@ async function run(env) {
       error instanceof Trouble ? error.wait : 3600000
     );
 
-    const detail = error instanceof Trouble
-      ? error.message
-      : "通信・保存・応答内容のエラー";
-
     await sql(
       env,
       "UPDATE nh_control SET next_at=?, message=? " +
       "WHERE id=1 AND token=?",
       Date.now() + wait,
-      "自動再確認待ち：" + stage + "／" + detail,
+      "自動再確認待ち：" + stage + "／" +
+      (
+        error instanceof Trouble
+          ? error.message
+          : "通信・保存・応答内容のエラー"
+      ),
       token
     ).run();
   } finally {
@@ -523,6 +668,60 @@ async function run(env) {
       token
     ).run();
   }
+}
+
+async function dashboard(original, prefix = "") {
+  const blocks = [];
+
+  for (const slot of SLOTS) {
+    const env = scoped(original, slot);
+
+    const s = await sql(
+      env,
+      "SELECT * FROM nh_control WHERE id=1"
+    ).first();
+
+    const now = Date.now();
+
+    const status = !s.enabled
+      ? "停止中（開始操作が必要）"
+      : s.lease > now
+        ? "ON・処理中"
+        : s.next_at > now
+          ? s.message.startsWith("自動再確認待ち")
+            ? "ON・エラー後の待機中"
+            : "ON・次の実行待ち"
+          : "ON・定期実行待ち";
+
+    const eligible = Math.max(s.next_at, s.lease);
+
+    blocks.push(
+      "アカウント " + slot +
+      "\n状態：" + status +
+      "\n確認済みスキ累計：" + s.total + "件" +
+      "\n最終実行：" + time(s.checked) +
+      (
+        s.enabled
+          ? "\n次回：" + (
+              eligible > now
+                ? time(eligible) + "以降の定期実行"
+                : "次の定期実行"
+            )
+          : ""
+      ) +
+      "\nログイン設定：" + (
+        env.NOTE_SESSION?.trim()
+          ? "設定あり（有効性は実行時に確認）"
+          : "未設定・要対応"
+      ) +
+      "\n" + s.message +
+      "\n巡回順：" + ORDERS[slot].join(" → ")
+    );
+  }
+
+  return [prefix, ...blocks]
+    .filter(Boolean)
+    .join("\n\n──────────\n\n");
 }
 
 export default {
@@ -557,146 +756,122 @@ export default {
       );
     }
 
-    const form = await request.formData();
-
-    if (form.get("key") !== original.ADMIN_KEY) {
-      return reply("管理用の鍵が違います。", false, 403);
-    }
-
-    const slot = form.get("account") || "1";
-
-    if (!["1", "2"].includes(slot)) {
-      return reply(
-        "アカウントを選んでください。",
-        false,
-        400
-      );
-    }
-
-    const env = scoped(original, slot);
-
-    const show = message => page(
-      "アカウント " + slot + "\n" +
-      (slot === "2"
-        ? message.replaceAll("NOTE_SESSION", "NOTE_SESSION_2")
-        : message),
-      slot
-    );
+    let slot = "1";
 
     try {
-      await init(env);
+      const form = await request.formData();
 
+      if (form.get("key") !== original.ADMIN_KEY) {
+        return reply("管理用の鍵が違います。", false, 403);
+      }
+
+      slot = form.get("account") || "1";
       const action = form.get("action");
+
+      if (
+        !SLOTS.includes(slot) ||
+        !["status", "start", "stop"].includes(action)
+      ) {
+        return reply("操作を選んでください。", false, 400);
+      }
+
+      await prepare(original);
+
+      const env = scoped(original, slot);
+      let message = "";
 
       if (action === "stop") {
         await sql(
           env,
           "UPDATE nh_control SET enabled=0 WHERE id=1"
         ).run();
-      } else if (action === "start") {
-        if (!env.NOTE_SESSION?.trim()) {
-          return show("NOTE_SESSIONが未設定です。");
-        }
 
+        message = "アカウント " + slot + " を停止しました。";
+      } else if (action === "start") {
         const state = await sql(
           env,
           "SELECT * FROM nh_control WHERE id=1"
         ).first();
 
         if (state.lease > Date.now()) {
-          return show(
-            "前の処理中です。少し待って状態を確認してください。"
-          );
+          message =
+            "処理中です。少し待って状態を確認してください。";
+        } else {
+          const id = await account(env);
+
+          const other = await sql(
+            scoped(original, slot === "1" ? "2" : "1"),
+            "SELECT account FROM nh_control WHERE id=1"
+          ).first();
+
+          if (other.account === id) {
+            message =
+              "もう一方と同じnoteです。別のログイン情報を設定してください。";
+          } else if (state.account && state.account !== id) {
+            message =
+              "元のアカウントのログイン情報に戻してください。";
+          } else {
+            const result = await sql(
+              env,
+              "UPDATE nh_control SET enabled=1, account=? " +
+              "WHERE id=1 AND lease<=?",
+              id,
+              Date.now()
+            ).run();
+
+            message = result.meta.changes
+              ? "アカウント " + slot +
+                " をONにしました。待機期限は保持します。"
+              : "処理中のため変更しませんでした。";
+          }
         }
-
-        const id = await account(env);
-
-        const other = scoped(
-          original,
-          slot === "1" ? "2" : "1"
-        );
-
-        await init(other);
-
-        const otherState = await sql(
-          other,
-          "SELECT account FROM nh_control WHERE id=1"
-        ).first();
-
-        if (otherState?.account === id) {
-          return show(
-            "もう一方と同じnoteです。別のnoteのログイン情報を設定してください。"
-          );
-        }
-
-        if (state.account && state.account !== id) {
-          return show(
-            "アカウントが違います。元のNOTE_SESSIONに戻してください。"
-          );
-        }
-
-        await sql(
-          env,
-          "UPDATE nh_control SET enabled=1, account=? " +
-          "WHERE id=1 AND lease<=?",
-          id,
-          Date.now()
-        ).run();
       }
 
-      const s = await sql(
-        env,
-        "SELECT * FROM nh_control WHERE id=1"
-      ).first();
-
-      const time = s.checked
-        ? new Date(s.checked).toLocaleString(
-            "ja-JP",
-            { timeZone: "Asia/Tokyo" }
-          )
-        : "まだありません";
-
-      const next = new Date(
-        Math.max(s.next_at, s.lease, Date.now())
-      ).toLocaleString(
-        "ja-JP",
-        { timeZone: "Asia/Tokyo" }
+      return page(
+        await dashboard(original, message),
+        slot
       );
+    } catch (error) {
+      const message = error instanceof Trouble
+        ? error.message +
+          "。アカウント " + slot + " の " +
+          (slot === "2" ? "NOTE_SESSION_2" : "NOTE_SESSION") +
+          " を確認してください。"
+        : "接続・データベースの確認でエラーになりました。状態を再確認してください。";
 
-      const status = s.enabled
-        ? s.next_at > Date.now()
-          ? "ON・待機中"
-          : "稼働設定ON"
-        : "手動停止中";
-
-      return show(
-        "状態：" + status +
-        "\n確認済みスキ累計：" + s.total + "件" +
-        "\n最終実行：" + time +
-        (s.enabled ? "\n次回確認の目安：" + next : "") +
-        "\n" + s.message
-      );
-    } catch {
-      return show(
-        "接続・ログイン・データベースの確認でエラーになりました。状態を再確認してください。"
-      );
+      try {
+        return page(
+          await dashboard(original, message),
+          slot
+        );
+      } catch {
+        return page(message, slot);
+      }
     }
   },
 
-  async scheduled(event, env, ctx) {
+  async scheduled(event, original, ctx) {
     ctx.waitUntil((async () => {
-      for (const slot of ["1", "2"]) {
+      try {
+        await prepare(original);
+      } catch {
+        console.error(
+          "note-helper: storage initialization failed; retry next cron"
+        );
+        return;
+      }
+
+      // 一方の通信待ちやエラーで、もう一方を待たせない。
+      await Promise.all(SLOTS.map(async slot => {
         try {
-          const selected = scoped(env, slot);
-          await init(selected);
-          await run(selected);
+          await run(scoped(original, slot));
         } catch {
           console.error(
             "note-helper: account " + slot +
-            " storage/runtime failure; retry on next cron"
+            " storage/runtime failure; retry next cron"
           );
         }
-      }
+      }));
     })());
   }
 };
