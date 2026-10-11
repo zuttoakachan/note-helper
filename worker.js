@@ -10,7 +10,8 @@ const ORDERS = {
 };
 
 const SLOTS = ["1", "2"];
-const INTERVAL = 120000;
+const INTERVAL = 180000;
+const HOUR = 3600000;
 
 const sql = (env, query, ...args) =>
   env.DB.prepare(query).bind(...args);
@@ -33,6 +34,9 @@ const time = value => value
     )
   : "まだありません";
 
+const nextTick = () =>
+  Math.floor(Date.now() / INTERVAL) * INTERVAL + INTERVAL;
+
 function reply(body, html = false, status = 200) {
   return new Response(body, {
     status,
@@ -50,14 +54,14 @@ function reply(body, html = false, status = 200) {
 }
 
 function page(
-  message = "管理用の鍵を入力して、状態を確認してください。",
+  message = "鍵を入力して、両方の状態を確認してください。",
   slot = "1"
 ) {
   return reply(`<!doctype html>
 <html lang="ja">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>note-helper v11</title>
+<title>note-helper v12</title>
 <style>
 body {
   font:17px system-ui;
@@ -80,11 +84,11 @@ pre {
   padding:16px
 }
 </style>
-<h1>note-helper v11</h1>
+<h1>note-helper v12</h1>
 <p>
-対象：小説・短編小説・創作・散文・エッセイ・詩・日記<br>
-2分ごとの定期実行で各アカウント最大1件。
-制限・エラー中は待機して自動確認します。
+小説・短編小説・創作・散文・エッセイ・詩・日記<br>
+通常は約3分ごとに各アカウント最大1件。
+制限中は休止して自動確認します。
 </p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
@@ -95,10 +99,7 @@ pre {
 <option value="2"${slot === "2" ? " selected" : ""}>2：追加したnote</option>
 </select>
 </label>
-<p>
-状態確認は2アカウント分を表示。
-開始・停止は選択した方だけに適用します。
-</p>
+<p>開始・停止は選んだ方のみ。状態は両方を表示します。</p>
 <label>
 管理用の鍵（ADMIN_KEY）
 <input type="password" name="key" required
@@ -109,75 +110,84 @@ pre {
 <button name="action" value="stop">停止</button>
 </form>
 <p>
-同じ記事は両アカウントで共有する履歴により除外します。
-送信結果が不明な記事も再送しません。
-停止直前の送信は取り消せません。
+開始を押しても休止期限は短縮しません。
+同じ記事は両アカウントで除外し、結果不明の記事も再送しません。
 </p>
 <p>
-表示は自動更新されません。
-ログイン期限切れや設定不備は手動での修正が必要です。
+ログイン切れ・設定不備は手動対応が必要です。
+画面は自動更新されません。
+停止直前の送信は取り消せません。
 </p>
 </html>`, true);
 }
 
-function scoped(env, slot) {
+function scoped(original, slot) {
   return {
-    ...env,
+    ...original,
     SLOT: slot,
     NOTE_SESSION: slot === "2"
-      ? env.NOTE_SESSION_2
-      : env.NOTE_SESSION,
-    DB: slot === "1" ? env.DB : {
-      prepare: query => env.DB.prepare(
-        query.replace(
-          /\b(nh_control|nh_seen|nh_retry)\b/g,
+      ? original.NOTE_SESSION_2
+      : original.NOTE_SESSION,
+    DB: slot === "1" ? original.DB : {
+      prepare: q => original.DB.prepare(
+        q.replace(
+          /\b(nh_control|nh_seen|nh_retry|nh_health)\b/g,
           "$1_2"
         )
       ),
-      batch: statements => env.DB.batch(statements)
+      batch: items => original.DB.batch(items)
     }
   };
 }
 
-async function init(env) {
-  await env.DB.batch([
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS nh_control (" +
-      "id INTEGER PRIMARY KEY, " +
-      "enabled INTEGER NOT NULL DEFAULT 0, " +
-      "account TEXT NOT NULL DEFAULT '', " +
-      "cursor INTEGER NOT NULL DEFAULT 0, " +
-      "token TEXT NOT NULL DEFAULT '', " +
-      "lease INTEGER NOT NULL DEFAULT 0, " +
-      "next_at INTEGER NOT NULL DEFAULT 0, " +
-      "inflight TEXT NOT NULL DEFAULT '', " +
-      "total INTEGER NOT NULL DEFAULT 0, " +
-      "message TEXT NOT NULL DEFAULT '未開始', " +
-      "checked INTEGER NOT NULL DEFAULT 0)"
-    ),
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS nh_seen (" +
-      "key TEXT PRIMARY KEY, " +
-      "status TEXT NOT NULL, " +
-      "created INTEGER NOT NULL)"
-    ),
-    env.DB.prepare(
-      "INSERT OR IGNORE INTO nh_control (id) VALUES (1)"
-    ),
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS nh_retry (" +
-      "id INTEGER PRIMARY KEY, " +
-      "failures INTEGER NOT NULL DEFAULT 0)"
-    ),
-    env.DB.prepare(
-      "INSERT OR IGNORE INTO nh_retry (id) VALUES (1)"
-    )
-  ]);
-}
-
 async function prepare(original) {
   for (const slot of SLOTS) {
-    await init(scoped(original, slot));
+    const env = scoped(original, slot);
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS nh_control (" +
+        "id INTEGER PRIMARY KEY, " +
+        "enabled INTEGER NOT NULL DEFAULT 0, " +
+        "account TEXT NOT NULL DEFAULT '', " +
+        "cursor INTEGER NOT NULL DEFAULT 0, " +
+        "token TEXT NOT NULL DEFAULT '', " +
+        "lease INTEGER NOT NULL DEFAULT 0, " +
+        "next_at INTEGER NOT NULL DEFAULT 0, " +
+        "inflight TEXT NOT NULL DEFAULT '', " +
+        "total INTEGER NOT NULL DEFAULT 0, " +
+        "message TEXT NOT NULL DEFAULT '未開始', " +
+        "checked INTEGER NOT NULL DEFAULT 0)"
+      ),
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS nh_seen (" +
+        "key TEXT PRIMARY KEY, " +
+        "status TEXT NOT NULL, " +
+        "created INTEGER NOT NULL)"
+      ),
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS nh_retry (" +
+        "id INTEGER PRIMARY KEY, " +
+        "failures INTEGER NOT NULL DEFAULT 0)"
+      ),
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS nh_health (" +
+        "id INTEGER PRIMARY KEY, " +
+        "rate_fail INTEGER NOT NULL DEFAULT 0, " +
+        "errors INTEGER NOT NULL DEFAULT 0, " +
+        "kind TEXT NOT NULL DEFAULT '', " +
+        "success_at INTEGER NOT NULL DEFAULT 0)"
+      ),
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO nh_control (id) VALUES (1)"
+      ),
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO nh_retry (id) VALUES (1)"
+      ),
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO nh_health (id) VALUES (1)"
+      )
+    ]);
   }
 
   await original.DB.batch([
@@ -194,42 +204,76 @@ async function prepare(original) {
     )
   ]);
 
-  // 旧版の履歴・結果未確認の記事も、両アカウントで除外する。
-  await original.DB.batch([
+  if (await sql(
+    original,
+    "SELECT name FROM nh_migrations WHERE name='v12'"
+  ).first()) {
+    return;
+  }
+
+  const items = [];
+
+  for (const slot of SLOTS) {
+    const env = scoped(original, slot);
+
+    items.push(
+      sql(
+        env,
+        "INSERT OR IGNORE INTO nh_shared " +
+        "SELECT key, ?, 'history', created FROM nh_seen " +
+        "WHERE NOT EXISTS (" +
+        "SELECT 1 FROM nh_migrations WHERE name='v12')",
+        slot
+      ),
+      sql(
+        env,
+        "INSERT OR IGNORE INTO nh_shared " +
+        "SELECT inflight, ?, 'history', checked FROM nh_control " +
+        "WHERE inflight<>'' AND NOT EXISTS (" +
+        "SELECT 1 FROM nh_migrations WHERE name='v12')",
+        slot
+      ),
+      sql(
+        env,
+        "UPDATE nh_health SET rate_fail=1, kind='rate' " +
+        "WHERE id=1 AND EXISTS (" +
+        "SELECT 1 FROM nh_control WHERE message LIKE '%429%') " +
+        "AND NOT EXISTS (" +
+        "SELECT 1 FROM nh_migrations WHERE name='v12')"
+      ),
+      sql(
+        env,
+        "UPDATE nh_control " +
+        "SET next_at=MAX(next_at, ?), " +
+        "message='429の履歴を引継ぎ、最低2時間休止してから自動確認します' " +
+        "WHERE id=1 AND message LIKE '%429%' " +
+        "AND NOT EXISTS (" +
+        "SELECT 1 FROM nh_migrations WHERE name='v12')",
+        Date.now() + 2 * HOUR
+      )
+    );
+  }
+
+  items.push(
     original.DB.prepare(
-      "INSERT OR IGNORE INTO nh_shared " +
-      "SELECT key, '1', 'history', created FROM nh_seen " +
-      "WHERE NOT EXISTS (" +
-      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
-    ),
-    original.DB.prepare(
-      "INSERT OR IGNORE INTO nh_shared " +
-      "SELECT key, '2', 'history', created FROM nh_seen_2 " +
-      "WHERE NOT EXISTS (" +
-      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
-    ),
-    original.DB.prepare(
-      "INSERT OR IGNORE INTO nh_shared " +
-      "SELECT inflight, '1', 'history', checked FROM nh_control " +
-      "WHERE inflight<>'' AND NOT EXISTS (" +
-      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
-    ),
-    original.DB.prepare(
-      "INSERT OR IGNORE INTO nh_shared " +
-      "SELECT inflight, '2', 'history', checked FROM nh_control_2 " +
-      "WHERE inflight<>'' AND NOT EXISTS (" +
-      "SELECT 1 FROM nh_migrations WHERE name='v11-shared')"
-    ),
-    original.DB.prepare(
-      "INSERT OR IGNORE INTO nh_migrations VALUES ('v11-shared')"
+      "INSERT OR IGNORE INTO nh_migrations VALUES ('v12')"
     )
-  ]);
+  );
+
+  await original.DB.batch(items);
 }
 
 class Trouble extends Error {
-  constructor(message, wait = 300000) {
+  constructor(
+    message,
+    kind = "network",
+    retry = 0,
+    code = 0
+  ) {
     super(message);
-    this.wait = wait;
+    this.kind = kind;
+    this.retry = retry;
+    this.code = code;
   }
 }
 
@@ -241,8 +285,8 @@ async function api(
 ) {
   if (!env.NOTE_SESSION?.trim()) {
     throw new Trouble(
-      "要対応：ログイン情報が未設定です",
-      21600000
+      "ログイン情報が未設定です",
+      "auth"
     );
   }
 
@@ -276,41 +320,42 @@ async function api(
 
   if (!response.ok) {
     const code = response.status;
-    const retry = response.headers.get("Retry-After") || "";
+    const raw = response.headers.get("Retry-After") || "";
 
-    const parsed = /^\d+$/.test(retry)
-      ? Number(retry) * 1000
-      : Date.parse(retry) - Date.now();
+    const parsed = /^\d+$/.test(raw)
+      ? Number(raw) * 1000
+      : Date.parse(raw) - Date.now();
 
-    const wait = Number.isFinite(parsed)
+    const retry = Number.isFinite(parsed)
       ? Math.max(0, parsed)
       : 0;
 
     await response.body?.cancel().catch(() => {});
 
-    const base = [401, 403].includes(code)
-      ? 21600000
-      : code >= 500
-        ? 300000
-        : 3600000;
+    const kind = code === 429
+      ? "rate"
+      : [401, 403].includes(code)
+        ? "auth"
+        : code >= 500
+          ? "network"
+          : "response";
 
-    const detail = code === 401
-      ? "：要対応・ログイン情報を確認"
-      : code === 403
-        ? "：アクセス拒否・ログイン情報や利用制限を確認"
-        : code === 429
-          ? "：回数制限の解除待ち"
+    const reason = code === 429
+      ? "回数制限"
+      : code === 401
+        ? "ログイン情報の確認が必要"
+        : code === 403
+          ? "アクセス拒否。ログイン情報や利用制限の確認が必要"
           : code === 422
-            ? "：送信内容などを受け付けられません"
-            : "";
+            ? "送信内容などが受け付けられません"
+            : "応答エラー";
 
-    const error = new Trouble(
-      "note応答 " + code + detail,
-      Math.max(base, wait)
+    throw new Trouble(
+      "note応答 " + code + "：" + reason,
+      kind,
+      retry,
+      code
     );
-
-    error.code = code;
-    throw error;
   }
 
   if (post) {
@@ -320,14 +365,18 @@ async function api(
 
   try {
     const json = await response.json();
+    const data = json?.data ?? json;
 
-    if (!json || typeof json !== "object") {
+    if (!data || typeof data !== "object") {
       throw new Error();
     }
 
-    return json.data ?? json;
+    return data;
   } catch {
-    throw new Trouble("応答形式を確認できません");
+    throw new Trouble(
+      "応答形式を確認できません",
+      "response"
+    );
   }
 }
 
@@ -337,15 +386,15 @@ async function account(env) {
 
   if (!user?.id || !user?.urlname) {
     throw new Trouble(
-      "要対応：ログイン情報を更新してください",
-      21600000
+      "ログイン情報の更新が必要です",
+      "auth"
     );
   }
 
   return String(user.id);
 }
 
-async function detail(env, key) {
+async function article(env, key) {
   try {
     return await api(env, "/api/v3/notes/" + key);
   } catch (error) {
@@ -358,34 +407,46 @@ async function run(env) {
   const token = crypto.randomUUID();
   const now = Date.now();
 
-  const locked = await sql(
+  // 異常終了時には15分の待機を残す。
+  const lock = await sql(
     env,
     "UPDATE nh_control " +
     "SET token=?, lease=?, next_at=?, checked=? " +
     "WHERE id=1 AND enabled=1 AND lease<? AND next_at<=?",
     token,
     now + 300000,
-    Math.floor(now / INTERVAL) * INTERVAL + INTERVAL,
+    now + 900000,
     now,
     now,
     now
   ).run();
 
-  if (!locked.meta.changes) return;
+  if (!lock.meta.changes) return;
 
-  let stage = "準備";
+  let stage = "ログイン確認";
 
-  const note = message => sql(
-    env,
-    "UPDATE nh_control SET message=? WHERE id=1 AND token=?",
-    message,
-    token
-  ).run();
-
-  const reset = () => sql(
-    env,
-    "UPDATE nh_retry SET failures=0 WHERE id=1"
-  ).run();
+  const finish = async (message, successfulSend = false) => {
+    await env.DB.batch([
+      sql(
+        env,
+        "UPDATE nh_control SET message=?, next_at=? " +
+        "WHERE id=1 AND token=?",
+        message,
+        nextTick(),
+        token
+      ),
+      sql(
+        env,
+        "UPDATE nh_health SET errors=0, kind='', " +
+        "rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END, " +
+        "success_at=CASE WHEN ? THEN ? ELSE success_at END " +
+        "WHERE id=1",
+        successfulSend ? 1 : 0,
+        successfulSend ? 1 : 0,
+        Date.now()
+      )
+    ]);
+  };
 
   try {
     const state = await sql(
@@ -393,22 +454,20 @@ async function run(env) {
       "SELECT * FROM nh_control WHERE id=1"
     ).first();
 
-    stage = "ログイン確認";
-
     if (await account(env) !== state.account) {
       throw new Trouble(
-        "要対応：元のアカウントのログイン情報に戻してください",
-        21600000
+        "元のアカウントのログイン情報に戻してください",
+        "auth"
       );
     }
 
     if (state.inflight) {
       stage = "前回送信の確認";
 
-      const article = await detail(env, state.inflight);
-      const liked = article?.is_liked === true;
+      const data = await article(env, state.inflight);
+      const liked = data?.is_liked === true;
 
-      const previous = await sql(
+      const before = await sql(
         env,
         "SELECT status FROM nh_seen WHERE key=?",
         state.inflight
@@ -417,7 +476,7 @@ async function run(env) {
       await env.DB.batch([
         sql(
           env,
-          "INSERT INTO nh_seen VALUES (?, ?, ?) " +
+          "INSERT INTO nh_seen VALUES (?,?,?) " +
           "ON CONFLICT(key) DO UPDATE SET status=excluded.status",
           state.inflight,
           liked ? "liked" : "uncertain",
@@ -426,17 +485,20 @@ async function run(env) {
         sql(
           env,
           "UPDATE nh_control " +
-          "SET inflight='', total=total+?, message=? " +
+          "SET inflight='', total=total+? " +
           "WHERE id=1 AND token=?",
-          liked && previous?.status !== "liked" ? 1 : 0,
-          liked
-            ? "前回の記事のスキを確認しました"
-            : "前回の記事は再送せず除外しました",
+          liked && before?.status !== "liked" ? 1 : 0,
           token
         )
       ]);
 
-      await reset();
+      // 読み取り成功だけでは429の履歴をリセットしない。
+      await finish(
+        liked
+          ? "前回の記事のスキを確認。次回から候補を確認します"
+          : "前回の記事は結果未確認のため再送せず除外しました"
+      );
+
       return;
     }
 
@@ -460,12 +522,15 @@ async function run(env) {
     );
 
     if (!Array.isArray(data.notes)) {
-      throw new Trouble("記事一覧の形式を確認できません");
+      throw new Trouble(
+        "記事一覧の形式を確認できません",
+        "response"
+      );
     }
 
     const keys = [...new Set(
       data.notes
-        .map(n => n.key)
+        .map(n => n?.key)
         .filter(k =>
           typeof k === "string" &&
           /^n[a-z0-9]+$/.test(k)
@@ -473,40 +538,40 @@ async function run(env) {
     )].slice(0, 50);
 
     if (!keys.length) {
-      await note("#" + tag + "：記事なし");
-      await reset();
+      await finish("#" + tag + "：記事なし");
       return;
     }
 
-    const placeholders = keys.map(() => "?").join(",");
+    const marks = keys.map(() => "?").join(",");
 
     const seen = await sql(
       env,
       "SELECT key FROM nh_seen WHERE key IN (" +
-      placeholders +
+      marks +
       ") UNION SELECT key FROM nh_shared WHERE key IN (" +
-      placeholders + ")",
+      marks + ")",
       ...keys,
       ...keys
     ).all();
 
-    const done = new Set(seen.results.map(row => row.key));
+    const done = new Set(seen.results.map(r => r.key));
     const key = keys.find(k => !done.has(k));
 
     if (!key) {
-      await note("#" + tag + "：履歴・共通予約を除く候補なし");
-      await reset();
+      await finish(
+        "#" + tag + "：履歴・共通予約を除く候補なし"
+      );
       return;
     }
 
     stage = "記事確認";
 
-    const article = await detail(env, key);
+    const dataNote = await article(env, key);
 
     if (
-      !article ||
-      article.is_liked === true ||
-      String(article.user?.id ?? article.user_id) === state.account
+      !dataNote ||
+      dataNote.is_liked === true ||
+      String(dataNote.user?.id ?? dataNote.user_id) === state.account
     ) {
       await sql(
         env,
@@ -515,17 +580,16 @@ async function run(env) {
         Date.now()
       ).run();
 
-      await note(
+      await finish(
         "#" + tag + "：削除済み・スキ済み・自分の記事を除外"
       );
-
-      await reset();
       return;
     }
 
-    const referer = article.note_url || (
-      article.user?.urlname
-        ? "https://note.com/" + article.user.urlname + "/n/" + key
+    const referer = dataNote.note_url || (
+      dataNote.user?.urlname
+        ? "https://note.com/" +
+          dataNote.user.urlname + "/n/" + key
         : ""
     );
 
@@ -539,12 +603,14 @@ async function run(env) {
     } catch {}
 
     if (!valid) {
-      throw new Trouble("記事URLを確認できません", 3600000);
+      throw new Trouble(
+        "記事URLを確認できません",
+        "response"
+      );
     }
 
-    stage = "共通送信予約の保存";
+    stage = "共通予約の保存";
 
-    // 共通予約と未確認送信の記録を、送信前に一括保存する。
     const reserved = await env.DB.batch([
       sql(
         env,
@@ -588,10 +654,9 @@ async function run(env) {
       !reserved[0].meta.changes ||
       !reserved[2].meta.changes
     ) {
-      await note(
-        "共通予約済みの記事、または停止操作により送信を見送りました"
+      await finish(
+        "共通予約済み、または停止操作により送信を見送りました"
       );
-      await reset();
       return;
     }
 
@@ -606,11 +671,11 @@ async function run(env) {
 
     stage = "送信後の確認";
 
-    const after = await detail(env, key);
+    const after = await article(env, key);
 
     if (after?.is_liked !== true) {
       throw new Trouble(
-        "送信結果が未確認です。再送せず確認します"
+        "送信結果は未確認。再送せず次回に確認します"
       );
     }
 
@@ -622,44 +687,70 @@ async function run(env) {
       ),
       sql(
         env,
-        "UPDATE nh_control " +
-        "SET inflight='', total=total+1, message=? " +
+        "UPDATE nh_control SET inflight='', total=total+1 " +
         "WHERE id=1 AND token=?",
-        "スキ確認済み：" + key + "（#" + tag + "）",
         token
       )
     ]);
 
-    await reset();
+    await finish(
+      "スキ確認済み：" + key + "（#" + tag + "）",
+      true
+    );
   } catch (error) {
-    const count = await sql(
+    const kind = error instanceof Trouble
+      ? error.kind
+      : "storage";
+
+    const h = await sql(
       env,
-      "UPDATE nh_retry SET failures=failures+1 " +
-      "WHERE id=1 RETURNING failures"
+      "SELECT * FROM nh_health WHERE id=1"
     ).first();
 
-    const backoff = [300000, 900000, 3600000][
-      Math.min(2, count.failures - 1)
-    ];
+    const rates = h.rate_fail + (kind === "rate" ? 1 : 0);
+    const errors = h.errors + 1;
+
+    const base = kind === "rate"
+      ? [1, 2, 4, 8, 24][Math.min(4, rates - 1)] * HOUR
+      : kind === "auth"
+        ? 12 * HOUR
+        : kind === "response"
+          ? 6 * HOUR
+          : [300000, 900000, HOUR, 3 * HOUR][
+              Math.min(3, errors - 1)
+            ];
 
     const wait = Math.max(
-      backoff,
-      error instanceof Trouble ? error.wait : 3600000
+      base,
+      error instanceof Trouble ? error.retry : 0
     );
 
-    await sql(
-      env,
-      "UPDATE nh_control SET next_at=?, message=? " +
-      "WHERE id=1 AND token=?",
-      Date.now() + wait,
+    const message =
       "自動再確認待ち：" + stage + "／" +
       (
         error instanceof Trouble
           ? error.message
-          : "通信・保存・応答内容のエラー"
+          : "保存・内部処理のエラー"
+      );
+
+    await env.DB.batch([
+      sql(
+        env,
+        "UPDATE nh_health SET rate_fail=?, errors=?, kind=? " +
+        "WHERE id=1",
+        rates,
+        errors,
+        kind
       ),
-      token
-    ).run();
+      sql(
+        env,
+        "UPDATE nh_control SET next_at=?, message=? " +
+        "WHERE id=1 AND token=?",
+        Date.now() + wait,
+        message,
+        token
+      )
+    ]);
   } finally {
     await sql(
       env,
@@ -681,37 +772,46 @@ async function dashboard(original, prefix = "") {
       "SELECT * FROM nh_control WHERE id=1"
     ).first();
 
+    const h = await sql(
+      env,
+      "SELECT * FROM nh_health WHERE id=1"
+    ).first();
+
     const now = Date.now();
 
     const status = !s.enabled
       ? "停止中（開始操作が必要）"
       : s.lease > now
         ? "ON・処理中"
-        : s.next_at > now
-          ? s.message.startsWith("自動再確認待ち")
-            ? "ON・エラー後の待機中"
-            : "ON・次の実行待ち"
-          : "ON・定期実行待ち";
+        : h.kind === "auth"
+          ? "ON・要対応（ログイン情報や利用制限を確認）"
+          : s.next_at > now
+            ? h.kind
+              ? "ON・エラー後の休止中"
+              : "ON・次の実行待ち"
+            : "ON・定期実行待ち";
 
-    const eligible = Math.max(s.next_at, s.lease);
+    const next = Math.max(s.next_at, s.lease);
 
     blocks.push(
       "アカウント " + slot +
       "\n状態：" + status +
       "\n確認済みスキ累計：" + s.total + "件" +
       "\n最終実行：" + time(s.checked) +
+      "\nv12での最終送信成功：" + time(h.success_at) +
       (
         s.enabled
           ? "\n次回：" + (
-              eligible > now
-                ? time(eligible) + "以降の定期実行"
+              next > now
+                ? time(next) + "以降の定期実行"
                 : "次の定期実行"
             )
           : ""
       ) +
+      "\n送信成功まで保持する429回数：" + h.rate_fail +
       "\nログイン設定：" + (
         env.NOTE_SESSION?.trim()
-          ? "設定あり（有効性は実行時に確認）"
+          ? "設定あり（有効性は実行時確認）"
           : "未設定・要対応"
       ) +
       "\n" + s.message +
@@ -778,6 +878,12 @@ export default {
       await prepare(original);
 
       const env = scoped(original, slot);
+
+      const s = await sql(
+        env,
+        "SELECT * FROM nh_control WHERE id=1"
+      ).first();
+
       let message = "";
 
       if (action === "stop") {
@@ -788,16 +894,12 @@ export default {
 
         message = "アカウント " + slot + " を停止しました。";
       } else if (action === "start") {
-        const state = await sql(
-          env,
-          "SELECT * FROM nh_control WHERE id=1"
-        ).first();
-
-        if (state.lease > Date.now()) {
-          message =
-            "処理中です。少し待って状態を確認してください。";
+        if (s.lease > Date.now()) {
+          message = "処理中です。少し待って確認してください。";
         } else {
-          const id = await account(env);
+          // 既存アカウントは休止明けの定期実行で本人確認する。
+          // 開始ボタンによる制限中の追加アクセスを避ける。
+          const id = s.account || await account(env);
 
           const other = await sql(
             scoped(original, slot === "1" ? "2" : "1"),
@@ -806,10 +908,7 @@ export default {
 
           if (other.account === id) {
             message =
-              "もう一方と同じnoteです。別のログイン情報を設定してください。";
-          } else if (state.account && state.account !== id) {
-            message =
-              "元のアカウントのログイン情報に戻してください。";
+              "もう一方と同じnoteです。ログイン情報を確認してください。";
           } else {
             const result = await sql(
               env,
@@ -821,7 +920,7 @@ export default {
 
             message = result.meta.changes
               ? "アカウント " + slot +
-                " をONにしました。待機期限は保持します。"
+                " をONにしました。休止期限を守って自動確認します。"
               : "処理中のため変更しませんでした。";
           }
         }
@@ -833,11 +932,8 @@ export default {
       );
     } catch (error) {
       const message = error instanceof Trouble
-        ? error.message +
-          "。アカウント " + slot + " の " +
-          (slot === "2" ? "NOTE_SESSION_2" : "NOTE_SESSION") +
-          " を確認してください。"
-        : "接続・データベースの確認でエラーになりました。状態を再確認してください。";
+        ? error.message
+        : "接続・DB設定の確認に失敗しました。";
 
       try {
         return page(
@@ -856,19 +952,18 @@ export default {
         await prepare(original);
       } catch {
         console.error(
-          "note-helper: storage initialization failed; retry next cron"
+          "note-helper v12: database initialization failed"
         );
         return;
       }
 
-      // 一方の通信待ちやエラーで、もう一方を待たせない。
       await Promise.all(SLOTS.map(async slot => {
         try {
           await run(scoped(original, slot));
         } catch {
           console.error(
-            "note-helper: account " + slot +
-            " storage/runtime failure; retry next cron"
+            "note-helper v12: account " + slot +
+            " storage/runtime failure; retry later"
           );
         }
       }));
