@@ -10,7 +10,7 @@ const ORDERS = {
 };
 
 const SLOTS = ["1", "2"];
-const INTERVAL = 180000;
+const INTERVAL = 240000;
 const HOUR = 3600000;
 
 const sql = (env, query, ...args) =>
@@ -61,7 +61,7 @@ function page(
 <html lang="ja">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>note-helper v12</title>
+<title>note-helper v12.1</title>
 <style>
 body {
   font:17px system-ui;
@@ -84,11 +84,15 @@ pre {
   padding:16px
 }
 </style>
-<h1>note-helper v12</h1>
+<h1>note-helper v12.1</h1>
 <p>
 小説・短編小説・創作・散文・エッセイ・詩・日記<br>
-通常は約3分ごとに各アカウント最大1件。
-制限中は休止して自動確認します。
+通常は約4分ごとに各アカウント最大1件。
+</p>
+<p>
+エラー後は初回2時間、続けて失敗したら以後3時間休止します。
+noteからそれ以上の待機時間を指定された場合は、その時間を守ります。
+送信成功を確認すると失敗回数をリセットします。
 </p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
@@ -204,6 +208,7 @@ async function prepare(original) {
     )
   ]);
 
+  // v12の移行済みデータと休止期限をそのまま使う。
   if (await sql(
     original,
     "SELECT name FROM nh_migrations WHERE name='v12'"
@@ -320,7 +325,9 @@ async function api(
 
   if (!response.ok) {
     const code = response.status;
-    const raw = response.headers.get("Retry-After") || "";
+    const raw = (
+      response.headers.get("Retry-After") || ""
+    ).trim();
 
     const parsed = /^\d+$/.test(raw)
       ? Number(raw) * 1000
@@ -407,7 +414,7 @@ async function run(env) {
   const token = crypto.randomUUID();
   const now = Date.now();
 
-  // 異常終了時には15分の待機を残す。
+  // 保存処理まで完了できず異常終了した場合の待機。
   const lock = await sql(
     env,
     "UPDATE nh_control " +
@@ -415,7 +422,7 @@ async function run(env) {
     "WHERE id=1 AND enabled=1 AND lease<? AND next_at<=?",
     token,
     now + 300000,
-    now + 900000,
+    now + 2 * HOUR,
     now,
     now,
     now
@@ -437,10 +444,13 @@ async function run(env) {
       ),
       sql(
         env,
-        "UPDATE nh_health SET errors=0, kind='', " +
+        "UPDATE nh_health SET " +
+        "errors=CASE WHEN ? THEN 0 ELSE errors END, " +
+        "kind='', " +
         "rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END, " +
         "success_at=CASE WHEN ? THEN ? ELSE success_at END " +
         "WHERE id=1",
+        successfulSend ? 1 : 0,
         successfulSend ? 1 : 0,
         successfulSend ? 1 : 0,
         Date.now()
@@ -492,7 +502,7 @@ async function run(env) {
         )
       ]);
 
-      // 読み取り成功だけでは429の履歴をリセットしない。
+      // 過去の結果確認だけでは失敗回数をリセットしない。
       await finish(
         liked
           ? "前回の記事のスキを確認。次回から候補を確認します"
@@ -707,23 +717,19 @@ async function run(env) {
       "SELECT * FROM nh_health WHERE id=1"
     ).first();
 
-    const rates = h.rate_fail + (kind === "rate" ? 1 : 0);
-    const errors = h.errors + 1;
+    const rates = Number(h.rate_fail) +
+      (kind === "rate" ? 1 : 0);
+    const errors = Number(h.errors) + 1;
 
-    const base = kind === "rate"
-      ? [1, 2, 4, 8, 24][Math.min(4, rates - 1)] * HOUR
-      : kind === "auth"
-        ? 12 * HOUR
-        : kind === "response"
-          ? 6 * HOUR
-          : [300000, 900000, HOUR, 3 * HOUR][
-              Math.min(3, errors - 1)
-            ];
+    // 初回は2時間。送信成功まで、以後は3時間。
+    const base = (errors === 1 ? 2 : 3) * HOUR;
 
-    const wait = Math.max(
-      base,
-      error instanceof Trouble ? error.retry : 0
-    );
+    // noteが指定した待機時間を下回らない。
+    const serverWait = error instanceof Trouble
+      ? error.retry
+      : 0;
+
+    const wait = Math.max(base, serverWait);
 
     const message =
       "自動再確認待ち：" + stage + "／" +
@@ -731,6 +737,14 @@ async function run(env) {
         error instanceof Trouble
           ? error.message
           : "保存・内部処理のエラー"
+      ) +
+      "\n今回の休止：" +
+      (
+        serverWait > base
+          ? "noteが指定した待機時間を優先"
+          : errors === 1
+            ? "2時間"
+            : "3時間"
       );
 
     await env.DB.batch([
@@ -798,7 +812,8 @@ async function dashboard(original, prefix = "") {
       "\n状態：" + status +
       "\n確認済みスキ累計：" + s.total + "件" +
       "\n最終実行：" + time(s.checked) +
-      "\nv12での最終送信成功：" + time(h.success_at) +
+      "\n最終送信成功（v12から引継ぎ）：" +
+      time(h.success_at) +
       (
         s.enabled
           ? "\n次回：" + (
@@ -808,6 +823,7 @@ async function dashboard(original, prefix = "") {
             )
           : ""
       ) +
+      "\n送信成功まで保持する失敗回数：" + h.errors +
       "\n送信成功まで保持する429回数：" + h.rate_fail +
       "\nログイン設定：" + (
         env.NOTE_SESSION?.trim()
@@ -897,8 +913,7 @@ export default {
         if (s.lease > Date.now()) {
           message = "処理中です。少し待って確認してください。";
         } else {
-          // 既存アカウントは休止明けの定期実行で本人確認する。
-          // 開始ボタンによる制限中の追加アクセスを避ける。
+          // 既存アカウントの本人確認は休止後の定期実行で行う。
           const id = s.account || await account(env);
 
           const other = await sql(
@@ -952,7 +967,7 @@ export default {
         await prepare(original);
       } catch {
         console.error(
-          "note-helper v12: database initialization failed"
+          "note-helper v12.1: database initialization failed"
         );
         return;
       }
@@ -962,7 +977,7 @@ export default {
           await run(scoped(original, slot));
         } catch {
           console.error(
-            "note-helper v12: account " + slot +
+            "note-helper v12.1: account " + slot +
             " storage/runtime failure; retry later"
           );
         }
