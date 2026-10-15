@@ -1,3 +1,5 @@
+const VERSION = "v12.2";
+
 const ORDERS = {
   "1": [
     "小説", "短編小説", "創作", "散文",
@@ -12,6 +14,7 @@ const ORDERS = {
 const SLOTS = ["1", "2"];
 const INTERVAL = 240000;
 const HOUR = 3600000;
+const CHECK_INTERVAL = 300000;
 
 const sql = (env, query, ...args) =>
   env.DB.prepare(query).bind(...args);
@@ -54,14 +57,14 @@ function reply(body, html = false, status = 200) {
 }
 
 function page(
-  message = "鍵を入力して、両方の状態を確認してください。",
+  message = "管理用の鍵を入力してください。",
   slot = "1"
 ) {
   return reply(`<!doctype html>
 <html lang="ja">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>note-helper v12.1</title>
+<title>note-helper ${VERSION}</title>
 <style>
 body {
   font:17px system-ui;
@@ -84,15 +87,15 @@ pre {
   padding:16px
 }
 </style>
-<h1>note-helper v12.1</h1>
+<h1>note-helper ${VERSION}</h1>
 <p>
-小説・短編小説・創作・散文・エッセイ・詩・日記<br>
+対象：小説・短編小説・創作・散文・エッセイ・詩・日記<br>
 通常は約4分ごとに各アカウント最大1件。
 </p>
 <p>
-エラー後は初回2時間、続けて失敗したら以後3時間休止します。
-noteからそれ以上の待機時間を指定された場合は、その時間を守ります。
-送信成功を確認すると失敗回数をリセットします。
+エラー後は初回2時間、再び失敗したら以後3時間休止。
+noteから長い待機時間を指定された場合は、その時間を守ります。
+新しい送信の成功を確認すると失敗回数をリセットします。
 </p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
@@ -103,21 +106,34 @@ noteからそれ以上の待機時間を指定された場合は、その時間�
 <option value="2"${slot === "2" ? " selected" : ""}>2：追加したnote</option>
 </select>
 </label>
-<p>開始・停止は選んだ方のみ。状態は両方を表示します。</p>
+<p>
+開始・停止・接続確認は選んだアカウントだけに適用します。
+状態は両方を表示します。
+</p>
 <label>
 管理用の鍵（ADMIN_KEY）
 <input type="password" name="key" required
  autocomplete="off" autocapitalize="none" spellcheck="false">
 </label>
 <button name="action" value="status">両方の状態を確認</button>
+<button name="action" value="check_login">選択したアカウントの接続確認</button>
 <button name="action" value="start">自動運転を開始</button>
 <button name="action" value="stop">停止</button>
 </form>
 <p>
-開始を押しても休止期限は短縮しません。
-同じ記事は両アカウントで除外し、結果不明の記事も再送しません。
+接続確認はログイン情報と登録済みアカウントの一致を調べます。
+いいねは送らず、自動運転の休止期限も変更しません。
+各アカウントにつき5分に1回までです。
+noteが長い待機時間を指定した場合は、その期限を守ります。
 </p>
 <p>
+接続確認の結果は、表示された確認日時のものです。
+Cookieを変更したら対象のアカウントで再確認してください。
+接続確認OKでも、いいね送信が許可されるとは限りません。
+</p>
+<p>
+開始を押しても休止期限は短縮しません。
+同じ記事は両アカウントで除外し、結果不明の記事も再送しません。
 ログイン切れ・設定不備は手動対応が必要です。
 画面は自動更新されません。
 停止直前の送信は取り消せません。
@@ -205,10 +221,25 @@ async function prepare(original) {
     original.DB.prepare(
       "CREATE TABLE IF NOT EXISTS nh_migrations (" +
       "name TEXT PRIMARY KEY)"
+    ),
+    original.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS nh_connection_checks (" +
+      "slot TEXT PRIMARY KEY, " +
+      "next_at INTEGER NOT NULL DEFAULT 0, " +
+      "checked INTEGER NOT NULL DEFAULT 0, " +
+      "result TEXT NOT NULL DEFAULT '未確認', " +
+      "message TEXT NOT NULL DEFAULT '', " +
+      "token TEXT NOT NULL DEFAULT '')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_connection_checks (slot) VALUES ('1')"
+    ),
+    original.DB.prepare(
+      "INSERT OR IGNORE INTO nh_connection_checks (slot) VALUES ('2')"
     )
   ]);
 
-  // v12の移行済みデータと休止期限をそのまま使う。
+  // 既存のv12移行済みデータと休止期限は維持する。
   if (await sql(
     original,
     "SELECT name FROM nh_migrations WHERE name='v12'"
@@ -410,11 +441,123 @@ async function article(env, key) {
   }
 }
 
+async function checkConnection(original, slot) {
+  const env = scoped(original, slot);
+  const now = Date.now();
+
+  const state = await sql(
+    env,
+    "SELECT * FROM nh_control WHERE id=1"
+  ).first();
+
+  const health = await sql(
+    env,
+    "SELECT * FROM nh_health WHERE id=1"
+  ).first();
+
+  if (state.lease > now) {
+    return "アカウント " + slot +
+      " は自動処理中です。少し待って接続確認してください。";
+  }
+
+  // 429による休止中は、手動確認でも追加アクセスしない。
+  if (health.kind === "rate" && state.next_at > now) {
+    return "アカウント " + slot +
+      " は回数制限による休止中です。" +
+      "\n接続確認は " + time(state.next_at) +
+      " 以降に行ってください。";
+  }
+
+  const token = crypto.randomUUID();
+
+  const allowed = await sql(
+    original,
+    "UPDATE nh_connection_checks " +
+    "SET next_at=?, token=? " +
+    "WHERE slot=? AND next_at<=?",
+    now + CHECK_INTERVAL,
+    token,
+    slot,
+    now
+  ).run();
+
+  if (!allowed.meta.changes) {
+    const previous = await sql(
+      original,
+      "SELECT next_at FROM nh_connection_checks WHERE slot=?",
+      slot
+    ).first();
+
+    return "アカウント " + slot +
+      " の接続確認は " + time(previous.next_at) +
+      " 以降にもう一度できます。";
+  }
+
+  let result;
+  let message;
+  let wait = CHECK_INTERVAL;
+
+  try {
+    // ログイン情報の読み取りだけ。いいねは送らない。
+    const id = await account(env);
+
+    if (!state.account) {
+      result = "ログインOK・登録先未確認";
+      message =
+        "ログインできました。" +
+        "この枠は未登録のため、登録済みアカウントとの一致は未確認です。";
+    } else if (id !== state.account) {
+      result = "別アカウント・要修正";
+      message =
+        "Cookieが登録済みのnoteと一致しません。" +
+        (slot === "2" ? "NOTE_SESSION_2" : "NOTE_SESSION") +
+        " に、元のnoteのCookieを設定してください。";
+    } else {
+      result = "接続確認OK";
+      message =
+        "ログインでき、登録済みのnoteと一致しました。" +
+        "いいね送信の制限解除までは確認していません。";
+    }
+  } catch (error) {
+    result = "接続確認失敗";
+    message = error instanceof Trouble
+      ? error.message
+      : "通信・内部処理のエラー";
+
+    if (error instanceof Trouble) {
+      wait = Math.max(
+        CHECK_INTERVAL,
+        error.retry,
+        error.code === 429 ? 2 * HOUR : 0
+      );
+    }
+  }
+
+  await sql(
+    original,
+    "UPDATE nh_connection_checks " +
+    "SET checked=?, result=?, message=?, " +
+    "next_at=MAX(next_at, ?), token='' " +
+    "WHERE slot=? AND token=?",
+    Date.now(),
+    result,
+    message,
+    Date.now() + wait,
+    slot,
+    token
+  ).run();
+
+  return "アカウント " + slot + "：" + result +
+    "\n" + message +
+    "\nいいねは送信していません。" +
+    "\n自動運転の休止期限は変更していません。" +
+    "\n下の自動実行欄のエラーは前回実行の記録です。";
+}
+
 async function run(env) {
   const token = crypto.randomUUID();
   const now = Date.now();
 
-  // 保存処理まで完了できず異常終了した場合の待機。
   const lock = await sql(
     env,
     "UPDATE nh_control " +
@@ -502,13 +645,11 @@ async function run(env) {
         )
       ]);
 
-      // 過去の結果確認だけでは失敗回数をリセットしない。
       await finish(
         liked
           ? "前回の記事のスキを確認。次回から候補を確認します"
           : "前回の記事は結果未確認のため再送せず除外しました"
       );
-
       return;
     }
 
@@ -721,14 +862,10 @@ async function run(env) {
       (kind === "rate" ? 1 : 0);
     const errors = Number(h.errors) + 1;
 
-    // 初回は2時間。送信成功まで、以後は3時間。
     const base = (errors === 1 ? 2 : 3) * HOUR;
-
-    // noteが指定した待機時間を下回らない。
     const serverWait = error instanceof Trouble
       ? error.retry
       : 0;
-
     const wait = Math.max(base, serverWait);
 
     const message =
@@ -791,6 +928,12 @@ async function dashboard(original, prefix = "") {
       "SELECT * FROM nh_health WHERE id=1"
     ).first();
 
+    const check = await sql(
+      original,
+      "SELECT * FROM nh_connection_checks WHERE slot=?",
+      slot
+    ).first();
+
     const now = Date.now();
 
     const status = !s.enabled
@@ -798,7 +941,7 @@ async function dashboard(original, prefix = "") {
       : s.lease > now
         ? "ON・処理中"
         : h.kind === "auth"
-          ? "ON・要対応（ログイン情報や利用制限を確認）"
+          ? "ON・要対応（前回の自動実行で認証エラー）"
           : s.next_at > now
             ? h.kind
               ? "ON・エラー後の休止中"
@@ -809,11 +952,16 @@ async function dashboard(original, prefix = "") {
 
     blocks.push(
       "アカウント " + slot +
+      "\n\n【手動の接続確認】" +
+      "\n結果：" + (check?.result || "未確認") +
+      "\n確認日時：" + time(check?.checked) +
+      (check?.message ? "\n" + check.message : "") +
+      "\n※確認日時時点の結果です。Cookie更新後は再確認してください。" +
+      "\n\n【自動運転】" +
       "\n状態：" + status +
       "\n確認済みスキ累計：" + s.total + "件" +
       "\n最終実行：" + time(s.checked) +
-      "\n最終送信成功（v12から引継ぎ）：" +
-      time(h.success_at) +
+      "\n最終送信成功：" + time(h.success_at) +
       (
         s.enabled
           ? "\n次回：" + (
@@ -827,10 +975,10 @@ async function dashboard(original, prefix = "") {
       "\n送信成功まで保持する429回数：" + h.rate_fail +
       "\nログイン設定：" + (
         env.NOTE_SESSION?.trim()
-          ? "設定あり（有効性は実行時確認）"
+          ? "設定あり（有効性は接続確認・実行時に確認）"
           : "未設定・要対応"
       ) +
-      "\n" + s.message +
+      "\n前回の自動実行結果：" + s.message +
       "\n巡回順：" + ORDERS[slot].join(" → ")
     );
   }
@@ -886,12 +1034,21 @@ export default {
 
       if (
         !SLOTS.includes(slot) ||
-        !["status", "start", "stop"].includes(action)
+        !["status", "start", "stop", "check_login"].includes(action)
       ) {
         return reply("操作を選んでください。", false, 400);
       }
 
       await prepare(original);
+
+      if (action === "check_login") {
+        const message = await checkConnection(original, slot);
+
+        return page(
+          await dashboard(original, message),
+          slot
+        );
+      }
 
       const env = scoped(original, slot);
 
@@ -913,7 +1070,6 @@ export default {
         if (s.lease > Date.now()) {
           message = "処理中です。少し待って確認してください。";
         } else {
-          // 既存アカウントの本人確認は休止後の定期実行で行う。
           const id = s.account || await account(env);
 
           const other = await sql(
@@ -967,7 +1123,7 @@ export default {
         await prepare(original);
       } catch {
         console.error(
-          "note-helper v12.1: database initialization failed"
+          "note-helper: database initialization failed"
         );
         return;
       }
@@ -977,7 +1133,7 @@ export default {
           await run(scoped(original, slot));
         } catch {
           console.error(
-            "note-helper v12.1: account " + slot +
+            "note-helper: account " + slot +
             " storage/runtime failure; retry later"
           );
         }
