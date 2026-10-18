@@ -1,9 +1,19 @@
-const VERSION = 'v13';
+const VERSION = 'v13.1';
 const SLOTS = ['1', '2'];
 
 const ORDERS = {
-  '1': ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記'],
-  '2': ['エッセイ', '詩', '日記', '小説', '短編小説', '創作', '散文']
+  '1': [
+    '小説', '短編小説', '創作', '散文',
+    'エッセイ', '詩', '日記',
+    'ショートショート', '掌編小説',
+    '詩のようなもの', '自由詩', '独白', '希死念慮'
+  ],
+  '2': [
+    'ショートショート', '掌編小説',
+    '詩のようなもの', '自由詩', '独白', '希死念慮',
+    '小説', '短編小説', '創作', '散文',
+    'エッセイ', '詩', '日記'
+  ]
 };
 
 const HOUR = 3600000;
@@ -32,7 +42,9 @@ const time = n => n
   : 'まだありません';
 
 const day = () =>
-  new Date(Date.now() + 9 * HOUR).toISOString().slice(0, 10);
+  new Date(Date.now() + 9 * HOUR)
+    .toISOString()
+    .slice(0, 10);
 
 function scoped(env, slot) {
   return {
@@ -105,7 +117,7 @@ small {display:block}
 <h1>note-helper ${VERSION}</h1>
 <p>
 約4分ごとに各アカウント最大1件。
-対象：小説・短編小説・創作・散文・エッセイ・詩・日記。
+対象13タグ：${esc(ORDERS['1'].join('・'))}。
 </p>
 <p>
 エラー後は初回2時間、その後は3時間ずつ休止。
@@ -206,10 +218,8 @@ async function prepare(original) {
   await original.DB.batch([
     original.DB.prepare(
       'CREATE TABLE IF NOT EXISTS nh_shared (' +
-      'key TEXT PRIMARY KEY, ' +
-      'slot TEXT NOT NULL, ' +
-      'token TEXT NOT NULL, ' +
-      'created INTEGER NOT NULL)'
+      'key TEXT PRIMARY KEY, slot TEXT NOT NULL, ' +
+      'token TEXT NOT NULL, created INTEGER NOT NULL)'
     ),
     original.DB.prepare(
       'CREATE TABLE IF NOT EXISTS nh_migrations (' +
@@ -217,10 +227,8 @@ async function prepare(original) {
     ),
     original.DB.prepare(
       'CREATE TABLE IF NOT EXISTS nh_v13_credentials (' +
-      'slot TEXT PRIMARY KEY, ' +
-      'iv TEXT NOT NULL, ' +
-      'ciphertext TEXT NOT NULL, ' +
-      'updated INTEGER NOT NULL)'
+      'slot TEXT PRIMARY KEY, iv TEXT NOT NULL, ' +
+      'ciphertext TEXT NOT NULL, updated INTEGER NOT NULL)'
     ),
     original.DB.prepare(
       "CREATE TABLE IF NOT EXISTS nh_v13_connection (" +
@@ -239,10 +247,8 @@ async function prepare(original) {
     ),
     original.DB.prepare(
       'CREATE TABLE IF NOT EXISTS nh_v13_success (' +
-      'slot TEXT NOT NULL, ' +
-      'key TEXT NOT NULL, ' +
-      'day TEXT NOT NULL, ' +
-      'confirmed INTEGER NOT NULL, ' +
+      'slot TEXT NOT NULL, key TEXT NOT NULL, ' +
+      'day TEXT NOT NULL, confirmed INTEGER NOT NULL, ' +
       'PRIMARY KEY(slot,key))'
     ),
     original.DB.prepare(
@@ -254,9 +260,7 @@ async function prepare(original) {
   if (await sql(
     original,
     "SELECT name FROM nh_migrations WHERE name='v13-history'"
-  ).first()) {
-    return;
-  }
+  ).first()) return;
 
   const items = [];
 
@@ -454,7 +458,6 @@ async function api(
 
   if (!response.ok) {
     const code = response.status;
-
     const raw = (
       response.headers.get('Retry-After') || ''
     ).trim();
@@ -569,12 +572,16 @@ async function release(env, token) {
   await sql(
     env,
     "UPDATE nh_control SET token='', lease=0 " +
-    "WHERE id=1 AND token=?",
+    'WHERE id=1 AND token=?',
     token
   ).run();
 }
 
-async function connection(original, slot, candidate = null) {
+async function connection(
+  original,
+  slot,
+  candidate = null
+) {
   let env = scoped(original, slot);
 
   if (candidate !== null) {
@@ -673,33 +680,29 @@ async function connection(original, slot, candidate = null) {
           candidate
         );
 
-        items.push(
-          sql(
-            original,
-            'INSERT INTO nh_v13_credentials ' +
-            '(slot,iv,ciphertext,updated) VALUES (?,?,?,?) ' +
-            'ON CONFLICT(slot) DO UPDATE SET ' +
-            'iv=excluded.iv, ' +
-            'ciphertext=excluded.ciphertext, ' +
-            'updated=excluded.updated',
-            slot,
-            encrypted.iv,
-            encrypted.ciphertext,
-            Date.now()
-          )
-        );
+        items.push(sql(
+          original,
+          'INSERT INTO nh_v13_credentials ' +
+          '(slot,iv,ciphertext,updated) VALUES (?,?,?,?) ' +
+          'ON CONFLICT(slot) DO UPDATE SET ' +
+          'iv=excluded.iv, ' +
+          'ciphertext=excluded.ciphertext, ' +
+          'updated=excluded.updated',
+          slot,
+          encrypted.iv,
+          encrypted.ciphertext,
+          Date.now()
+        ));
       }
 
-      items.push(
-        sql(
-          original,
-          'UPDATE nh_v13_connection ' +
-          'SET checked=?, ok=1, message=? WHERE slot=?',
-          Date.now(),
-          message,
-          slot
-        )
-      );
+      items.push(sql(
+        original,
+        'UPDATE nh_v13_connection ' +
+        'SET checked=?, ok=1, message=? WHERE slot=?',
+        Date.now(),
+        message,
+        slot
+      ));
 
       await original.DB.batch(items);
 
@@ -724,8 +727,9 @@ async function connection(original, slot, candidate = null) {
         'hold_until=MAX(hold_until,?), ' +
         'next_check=MAX(next_check,?) WHERE slot=?',
         Date.now(),
-        (candidate !== null ? '更新用Cookieの確認：' : '') +
-          message,
+        (candidate !== null
+          ? '更新用Cookieの確認：'
+          : '') + message,
         Date.now() + wait,
         Date.now() + Math.max(LEASE, wait),
         slot
@@ -741,13 +745,15 @@ async function connection(original, slot, candidate = null) {
 
 async function run(baseEnv) {
   const token = await acquire(baseEnv, true);
-
   if (!token) return;
 
   let env = baseEnv;
   let stage = 'ログイン確認';
 
-  const finish = async (message, success = false) => {
+  const finish = async (
+    message,
+    success = false
+  ) => {
     await env.DB.batch([
       sql(
         env,
@@ -760,12 +766,12 @@ async function run(baseEnv) {
       ),
       sql(
         env,
-        "UPDATE nh_health SET " +
-        "errors=CASE WHEN ? THEN 0 ELSE errors END, " +
+        'UPDATE nh_health ' +
+        'SET errors=CASE WHEN ? THEN 0 ELSE errors END, ' +
         "kind='', " +
-        "rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END, " +
-        "success_at=CASE WHEN ? THEN ? ELSE success_at END " +
-        "WHERE id=1",
+        'rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END, ' +
+        'success_at=CASE WHEN ? THEN ? ELSE success_at END ' +
+        'WHERE id=1',
         +success,
         +success,
         +success,
@@ -815,23 +821,21 @@ async function run(baseEnv) {
         sql(
           env,
           "UPDATE nh_control SET inflight='', total=total+? " +
-          "WHERE id=1 AND token=?",
+          'WHERE id=1 AND token=?',
           +add,
           token
         )
       ];
 
       if (add) {
-        items.push(
-          sql(
-            env,
-            'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',
-            env.SLOT,
-            state.inflight,
-            day(),
-            Date.now()
-          )
-        );
+        items.push(sql(
+          env,
+          'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',
+          env.SLOT,
+          state.inflight,
+          day(),
+          Date.now()
+        ));
       }
 
       await env.DB.batch(items);
@@ -897,7 +901,10 @@ async function run(baseEnv) {
       ...keys
     ).all();
 
-    const done = new Set(seen.results.map(r => r.key));
+    const done = new Set(
+      seen.results.map(r => r.key)
+    );
+
     const key = keys.find(k => !done.has(k));
 
     if (!key) {
@@ -926,6 +933,7 @@ async function run(baseEnv) {
       await finish(
         '#' + tag + '：削除済み・スキ済み・自分の記事を除外'
       );
+
       return;
     }
 
@@ -940,7 +948,6 @@ async function run(baseEnv) {
 
     try {
       const u = new URL(referer);
-
       valid =
         u.origin === 'https://note.com' &&
         u.pathname.endsWith('/n/' + key);
@@ -971,9 +978,9 @@ async function run(baseEnv) {
       ),
       sql(
         env,
-        "INSERT OR IGNORE INTO nh_seen (key,status,created) " +
+        'INSERT OR IGNORE INTO nh_seen (key,status,created) ' +
         "SELECT ?, 'pending', ? WHERE EXISTS (" +
-        "SELECT 1 FROM nh_shared WHERE key=? AND token=?)",
+        'SELECT 1 FROM nh_shared WHERE key=? AND token=?)',
         key,
         Date.now(),
         key,
@@ -1030,7 +1037,7 @@ async function run(baseEnv) {
       sql(
         env,
         "UPDATE nh_control SET inflight='', total=total+1 " +
-        "WHERE id=1 AND token=?",
+        'WHERE id=1 AND token=?',
         token
       ),
       sql(
@@ -1058,7 +1065,6 @@ async function run(baseEnv) {
     ).first();
 
     const errors = Number(h.errors) + 1;
-
     const rates = Number(h.rate_fail) +
       (kind === 'rate' ? 1 : 0);
 
@@ -1146,7 +1152,6 @@ async function dashboard(original, prefix = '') {
     ).first();
 
     const now = Date.now();
-
     const next = Math.max(
       s.next_at,
       s.lease,
@@ -1184,7 +1189,7 @@ async function dashboard(original, prefix = '') {
       'アカウント ' + slot +
       '\n状態：' + status +
       '\n今日のスキ確認成功：' +
-      today.count + '件（日本時間）' +
+        today.count + '件（日本時間）' +
       '\n累計：' + s.total + '件' +
       '\n最終自動実行：' + time(s.checked) +
       '\n最終送信成功：' + time(h.success_at) +
@@ -1235,7 +1240,9 @@ export default {
     ) {
       return page(
         undefined,
-        url.searchParams.get('account') === '2' ? '2' : '1'
+        url.searchParams.get('account') === '2'
+          ? '2'
+          : '1'
       );
     }
 
@@ -1284,7 +1291,8 @@ export default {
 
       if (
         !SLOTS.includes(slot) ||
-        !['status', 'start', 'stop', 'check', 'save'].includes(action)
+        !['status', 'start', 'stop', 'check', 'save']
+          .includes(action)
       ) {
         return reply(
           '操作を選んでください。',
@@ -1312,12 +1320,14 @@ export default {
           'UPDATE nh_control SET enabled=0 WHERE id=1'
         ).run();
 
-        message = 'アカウント ' + slot + ' を停止しました。';
+        message =
+          'アカウント ' + slot + ' を停止しました。';
       } else if (action === 'start') {
         const token = await acquire(env, false);
 
         if (!token) {
-          message = '処理中、またはnoteが指定した待機中です。';
+          message =
+            '処理中、またはnoteが指定した待機中です。';
         } else {
           try {
             const s = await sql(
@@ -1328,7 +1338,10 @@ export default {
             const id = s.account || await account(env);
 
             const other = await sql(
-              scoped(original, slot === '1' ? '2' : '1'),
+              scoped(
+                original,
+                slot === '1' ? '2' : '1'
+              ),
               'SELECT account FROM nh_control WHERE id=1'
             ).first();
 
@@ -1344,7 +1357,8 @@ export default {
                 token
               ).run();
 
-              message = 'アカウント ' + slot +
+              message =
+                'アカウント ' + slot +
                 ' をONにしました。休止期限は保持します。';
             }
           } finally {
