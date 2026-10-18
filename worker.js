@@ -1,4 +1,4 @@
-const VERSION = 'v14';
+const VERSION = 'v14.1';
 const SLOTS = ['1', '2'];
 const ORDERS = {
   '1': ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮'],
@@ -135,21 +135,42 @@ function statItems(env, tag, field) {
 }
 async function telegram(env, method, body) {
   const token = String(env.TELEGRAM_BOT_TOKEN || '').trim();
-  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Trouble('TELEGRAM_BOT_TOKENをCloudflareのSecretに設定してください','config');
-  let response, data;
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) {
+    throw new Trouble('Telegram設定エラー：TELEGRAM_BOT_TOKENはBotFatherのトークンだけを保存してください', 'config');
+  }
+  let response;
   try {
-    response = await fetch('https://api.telegram.org/bot'+token+'/'+method,{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),
-      redirect:'error',signal:AbortSignal.timeout(15000)
+    response = await fetch('https://api.telegram.org/bot'+token+'/'+method, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body), redirect:'manual',
+      signal:AbortSignal.timeout(15000)
     });
-    data = await response.json();
-  } catch { throw new Trouble('Telegramへの接続に失敗しました'); }
-  if (!response.ok || data.ok !== true) {
-    const retry = Number(data?.parameters?.retry_after) || 0;
-    throw new Trouble('Telegram通知エラー。Botのトークン・連携・ブロック状態を確認してください','notification',Math.max(0,retry)*1000,response.status);
+  } catch (error) {
+    const reason = ['TimeoutError','AbortError'].includes(error?.name)
+      ? '15秒以内に応答がありませんでした'
+      : 'CloudflareからTelegramへの通信を開始・完了できませんでした';
+    throw new Trouble('Telegram通信エラー：'+reason+'。トークン不正かどうかは未確認です');
+  }
+  let data;
+  try { data = await response.json(); }
+  catch {
+    throw new Trouble('Telegram応答エラー：HTTP '+response.status+'。JSON形式の応答を取得できませんでした。トークンの正否は未確認です', 'notification', 0, response.status);
+  }
+  if (!response.ok || data?.ok !== true) {
+    const code = Number(data?.error_code) || response.status;
+    const seconds = Number(data?.parameters?.retry_after);
+    const retry = Number.isFinite(seconds) ? Math.max(0, seconds)*1000 : 0;
+    const reason = code === 401 || code === 404
+      ? 'Botトークンを確認してください。BotFatherのAPI Tokenをコピーし直してSecretを更新してください'
+      : code === 403 ? 'Botがブロックされていないか確認してください'
+      : code === 409 ? '同じBotが別の仕組みで使われています。この通知専用のBotを使ってください'
+      : code === 429 ? 'Telegramの回数制限です。待ってから再確認してください'
+      : 'Telegramが操作を受け付けませんでした。設定を確認してください';
+    throw new Trouble('Telegram応答エラー：'+code+'／'+reason, 'notification', retry, code);
   }
   return data.result;
 }
+
 async function telegramAction(env, action) {
   if (action === 'tg_off') {
     await env.DB.batch([
