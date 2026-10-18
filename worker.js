@@ -1,10 +1,10 @@
-const VERSION = 'v14.1';
+const VERSION = 'v14.2';
 const SLOTS = ['1', '2'];
 const ORDERS = {
   '1': ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮'],
   '2': ['ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記']
 };
-const HOUR = 3600000, INTERVAL = 240000, LEASE = 300000;
+const HOUR = 3600000, INTERVAL = 210000, LEASE = 300000;
 const sql = (env, q, ...a) => env.DB.prepare(q).bind(...a);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time = n => n ? new Date(n).toLocaleString('ja-JP', {timeZone:'Asia/Tokyo'}) : 'まだありません';
@@ -30,7 +30,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1>
-<p>約4分ごとに各アカウント最大1件。タグは管理画面で変更できます。初期設定は13タグです。</p>
+<p>通常は処理完了から210秒（3分30秒）以上あけて、各アカウント最大1件。実行が遅れる場合があります。タグは管理画面で変更できます。初期設定は13タグです。</p>
 <p>エラー後は毎回2時間ずつ休止して再確認します。noteが長い待機時間を指定した場合は、その時間を守ります。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
@@ -379,7 +379,7 @@ async function run(baseEnv) {
   const finish = async (message, success = false) => {
     await env.DB.batch([
       ...statItems(env, activeTag, success ? 'sent' : 'skips'),
-      sql(env, 'UPDATE nh_control SET message=?, next_at=? WHERE id=1 AND token=?', message, Math.floor(Date.now()/INTERVAL)*INTERVAL+INTERVAL, token),
+      sql(env, 'UPDATE nh_control SET message=?, next_at=? WHERE id=1 AND token=?', message, Date.now()+INTERVAL, token),
       sql(env, "UPDATE nh_health SET errors=CASE WHEN ? THEN 0 ELSE errors END, kind='', rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END, success_at=CASE WHEN ? THEN ? ELSE success_at END WHERE id=1", +success,+success,+success,Date.now())
     ]);
   };
@@ -543,6 +543,8 @@ export default {
           }
         } finally { await release(env,token); }
       }
+      try { await wakeScheduler(original); }
+      catch { message += '\n実行予約の確認に失敗しました。CloudflareのSCHEDULER設定とログを確認してください。'; }
       return page(await dashboard(original,message),slot,await getSettings(original));
     } catch (error) {
       const message = error instanceof Trouble ? error.message : '接続・保存・設定の確認に失敗しました。';
@@ -550,12 +552,56 @@ export default {
     }
   },
   async scheduled(event, original, ctx) {
-    ctx.waitUntil((async () => {
-      try { await prepare(original); } catch { console.error('note-helper: database initialization failed'); return; }
-      await Promise.all(SLOTS.map(async slot => {
-        try { await run(scoped(original,slot)); } catch { console.error('note-helper: account ' + slot + ' storage/runtime failure'); }
-      }));
-      try { await flushAlerts(original); } catch { console.error('note-helper: notification delivery deferred'); }
-    })());
+    // Cronは予約の復旧専用。ここから直接いいねは送信しない。
+    ctx.waitUntil(wakeScheduler(original));
   }
 };
+
+async function wakeScheduler(env) {
+  if (!env.SCHEDULER) throw new Error('Scheduler binding missing');
+  const id = env.SCHEDULER.idFromName('note-helper-210-seconds');
+  const response = await env.SCHEDULER.get(id).fetch('https://scheduler.internal/wake');
+  if (!response.ok) throw new Error('Scheduler unavailable');
+}
+
+// 秒単位の予約だけを担当する。既存の履歴・認証・休止期限はD1で保持する。
+export class NoteScheduler {
+  constructor(ctx, env) { this.ctx = ctx; this.env = env; this.busy = false; }
+  async fetch() {
+    if (!this.busy) {
+      const at = await this.ctx.storage.getAlarm();
+      // 既存の未来の予約を前倒ししない。予約喪失時だけ復旧する。
+      if (at === null || at < Date.now() - 300000) {
+        await this.ctx.storage.setAlarm(Date.now() + 1000);
+      }
+    }
+    return new Response('OK');
+  }
+  async alarm() {
+    this.busy = true;
+    try {
+      // 異常終了時にも次の確認を予約。D1のlease/next_atで再送を抑止する。
+      await this.ctx.storage.setAlarm(Date.now() + 120000);
+      await prepare(this.env);
+      await Promise.all(SLOTS.map(async slot => {
+        try { await run(scoped(this.env, slot)); }
+        catch { console.error('note-helper: account ' + slot + ' storage/runtime failure'); }
+      }));
+      try { await flushAlerts(this.env); }
+      catch { console.error('note-helper: notification delivery deferred'); }
+      await this.plan();
+    } finally { this.busy = false; }
+  }
+  async plan() {
+    let next = Date.now() + 120000; // 停止・手動変更・通知再試行も定期確認する。
+    for (const slot of SLOTS) {
+      const env = scoped(this.env, slot);
+      const state = await sql(env, 'SELECT * FROM nh_control WHERE id=1').first();
+      const connection = await sql(env, 'SELECT hold_until FROM nh_v13_connection WHERE slot=?', slot).first();
+      if (state.enabled) {
+        next = Math.min(next, Math.max(Date.now()+1000, state.next_at, state.lease, connection?.hold_until || 0));
+      }
+    }
+    await this.ctx.storage.setAlarm(next);
+  }
+}
