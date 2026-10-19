@@ -1,4 +1,4 @@
-const VERSION = 'v15';
+const VERSION = 'v15.1';
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
 const HOUR = 3600000, INTERVAL = 240000, LEASE = 300000;
@@ -45,7 +45,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <button name="action" value="save">本人確認してCookieを保存</button>
 <small>登録済みのnote本人と確認できた場合だけ暗号化保存します。失敗時は以前の設定を残します。いいねは送信しません。</small></details>
 <details><summary>巡回タグ・間隔・探索件数を変更</summary>
-<p>「両方の状態を確認」を押すと現在の設定を読み込みます。タグは1行に1つ。保存すると両アカウントに適用し、2番の巡回順をずらします。</p>
+<p>「両方の状態を確認」を押すと現在の設定を読み込みます。タグは1行に1つ、最大35個。保存すると両アカウントに適用し、2番の巡回順をずらします。</p>
 <label>タグ一覧<textarea name="tags" rows="13" maxlength="3000" placeholder="状態確認で現在のタグを表示">${settings ? esc(settings.tags.join('\n')) : ''}</textarea></label>
 <label>同じ作者への間隔（時間・1〜168）<input name="author_hours" type="number" min="1" max="168" step="1" value="${settings ? settings.author_hours : ''}"></label>
 <p>同じ作者への待機は2垢で共有します。結果不明の送信も履歴に残し、別の作者を探します。旧版で記録済みの作者履歴を引き継ぎます。</p>
@@ -189,7 +189,7 @@ async function saveSettings(env, form) {
   if (raw.length > 3000) throw new Trouble('タグの入力が長すぎます','config');
   const tags = [...new Set(raw.split(/[\s,、・，]+/u).map(t=>t.replace(/^[#＃]+/u,'').trim()).filter(Boolean))];
   const hours = Number(form.get('author_hours'));
-  if (!tags.length || tags.length>30 || tags.some(t=>[...t].length>50 || /[\x00-\x1f\x7f<>/#＃]/u.test(t))) throw new Trouble('タグは1〜30個、各50文字以内で入力してください','config');
+  if (!tags.length || tags.length>35 || tags.some(t=>[...t].length>50 || /[\x00-\x1f\x7f<>/#＃]/u.test(t))) throw new Trouble('タグは1〜35個、各50文字以内で入力してください','config');
   if (!Number.isInteger(hours) || hours<1 || hours>168) throw new Trouble('作者への間隔は1〜168時間の整数で入力してください','config');
   const current = await getSettings(env);
   const read = (name,min,max,step=1) => {
