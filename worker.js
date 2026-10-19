@@ -1,10 +1,10 @@
-const VERSION = 'v14.2';
+const VERSION = 'v14.3';
 const SLOTS = ['1', '2'];
 const ORDERS = {
   '1': ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮'],
   '2': ['ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記']
 };
-const HOUR = 3600000, INTERVAL = 210000, LEASE = 300000;
+const HOUR = 3600000, INTERVAL = 240000, LEASE = 300000;
 const sql = (env, q, ...a) => env.DB.prepare(q).bind(...a);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time = n => n ? new Date(n).toLocaleString('ja-JP', {timeZone:'Asia/Tokyo'}) : 'まだありません';
@@ -30,7 +30,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1>
-<p>通常は処理完了から210秒（3分30秒）以上あけて、各アカウント最大1件。実行が遅れる場合があります。タグは管理画面で変更できます。初期設定は13タグです。</p>
+<p>通常は処理完了から240秒（4分）以上あけて、各アカウント最大1件。実行が遅れる場合があります。タグは管理画面で変更できます。初期設定は13タグです。</p>
 <p>エラー後は毎回2時間ずつ休止して再確認します。noteが長い待機時間を指定した場合は、その時間を守ります。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
