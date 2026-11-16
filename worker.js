@@ -1,16 +1,16 @@
-const VERSION = 'v15.1';
+const VERSION = 'v15.2';
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
 const HOUR = 3600000, INTERVAL = 240000, LEASE = 300000;
 const sql = (env, q, ...a) => env.DB.prepare(q).bind(...a);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time = n => n ? new Date(n).toLocaleString('ja-JP', {timeZone:'Asia/Tokyo'}) : 'まだありません';
-const day = () => new Date(Date.now() + 9 * HOUR).toISOString().slice(0, 10);
-function scoped(env, slot) {
-  return {...env, SLOT:slot, NOTE_SESSION:slot === '2' ? env.NOTE_SESSION_2 : env.NOTE_SESSION,
-    DB:slot === '1' ? env.DB : {
-      prepare:q => env.DB.prepare(q.replace(/\b(nh_control|nh_seen|nh_health)\b/g, '$1_2')),
-      batch:items => env.DB.batch(items)
+const day = (ago=0) => new Date(Date.now() + 9 * HOUR - ago * 24 * HOUR).toISOString().slice(0, 10);
+function scoped(original, slot) {
+  return {...original, SLOT:slot, NOTE_SESSION:slot === '2' ? original.NOTE_SESSION_2 : original.NOTE_SESSION,
+    DB:slot === '1' ? original.DB : {
+      prepare:q => original.DB.prepare(q.replace(/\b(nh_control|nh_seen|nh_health)\b/g, '$1_2')),
+      batch:items => original.DB.batch(items)
     }};
 }
 function reply(body, html = false, status = 200) {
@@ -21,14 +21,14 @@ function reply(body, html = false, status = 200) {
     'X-Content-Type-Options':'nosniff'
   }});
 }
-function page(message = '管理用の鍵を入力してください。', slot = '1', settings = null) {
+function page(message = '管理用の鍵を入力してください。', slot = '1', settings = null, status = 200) {
   return reply(`<!doctype html><html lang="ja"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
-<p>エラー後は毎回2時間ずつ休止して再確認します。noteが長い待機時間を指定した場合は、その時間を守ります。</p>
+<p>通常の通信エラー後は2時間休止します。noteが長い待機時間を指定した場合は、その時間を守ります。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
 <label>操作するアカウント<select name="account">
@@ -63,77 +63,97 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <button name="action" value="tg_pair">① 連携コードを発行</button>
 <button name="action" value="tg_connect">② Telegramとの連携を確認</button>
 <button name="action" value="tg_test">通知をテスト</button>
-<button name="action" value="tg_off">通知を解除</button>
-</details>
+<button name="action" value="tg_off">通知を解除</button></details>
 </form>
 <p>接続確認・Cookie保存は各アカウント5分に1回まで。回数制限の休止中やnoteが指定した待機中は実行しません。画面は自動更新されません。</p>
-<p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true);
+<p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
+}
+
+const READY = 'v15.2-ready';
+function errorText(error) {
+  return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
+}
+function readLimit(error) {
+  return /D1_ERROR/i.test(errorText(error)) && /daily row read limit/i.test(errorText(error));
+}
+const quotaMessage = 'Cloudflare D1の日次読み取り上限に達しました。枠は日本時間9:00に更新されます。状態や操作結果は、更新後に「両方の状態を確認」で確認してください。';
+function failure(error) {
+  if (readLimit(error)) return quotaMessage;
+  if (error instanceof Trouble) return error.message;
+  if (/D1_ERROR|D1_EXEC_ERROR/i.test(errorText(error))) return 'Cloudflare D1で読み込みまたは保存に失敗しました。日次読み取り上限かどうかは未確認です。';
+  return '接続・保存・内部処理に失敗しました。操作結果を確認できません。';
 }
 async function prepare(original) {
+  // D1に永続化した完了行を主キーで読む。途中失敗ではこの行を書かない。
+  try {
+    if (await sql(original,'SELECT name FROM nh_migrations WHERE name=?',READY).first()) return;
+  } catch (error) {
+    if (!/no such table:\s*(?:main\.)?nh_migrations\b/i.test(errorText(error))) throw error;
+  }
+  const db = original.DB;
+  const schema = [];
   for (const slot of SLOTS) {
-    const env = scoped(original, slot);
-    await env.DB.batch([
+    const env = scoped(original,slot);
+    schema.push(
       env.DB.prepare("CREATE TABLE IF NOT EXISTS nh_control (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, account TEXT NOT NULL DEFAULT '', cursor INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL DEFAULT '', lease INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, inflight TEXT NOT NULL DEFAULT '', total INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '未開始', checked INTEGER NOT NULL DEFAULT 0)"),
       env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_seen (key TEXT PRIMARY KEY, status TEXT NOT NULL, created INTEGER NOT NULL)'),
       env.DB.prepare("CREATE TABLE IF NOT EXISTS nh_health (id INTEGER PRIMARY KEY, rate_fail INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT '', success_at INTEGER NOT NULL DEFAULT 0)"),
       env.DB.prepare('INSERT OR IGNORE INTO nh_control (id) VALUES (1)'),
       env.DB.prepare('INSERT OR IGNORE INTO nh_health (id) VALUES (1)')
-    ]);
-  }
-  await original.DB.batch([
-    original.DB.prepare('CREATE TABLE IF NOT EXISTS nh_shared (key TEXT PRIMARY KEY, slot TEXT NOT NULL, token TEXT NOT NULL, created INTEGER NOT NULL)'),
-    original.DB.prepare('CREATE TABLE IF NOT EXISTS nh_migrations (name TEXT PRIMARY KEY)'),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v13_credentials (slot TEXT PRIMARY KEY, iv TEXT NOT NULL, ciphertext TEXT NOT NULL, updated INTEGER NOT NULL)"),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v13_connection (slot TEXT PRIMARY KEY, next_check INTEGER NOT NULL DEFAULT 0, hold_until INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '未確認')"),
-    original.DB.prepare("INSERT OR IGNORE INTO nh_v13_connection (slot) VALUES ('1')"),
-    original.DB.prepare("INSERT OR IGNORE INTO nh_v13_connection (slot) VALUES ('2')"),
-    original.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v13_success (slot TEXT NOT NULL, key TEXT NOT NULL, day TEXT NOT NULL, confirmed INTEGER NOT NULL, PRIMARY KEY(slot,key))'),
-    original.DB.prepare('CREATE INDEX IF NOT EXISTS nh_v13_success_day ON nh_v13_success(day,slot)')
-  ]);
-  await original.DB.batch([
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v14_settings (id INTEGER PRIMARY KEY, tags TEXT NOT NULL, author_hours INTEGER NOT NULL DEFAULT 24)"),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v14_authors (slot TEXT NOT NULL, author TEXT NOT NULL, last_at INTEGER NOT NULL, token TEXT NOT NULL, PRIMARY KEY(slot,author))"),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v14_stats (slot TEXT NOT NULL, tag TEXT NOT NULL, day TEXT NOT NULL, checks INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, skips INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(slot,tag,day))"),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v14_telegram (id INTEGER PRIMARY KEY, chat_id TEXT NOT NULL DEFAULT '', nonce TEXT NOT NULL DEFAULT '', expires INTEGER NOT NULL DEFAULT 0, next_test INTEGER NOT NULL DEFAULT 0, last_sent INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '未連携')"),
-    original.DB.prepare("INSERT OR IGNORE INTO nh_v14_telegram (id) VALUES (1)"),
-    original.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v14_alerts (slot TEXT PRIMARY KEY, fingerprint TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '', pending INTEGER NOT NULL DEFAULT 0, last_sent INTEGER NOT NULL DEFAULT 0, attempt_at INTEGER NOT NULL DEFAULT 0)"),
-    original.DB.prepare("INSERT OR IGNORE INTO nh_v14_alerts (slot) VALUES ('1')"),
-    original.DB.prepare("INSERT OR IGNORE INTO nh_v14_alerts (slot) VALUES ('2')")
-  ]);
-  await sql(original, 'INSERT OR IGNORE INTO nh_v14_settings (id,tags,author_hours) VALUES (1,?,168)', JSON.stringify(DEFAULT_TAGS)).run();
-  await prepareV15(original);
-  if (await sql(original, "SELECT name FROM nh_migrations WHERE name='v13-history'").first()) return;
-  const items = [];
-  for (const slot of SLOTS) {
-    const env = scoped(original, slot);
-    items.push(
-      sql(env, "INSERT OR IGNORE INTO nh_shared SELECT key, ?, 'history', created FROM nh_seen WHERE NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v13-history')", slot),
-      sql(env, "INSERT OR IGNORE INTO nh_shared SELECT inflight, ?, 'history', checked FROM nh_control WHERE inflight<>'' AND NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v13-history')", slot)
     );
   }
-  items.push(original.DB.prepare("INSERT OR IGNORE INTO nh_migrations VALUES ('v13-history')"));
-  await original.DB.batch(items);
+  for (const query of [
+    'CREATE TABLE IF NOT EXISTS nh_shared (key TEXT PRIMARY KEY, slot TEXT NOT NULL, token TEXT NOT NULL, created INTEGER NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS nh_migrations (name TEXT PRIMARY KEY)',
+    'CREATE TABLE IF NOT EXISTS nh_v13_credentials (slot TEXT PRIMARY KEY, iv TEXT NOT NULL, ciphertext TEXT NOT NULL, updated INTEGER NOT NULL)',
+    "CREATE TABLE IF NOT EXISTS nh_v13_connection (slot TEXT PRIMARY KEY, next_check INTEGER NOT NULL DEFAULT 0, hold_until INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '未確認')",
+    "INSERT OR IGNORE INTO nh_v13_connection (slot) VALUES ('1'),('2')",
+    'CREATE TABLE IF NOT EXISTS nh_v13_success (slot TEXT NOT NULL, key TEXT NOT NULL, day TEXT NOT NULL, confirmed INTEGER NOT NULL, PRIMARY KEY(slot,key))',
+    'CREATE INDEX IF NOT EXISTS nh_v13_success_day ON nh_v13_success(day,slot)',
+    'CREATE TABLE IF NOT EXISTS nh_v14_settings (id INTEGER PRIMARY KEY, tags TEXT NOT NULL, author_hours INTEGER NOT NULL DEFAULT 24)',
+    'CREATE TABLE IF NOT EXISTS nh_v14_authors (slot TEXT NOT NULL, author TEXT NOT NULL, last_at INTEGER NOT NULL, token TEXT NOT NULL, PRIMARY KEY(slot,author))',
+    'CREATE TABLE IF NOT EXISTS nh_v14_stats (slot TEXT NOT NULL, tag TEXT NOT NULL, day TEXT NOT NULL, checks INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, skips INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(slot,tag,day))',
+    "CREATE TABLE IF NOT EXISTS nh_v14_telegram (id INTEGER PRIMARY KEY, chat_id TEXT NOT NULL DEFAULT '', nonce TEXT NOT NULL DEFAULT '', expires INTEGER NOT NULL DEFAULT 0, next_test INTEGER NOT NULL DEFAULT 0, last_sent INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '未連携')",
+    'INSERT OR IGNORE INTO nh_v14_telegram (id) VALUES (1)',
+    "CREATE TABLE IF NOT EXISTS nh_v14_alerts (slot TEXT PRIMARY KEY, fingerprint TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '', pending INTEGER NOT NULL DEFAULT 0, last_sent INTEGER NOT NULL DEFAULT 0, attempt_at INTEGER NOT NULL DEFAULT 0)",
+    "INSERT OR IGNORE INTO nh_v14_alerts (slot) VALUES ('1'),('2')",
+    "CREATE TABLE IF NOT EXISTS nh_v15_settings (id INTEGER PRIMARY KEY, interval_seconds INTEGER NOT NULL DEFAULT 240, scan_tags INTEGER NOT NULL DEFAULT 2, scan_notes INTEGER NOT NULL DEFAULT 3, empty_minutes INTEGER NOT NULL DEFAULT 15, marker TEXT NOT NULL DEFAULT '')",
+    'INSERT OR IGNORE INTO nh_v15_settings (id) VALUES (1)',
+    'CREATE TABLE IF NOT EXISTS nh_v15_authors (author TEXT PRIMARY KEY, last_at INTEGER NOT NULL, slot TEXT NOT NULL, token TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS nh_v15_tag_wait (slot TEXT NOT NULL, tag TEXT NOT NULL, until_at INTEGER NOT NULL, PRIMARY KEY(slot,tag))',
+    'CREATE TABLE IF NOT EXISTS nh_v15_metrics (slot TEXT NOT NULL, day TEXT NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(slot,day,reason))',
+    "CREATE TABLE IF NOT EXISTS nh_v15_runtime (id INTEGER PRIMARY KEY, last_slot TEXT NOT NULL DEFAULT '', last_at INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, alarm_at INTEGER NOT NULL DEFAULT 0)",
+    'INSERT OR IGNORE INTO nh_v15_runtime (id) VALUES (1)',
+    'CREATE TABLE IF NOT EXISTS nh_v15_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, message TEXT NOT NULL)',
+    'CREATE INDEX IF NOT EXISTS nh_v152_author_time ON nh_v14_authors(author,last_at)',
+    'CREATE INDEX IF NOT EXISTS nh_v152_stats_day ON nh_v14_stats(day,slot,tag)',
+    'CREATE INDEX IF NOT EXISTS nh_v152_metrics_day ON nh_v15_metrics(day,slot,reason)'
+  ]) schema.push(db.prepare(query));
+  schema.push(sql(original,'INSERT OR IGNORE INTO nh_v14_settings (id,tags,author_hours) VALUES (1,?,168)',JSON.stringify(DEFAULT_TAGS)));
+  await db.batch(schema);
+  const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
+  const names = new Set(done.results.map(row=>row.name));
+  const items = [];
+  if (!names.has('v13-history')) {
+    for (const slot of SLOTS) {
+      const env = scoped(original,slot);
+      items.push(
+        sql(env,"INSERT OR IGNORE INTO nh_shared SELECT key, ?, 'history', created FROM nh_seen WHERE NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v13-history')",slot),
+        sql(env,"INSERT OR IGNORE INTO nh_shared SELECT inflight, ?, 'history', checked FROM nh_control WHERE inflight<>'' AND NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v13-history')",slot)
+      );
+    }
+    items.push(db.prepare("INSERT OR IGNORE INTO nh_migrations VALUES ('v13-history')"));
+  }
+  if (!names.has('v15-authors')) {
+    items.push(db.prepare("INSERT INTO nh_v15_authors (author,last_at,slot,token) SELECT author,MAX(last_at),'history','history' FROM nh_v14_authors WHERE NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v15-authors') GROUP BY author ON CONFLICT(author) DO UPDATE SET last_at=MAX(nh_v15_authors.last_at,excluded.last_at)"),
+      db.prepare("INSERT OR IGNORE INTO nh_migrations VALUES ('v15-authors')"));
+  }
+  items.push(sql(original,'INSERT OR IGNORE INTO nh_migrations (name) VALUES (?)',READY));
+  await db.batch(items);
 }
 function orderFor(tags, slot) {
   const offset = slot === '2' ? Math.ceil(tags.length / 2) : 0;
   return tags.slice(offset).concat(tags.slice(0,offset));
-}
-async function prepareV15(env) {
-  await env.DB.batch([
-    env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v15_settings (id INTEGER PRIMARY KEY, interval_seconds INTEGER NOT NULL DEFAULT 240, scan_tags INTEGER NOT NULL DEFAULT 2, scan_notes INTEGER NOT NULL DEFAULT 3, empty_minutes INTEGER NOT NULL DEFAULT 15, marker TEXT NOT NULL DEFAULT \'\')'),
-    env.DB.prepare('INSERT OR IGNORE INTO nh_v15_settings (id) VALUES (1)'),
-    env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v15_authors (author TEXT PRIMARY KEY, last_at INTEGER NOT NULL, slot TEXT NOT NULL, token TEXT NOT NULL)'),
-    env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v15_tag_wait (slot TEXT NOT NULL, tag TEXT NOT NULL, until_at INTEGER NOT NULL, PRIMARY KEY(slot,tag))'),
-    env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v15_metrics (slot TEXT NOT NULL, day TEXT NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(slot,day,reason))'),
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS nh_v15_runtime (id INTEGER PRIMARY KEY, last_slot TEXT NOT NULL DEFAULT '', last_at INTEGER NOT NULL DEFAULT 0, heartbeat INTEGER NOT NULL DEFAULT 0, alarm_at INTEGER NOT NULL DEFAULT 0)"),
-    env.DB.prepare('INSERT OR IGNORE INTO nh_v15_runtime (id) VALUES (1)'),
-    env.DB.prepare('CREATE TABLE IF NOT EXISTS nh_v15_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, message TEXT NOT NULL)')
-  ]);
-  // 旧版の2垢それぞれの作者履歴を合流。設定・Cookie・next_atは変更しない。
-  await env.DB.batch([
-    sql(env,"INSERT INTO nh_v15_authors (author,last_at,slot,token) SELECT author,MAX(last_at),'history','history' FROM nh_v14_authors WHERE NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v15-authors') GROUP BY author ON CONFLICT(author) DO UPDATE SET last_at=MAX(nh_v15_authors.last_at,excluded.last_at)"),
-    sql(env,"INSERT OR IGNORE INTO nh_migrations VALUES ('v15-authors')")
-  ]);
 }
 const REASONS = {
   runs:'自動確認', sent:'送信成功', recovered:'前回送信の成功確認', author_recent:'同じ作者への待機で除外した候補',
@@ -145,44 +165,39 @@ function metricItems(env, counts) {
   return Object.entries(counts).filter(([reason,count])=>REASONS[reason] && count>0).map(([reason,count])=>
     sql(env,'INSERT INTO nh_v15_metrics (slot,day,reason,count) VALUES (?,?,?,?) ON CONFLICT(slot,day,reason) DO UPDATE SET count=count+excluded.count',env.SLOT,day(),reason,count));
 }
-async function schedulerState(env, settings = null) {
-  settings ||= await getSettings(env);
-  const states = [];
-  for (const slot of SLOTS) {
-    const s = await sql(scoped(env,slot),'SELECT * FROM nh_control WHERE id=1').first();
-    const c = await sql(env,'SELECT hold_until FROM nh_v13_connection WHERE slot=?',slot).first();
-    states.push({...s,slot,hold_until:c.hold_until});
-  }
-  const runtime = await sql(env,'SELECT * FROM nh_v15_runtime WHERE id=1').first();
+async function schedulerState(original) {
+  const statements = SLOTS.map(slot=>sql(scoped(original,slot),
+    'SELECT s.*, c.slot, c.hold_until FROM nh_control s JOIN nh_v13_connection c ON c.slot=? WHERE s.id=1',slot));
+  statements.push(sql(original,'SELECT r.*,v.interval_seconds FROM nh_v15_runtime r JOIN nh_v15_settings v ON v.id=r.id WHERE r.id=1'));
+  const rows = await original.DB.batch(statements);
+  const states = rows.slice(0,2).map(r=>r.results[0]);
+  const runtime = rows[2].results[0];
   const active = states.filter(s=>s.enabled);
-  const gap = active.length===2 ? settings.interval_seconds*500 : 0;
+  const gap = active.length===2 ? runtime.interval_seconds*500 : 0;
   const gate = runtime.last_at ? runtime.last_at+gap : 0;
   for (const s of states) s.eligible = Math.max(s.next_at,s.lease,s.hold_until,gate);
-  // 同時に期限を迎えた時は、前回選ばれなかった枠を先にする。
   active.sort((a,b)=>a.eligible-b.eligible || Number(a.slot===runtime.last_slot)-Number(b.slot===runtime.last_slot));
   return {states,active,runtime,gap,gate};
 }
 async function exportData(env) {
   const settings = await getSettings(env);
-  const since = new Date(Date.now()+9*HOUR-29*24*HOUR).toISOString().slice(0,10);
-  const accounts = [];
-  for (const slot of SLOTS) {
-    const state = await sql(scoped(env,slot),'SELECT enabled,total,checked,next_at FROM nh_control WHERE id=1').first();
-    accounts.push({slot,...state});
-  }
-  const stats = await sql(env,'SELECT slot,tag,day,checks,sent,skips,errors FROM nh_v14_stats WHERE day>=? ORDER BY day,slot,tag',since).all();
-  const metrics = await sql(env,'SELECT slot,day,reason,count FROM nh_v15_metrics WHERE day>=? ORDER BY day,slot,reason',since).all();
-  const daily = await sql(env,'SELECT slot,day,COUNT(*) AS confirmed FROM nh_v13_success WHERE day>=? GROUP BY slot,day ORDER BY day,slot',since).all();
-  return new Response(JSON.stringify({version:VERSION,exported_at:new Date(Date.now()).toISOString(),settings,accounts,tag_stats:stats.results,metrics:metrics.results,daily:daily.results},null,2),{
+  const since = day(29);
+  const [first,second,stats,metrics,daily] = await env.DB.batch([
+    ...SLOTS.map(slot=>sql(scoped(env,slot),'SELECT enabled,total,checked,next_at FROM nh_control WHERE id=1')),
+    sql(env,'SELECT slot,tag,day,checks,sent,skips,errors FROM nh_v14_stats WHERE day>=? ORDER BY day,slot,tag',since),
+    sql(env,'SELECT slot,day,reason,count FROM nh_v15_metrics WHERE day>=? ORDER BY day,slot,reason',since),
+    sql(env,'SELECT slot,day,COUNT(*) AS confirmed FROM nh_v13_success WHERE day>=? GROUP BY day,slot ORDER BY day,slot',since)
+  ]);
+  const accounts = [first,second].map((r,i)=>({slot:SLOTS[i],...r.results[0]}));
+  return new Response(JSON.stringify({version:VERSION,exported_at:new Date().toISOString(),settings,accounts,tag_stats:stats.results,metrics:metrics.results,daily:daily.results},null,2),{
     headers:{'Content-Type':'application/json; charset=utf-8','Content-Disposition':'attachment; filename="note-helper-settings-stats.json"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}
   });
 }
 async function getSettings(env) {
-  const row = await sql(env,'SELECT * FROM nh_v14_settings WHERE id=1').first();
+  const row = await sql(env,'SELECT a.tags,a.author_hours,b.interval_seconds,b.scan_tags,b.scan_notes,b.empty_minutes FROM nh_v14_settings a JOIN nh_v15_settings b ON b.id=a.id WHERE a.id=1').first();
   const tags = JSON.parse(row.tags);
   if (!Array.isArray(tags) || !tags.length) throw new Trouble('タグ設定を確認してください','config');
-  const extra = await sql(env,'SELECT * FROM nh_v15_settings WHERE id=1').first();
-  return {tags, author_hours:row.author_hours, interval_seconds:extra.interval_seconds, scan_tags:extra.scan_tags, scan_notes:extra.scan_notes, empty_minutes:extra.empty_minutes};
+  return {...row,tags};
 }
 async function saveSettings(env, form) {
   const raw = String(form.get('tags') || '');
@@ -200,9 +215,9 @@ async function saveSettings(env, form) {
   const seconds = read('interval_seconds',240,3600,30), tagLimit = read('scan_tags',1,3), noteLimit = read('scan_notes',1,5), empty = read('empty_minutes',0,120);
   const marker = crypto.randomUUID();
   const result = await env.DB.batch([
-    sql(env,"UPDATE nh_v15_settings SET interval_seconds=?,scan_tags=?,scan_notes=?,empty_minutes=?,marker=? WHERE id=1 AND NOT EXISTS (SELECT 1 FROM nh_control WHERE lease>?) AND NOT EXISTS (SELECT 1 FROM nh_control_2 WHERE lease>?)",seconds,tagLimit,noteLimit,empty,marker,Date.now(),Date.now()),
-    sql(env,'UPDATE nh_v14_settings SET tags=?,author_hours=? WHERE id=1 AND EXISTS (SELECT 1 FROM nh_v15_settings WHERE marker=?)',JSON.stringify(tags),hours,marker),
-    sql(env,"INSERT INTO nh_v15_audit (at,message) SELECT ?,? WHERE EXISTS (SELECT 1 FROM nh_v15_settings WHERE marker=?)",Date.now(),tags.length+'タグ／間隔'+seconds+'秒／作者'+hours+'時間／探索'+tagLimit+'タグ・'+noteLimit+'記事／候補なし'+empty+'分',marker)
+    sql(env,"UPDATE nh_v15_settings SET interval_seconds=?,scan_tags=?,scan_notes=?,empty_minutes=?,marker=? WHERE id=1 AND NOT EXISTS (SELECT 1 FROM nh_control WHERE id=1 AND lease>?) AND NOT EXISTS (SELECT 1 FROM nh_control_2 WHERE id=1 AND lease>?)",seconds,tagLimit,noteLimit,empty,marker,Date.now(),Date.now()),
+    sql(env,'UPDATE nh_v14_settings SET tags=?,author_hours=? WHERE id=1 AND EXISTS (SELECT 1 FROM nh_v15_settings WHERE id=1 AND marker=?)',JSON.stringify(tags),hours,marker),
+    sql(env,'INSERT INTO nh_v15_audit (at,message) SELECT ?,? WHERE EXISTS (SELECT 1 FROM nh_v15_settings WHERE id=1 AND marker=?)',Date.now(),tags.length+'タグ／間隔'+seconds+'秒／作者'+hours+'時間／探索'+tagLimit+'タグ・'+noteLimit+'記事／候補なし'+empty+'分',marker)
   ]);
   return result[0].meta.changes ? tags.length+'タグと動作設定を両方に保存しました。2番の巡回順をずらしています。既存の休止期限・次回時刻・履歴は保持します。' : '処理中のため設定を変更しませんでした。少し待って再度保存してください。';
 }
@@ -220,13 +235,11 @@ async function telegram(env, method, body) {
   try {
     response = await fetch('https://api.telegram.org/bot'+token+'/'+method, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body), redirect:'manual',
-      signal:AbortSignal.timeout(15000)
+      body:JSON.stringify(body), redirect:'manual', signal:AbortSignal.timeout(15000)
     });
   } catch (error) {
     const reason = ['TimeoutError','AbortError'].includes(error?.name)
-      ? '15秒以内に応答がありませんでした'
-      : 'CloudflareからTelegramへの通信を開始・完了できませんでした';
+      ? '15秒以内に応答がありませんでした' : 'CloudflareからTelegramへの通信を開始・完了できませんでした';
     throw new Trouble('Telegram通信エラー：'+reason+'。トークン不正かどうかは未確認です');
   }
   let data;
@@ -248,12 +261,11 @@ async function telegram(env, method, body) {
   }
   return data.result;
 }
-
 async function telegramAction(env, action) {
   if (action === 'tg_off') {
     await env.DB.batch([
       sql(env,"UPDATE nh_v14_telegram SET chat_id='',nonce='',expires=0,message='通知を解除しました' WHERE id=1"),
-      sql(env,'UPDATE nh_v14_alerts SET pending=0')
+      sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE pending<>0')
     ]);
     return 'Telegram通知を解除しました。自動運転は変更していません。';
   }
@@ -285,6 +297,7 @@ async function telegramAction(env, action) {
       await sql(env,"UPDATE nh_v14_telegram SET last_sent=?,message='通知テスト成功' WHERE id=1",Date.now()).run();
       return 'Telegramにテスト通知を送りました。';
     } catch (error) {
+      if (readLimit(error)) throw error;
       await sql(env,"UPDATE nh_v14_telegram SET message='通知テスト失敗。トークン・連携・ブロック状態を確認',next_test=MAX(next_test,?) WHERE id=1",Date.now()+(error.retry||0)).run();
       throw error;
     }
@@ -299,35 +312,40 @@ async function queueAlert(env, kind, message) {
     fingerprint=?,message=? WHERE slot=?`,fingerprint,Date.now()-24*HOUR,fingerprint,fingerprint,message,env.SLOT).run();
 }
 async function flushAlerts(env) {
-  const cfg = await sql(env,'SELECT * FROM nh_v14_telegram WHERE id=1').first();
-  if (!env.TELEGRAM_BOT_TOKEN || !cfg.chat_id) return;
-  for (const slot of SLOTS) {
-    // Check current status so repaired or manually stopped accounts do not send stale alerts.
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+  const pending = await sql(env,`SELECT a.*,t.chat_id FROM nh_v14_alerts a
+    JOIN nh_v14_telegram t ON t.id=1 WHERE a.pending=1 AND t.chat_id<>''`).all();
+  for (const row of pending.results) {
+    const slot = row.slot;
+    if (!SLOTS.includes(slot)) continue;
     const selected = scoped(env,slot);
-    const state = await sql(selected,'SELECT enabled FROM nh_control WHERE id=1').first();
-    const health = await sql(selected,'SELECT kind FROM nh_health WHERE id=1').first();
-    if (!state.enabled || !['auth','config'].includes(health.kind)) {
-      await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=?',slot).run(); continue;
+    const gate = await sql(selected,`UPDATE nh_v14_alerts SET attempt_at=?
+      WHERE slot=? AND pending=1 AND attempt_at<=? AND fingerprint=?
+      AND EXISTS (SELECT 1 FROM nh_control s JOIN nh_health h ON h.id=s.id
+                  WHERE s.id=1 AND s.enabled=1 AND h.kind IN ('auth','config'))
+      AND EXISTS (SELECT 1 FROM nh_v14_telegram WHERE id=1 AND chat_id=?)`,
+      Date.now()+15*60000,slot,Date.now(),row.fingerprint,row.chat_id).run();
+    if (!gate.meta.changes) {
+      await sql(selected,`UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending=1 AND fingerprint=?
+        AND NOT EXISTS (SELECT 1 FROM nh_control s JOIN nh_health h ON h.id=s.id
+                        WHERE s.id=1 AND s.enabled=1 AND h.kind IN ('auth','config'))`,slot,row.fingerprint).run();
+      continue;
     }
-    const row = await sql(env,'SELECT * FROM nh_v14_alerts WHERE slot=?',slot).first();
-    if (!row.pending || row.attempt_at>Date.now()) continue;
-    const gate = await sql(env,'UPDATE nh_v14_alerts SET attempt_at=? WHERE slot=? AND pending=1 AND attempt_at<=? AND fingerprint=?',Date.now()+15*60000,slot,Date.now(),row.fingerprint).run();
-    if (!gate.meta.changes) continue;
     try {
-      await telegram(env,'sendMessage',{chat_id:cfg.chat_id,text:'note-helper：アカウント '+slot+' の確認が必要です。\n'+row.message+'\n管理画面で状態を確認してください。\n401はCookie更新、403はアクセス拒否の確認が必要です。'});
-      await env.DB.batch([
-        sql(env,'UPDATE nh_v14_alerts SET pending=0,last_sent=? WHERE slot=? AND fingerprint=?',Date.now(),slot,row.fingerprint),
-        sql(env,"UPDATE nh_v14_telegram SET last_sent=?,message='エラー通知を送信しました' WHERE id=1",Date.now())
-      ]);
+      await telegram(env,'sendMessage',{chat_id:row.chat_id,text:'note-helper：アカウント '+slot+' の確認が必要です。\n'+row.message+'\n管理画面で状態を確認してください。\n401はCookie更新、403はアクセス拒否の確認が必要です。'});
     } catch (error) {
       await env.DB.batch([
-        sql(env,'UPDATE nh_v14_alerts SET attempt_at=? WHERE slot=?',Date.now()+Math.max(15*60000,error.retry||0),slot),
+        sql(env,'UPDATE nh_v14_alerts SET attempt_at=? WHERE slot=? AND fingerprint=?',Date.now()+Math.max(15*60000,error.retry||0),slot,row.fingerprint),
         sql(env,"UPDATE nh_v14_telegram SET message='通知失敗。設定を確認してください。後で自動再試行します' WHERE id=1")
       ]);
+      continue;
     }
+    await env.DB.batch([
+      sql(env,'UPDATE nh_v14_alerts SET pending=0,last_sent=? WHERE slot=? AND fingerprint=?',Date.now(),slot,row.fingerprint),
+      sql(env,"UPDATE nh_v14_telegram SET last_sent=?,message='エラー通知を送信しました' WHERE id=1",Date.now())
+    ]);
   }
 }
-
 class Trouble extends Error {
   constructor(message, kind = 'network', retry = 0, code = 0) {
     super(message); this.kind = kind; this.retry = retry; this.code = code;
@@ -397,7 +415,7 @@ async function account(env) {
 }
 async function article(env, key) {
   try { return await api(env, '/api/v3/notes/' + key); }
-  catch (error) { if (error.code === 404) return null; throw error; }
+  catch (error) { if (error.code === 404 && !error.retry) return null; throw error; }
 }
 async function acquire(env, automatic) {
   const now = Date.now(), token = crypto.randomUUID();
@@ -440,18 +458,20 @@ async function connection(original, slot, candidate = null) {
         items.push(sql(original, 'INSERT INTO nh_v13_credentials (slot,iv,ciphertext,updated) VALUES (?,?,?,?) ON CONFLICT(slot) DO UPDATE SET iv=excluded.iv,ciphertext=excluded.ciphertext,updated=excluded.updated', slot, encrypted.iv, encrypted.ciphertext, Date.now()));
       }
       items.push(sql(original, 'UPDATE nh_v13_connection SET checked=?, ok=1, message=? WHERE slot=?', Date.now(), message, slot));
-      items.push(sql(original, 'UPDATE nh_v14_alerts SET pending=0 WHERE slot=?', slot));
+      items.push(sql(original, 'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0', slot));
       await original.DB.batch(items);
       return 'アカウント ' + slot + '：' + message + '\nいいねは送信していません。自動運転の休止期限は維持します。';
     } catch (error) {
-      const message = error instanceof Trouble ? error.message : '通信・保存・内部処理のエラー。保存結果を確認できません。';
-      const wait = error instanceof Trouble ? Math.max(error.retry, error.code === 429 ? 2*HOUR : 0) : 0;
+      if (!(error instanceof Trouble)) throw error;
+      const message = error.message;
+      const wait = Math.max(error.retry, error.code === 429 ? 2*HOUR : 0);
       await sql(original, 'UPDATE nh_v13_connection SET checked=?, ok=0, message=?, hold_until=MAX(hold_until,?), next_check=MAX(next_check,?) WHERE slot=?', Date.now(), (candidate !== null ? '更新用Cookieの確認：' : '') + message, Date.now()+wait, Date.now()+Math.max(LEASE,wait), slot).run();
       return 'アカウント ' + slot + '：' + message + '\n本人確認に失敗したCookieは保存しません。いいねは送信していません。';
     }
   } finally { await release(env, token); }
 }
-async function run(baseEnv) {
+async function run(original,slot) {
+  const baseEnv = scoped(original,slot);
   const token = await acquire(baseEnv,true);
   if (!token) return false;
   const trace = {calls:0}, counts = {runs:1};
@@ -471,7 +491,7 @@ async function run(baseEnv) {
     const state = await sql(env,'SELECT * FROM nh_control WHERE id=1').first();
     env = await loadCookie(env,state.account);
     if (await account(env)!==state.account) throw new Trouble('登録済みのnoteとログイン情報が一致しません','auth');
-    await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=?',env.SLOT).run();
+    await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0',slot).run();
     if (state.inflight) {
       stage='前回送信の確認';
       const data=await article(env,state.inflight), liked=data?.is_liked===true;
@@ -481,23 +501,27 @@ async function run(baseEnv) {
         sql(env,'INSERT INTO nh_seen VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET status=excluded.status',state.inflight,liked?'liked':'uncertain',Date.now()),
         sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=?",+add,token)
       ];
-      if (add) { items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',env.SLOT,state.inflight,day(),Date.now())); bump('recovered'); }
+      if (add) { items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,state.inflight,day(),Date.now())); bump('recovered'); }
       await env.DB.batch(items);
       await finish(liked?'前回の記事のスキを確認しました。次回から候補を確認します':'前回の記事は再送せず除外しました');
       return true;
     }
-    const tags=orderFor(settings.tags,env.SLOT), started=Date.now();
-    const other=await sql(scoped(env,env.SLOT==='1'?'2':'1'),'SELECT account FROM nh_control WHERE id=1').first();
-    const ownIds=new Set([state.account,other.account].filter(Boolean));
-    let cursor=state.cursor, lists=0, details=0, limited=false;
+    const tags=orderFor(settings.tags,slot), started=Date.now();
+    const marks = values=>values.map(()=>'?').join(',');
+    const [otherRows,waitRows]=await original.DB.batch([
+      sql(scoped(original,slot==='1'?'2':'1'),'SELECT account FROM nh_control WHERE id=1'),
+      sql(env,'SELECT tag,until_at FROM nh_v15_tag_wait WHERE slot=? AND tag IN ('+marks(tags)+') AND until_at>?',slot,...tags,Date.now())
+    ]);
+    const ownIds=new Set([state.account,otherRows.results[0].account].filter(Boolean));
+    const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
+    let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
     for (let visited=0; visited<tags.length && lists<settings.scan_tags; visited++) {
       if (details>=settings.scan_notes || Date.now()-started>=90000) { limited=true; break; }
       const tag=tags[cursor%tags.length]; cursor++;
-      await sql(env,'UPDATE nh_control SET cursor=? WHERE id=1 AND token=?',cursor,token).run();
-      const waiting=await sql(env,'SELECT until_at FROM nh_v15_tag_wait WHERE slot=? AND tag=?',env.SLOT,tag).first();
-      if (waiting?.until_at>Date.now()) { bump('tag_wait'); continue; }
-      const live=await sql(env,'SELECT enabled,token,lease FROM nh_control WHERE id=1').first();
-      if (!live.enabled || live.token!==token || live.lease<=Date.now()) { await finish('停止または処理期限により探索を終了しました'); return true; }
+      if (waits.get(tag)>Date.now()) { bump('tag_wait'); continue; }
+      const live=await sql(env,'UPDATE nh_control SET cursor=? WHERE id=1 AND token=? AND enabled=1 AND lease>?',cursor,token,Date.now()).run();
+      if (!live.meta.changes) { await finish('停止または処理期限により探索を終了しました'); return true; }
+      savedCursor=cursor;
       stage='記事一覧の取得'; activeTag=tag; lists++;
       await env.DB.batch(statItems(env,tag,'checks'));
       const data=await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
@@ -505,19 +529,17 @@ async function run(baseEnv) {
       const notes=new Map(data.notes.filter(n=>typeof n?.key==='string' && /^n[a-z0-9]+$/.test(n.key)).map(n=>[n.key,n]));
       const keys=[...notes.keys()].slice(0,50);
       let candidates=[];
+      const authorOf=n=>String(n?.user?.id ?? n?.user_id ?? '');
+      const recent=new Map();
       if (keys.length) {
-        const marks=keys.map(()=>'?').join(',');
-        const seen=await sql(env,'SELECT key FROM nh_seen WHERE key IN ('+marks+') UNION SELECT key FROM nh_shared WHERE key IN ('+marks+')',...keys,...keys).all();
+        const seen=await sql(env,'SELECT key FROM nh_seen WHERE key IN ('+marks(keys)+') UNION ALL SELECT key FROM nh_shared WHERE key IN ('+marks(keys)+')',...keys,...keys).all();
         const done=new Set(seen.results.map(r=>r.key));
         candidates=keys.filter(k=>!done.has(k)); bump('seen',keys.length-candidates.length);
-      }
-      // 一覧に作者IDがある場合は一括照会し、同じ作者への不要な記事取得を省く。
-      const authorOf=n=>String(n?.user?.id ?? n?.user_id ?? '');
-      const ids=[...new Set(candidates.map(k=>authorOf(notes.get(k))).filter(Boolean))];
-      const recent=new Map();
-      if (ids.length) {
-        const rows=await sql(env,'SELECT author,last_at FROM nh_v15_authors WHERE author IN ('+ids.map(()=>'?').join(',')+')',...ids).all();
-        for (const row of rows.results) recent.set(row.author,row.last_at);
+        const ids=[...new Set(candidates.map(k=>authorOf(notes.get(k))).filter(Boolean))];
+        if (ids.length) {
+          const rows=await sql(env,'SELECT author,last_at FROM nh_v15_authors WHERE author IN ('+marks(ids)+')',...ids).all();
+          for (const row of rows.results) recent.set(row.author,row.last_at);
+        }
       }
       for (const key of candidates) {
         const listedAuthor=authorOf(notes.get(key));
@@ -532,9 +554,11 @@ async function run(baseEnv) {
           bump(!note?'missing':'own_or_liked'); continue;
         }
         if (!author || author==='0') { bump('no_author'); continue; }
-        const last=await sql(env,'SELECT last_at FROM nh_v15_authors WHERE author=?',author).first();
-        if (last && last.last_at>Date.now()-settings.author_hours*HOUR) {
-          recent.set(author,last.last_at); bump('author_recent'); continue;
+        if (!listedAuthor || author!==listedAuthor) {
+          const last=await sql(env,'SELECT last_at FROM nh_v15_authors WHERE author=?',author).first();
+          if (last && last.last_at>Date.now()-settings.author_hours*HOUR) {
+            recent.set(author,last.last_at); bump('author_recent'); continue;
+          }
         }
         const referer=note.note_url || (note.user?.urlname?'https://note.com/'+note.user.urlname+'/n/'+key:'');
         let valid=false;
@@ -542,13 +566,18 @@ async function run(baseEnv) {
         if (!valid) throw new Trouble('記事URLを確認できません','response');
         stage='共通予約の保存';
         const now=Date.now(), cutoff=now-settings.author_hours*HOUR;
-        // 同じ作者の予約はPKで1つ。異なる記事への同時予約も、この一括処理で排他する。
+        // 最後の判定を予約と同じトランザクションで行う。一覧の先読みだけで送信を決めない。
         const reserved=await env.DB.batch([
-          sql(env,'INSERT INTO nh_v15_authors (author,last_at,slot,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_control WHERE id=1 AND token=? AND enabled=1 AND lease>?) AND NOT EXISTS (SELECT 1 FROM nh_shared WHERE key=?) AND NOT EXISTS (SELECT 1 FROM nh_v14_authors WHERE author=? AND last_at>?) ON CONFLICT(author) DO UPDATE SET last_at=excluded.last_at,slot=excluded.slot,token=excluded.token WHERE nh_v15_authors.last_at<=?',author,now,env.SLOT,token,token,now,key,author,cutoff,cutoff),
-          sql(env,'INSERT OR IGNORE INTO nh_shared (key,slot,token,created) SELECT ?,?,?,? FROM nh_control WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_v15_authors WHERE author=? AND token=?)',key,env.SLOT,token,now,token,now,author,token),
+          sql(env,`INSERT INTO nh_v15_authors (author,last_at,slot,token) SELECT ?,?,?,?
+            WHERE EXISTS (SELECT 1 FROM nh_control WHERE id=1 AND token=? AND enabled=1 AND lease>?)
+            AND NOT EXISTS (SELECT 1 FROM nh_shared WHERE key=?)
+            AND NOT EXISTS (SELECT 1 FROM nh_v14_authors WHERE author=? AND last_at>?)
+            ON CONFLICT(author) DO UPDATE SET last_at=excluded.last_at,slot=excluded.slot,token=excluded.token
+            WHERE nh_v15_authors.last_at<=?`,author,now,slot,token,token,now,key,author,cutoff,cutoff),
+          sql(env,'INSERT OR IGNORE INTO nh_shared (key,slot,token,created) SELECT ?,?,?,? FROM nh_control WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_v15_authors WHERE author=? AND token=?)',key,slot,token,now,token,now,author,token),
           sql(env,"INSERT OR IGNORE INTO nh_seen (key,status,created) SELECT ?,'pending',? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)",key,now,key,token),
           sql(env,'UPDATE nh_control SET inflight=?,lease=? WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)',key,now+LEASE,token,now,key,token),
-          sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',env.SLOT,author,now,token,key,token)
+          sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token)
         ]);
         if (!reserved[0].meta.changes || !reserved[1].meta.changes || !reserved[3].meta.changes) { bump('reserved'); continue; }
         stage='スキ送信';
@@ -558,7 +587,7 @@ async function run(baseEnv) {
         await env.DB.batch([
           sql(env,"UPDATE nh_seen SET status='liked' WHERE key=?",key),
           sql(env,"UPDATE nh_control SET inflight='',total=total+1 WHERE id=1 AND token=?",token),
-          sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',env.SLOT,key,day(),Date.now())
+          sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now())
         ]);
         bump('sent');
         await finish('スキ確認済み：'+key+'（#'+tag+'）／探索 '+lists+'タグ・'+details+'記事',true);
@@ -568,51 +597,57 @@ async function run(baseEnv) {
       bump('no_candidates');
       await env.DB.batch([
         ...statItems(env,tag,'skips'),
-        sql(env,'INSERT INTO nh_v15_tag_wait (slot,tag,until_at) VALUES (?,?,?) ON CONFLICT(slot,tag) DO UPDATE SET until_at=excluded.until_at',env.SLOT,tag,Date.now()+settings.empty_minutes*60000)
+        sql(env,'INSERT INTO nh_v15_tag_wait (slot,tag,until_at) VALUES (?,?,?) ON CONFLICT(slot,tag) DO UPDATE SET until_at=excluded.until_at',slot,tag,Date.now()+settings.empty_minutes*60000)
       ]);
       activeTag=null;
     }
+    if (cursor!==savedCursor) await sql(env,'UPDATE nh_control SET cursor=? WHERE id=1 AND token=?',cursor,token).run();
     if (limited || lists>=settings.scan_tags) bump('candidate_limit');
     await finish('送信見送り：探索 '+lists+'タグ・'+details+'記事。'+(limited?'探索上限に達しました。':'候補なし・作者待機・タグ待機。')+'次回は巡回の続きから確認します。');
     return true;
   } catch (error) {
+    if (readLimit(error)) throw error;
     const kind=error instanceof Trouble?error.kind:'storage';
     const h=await sql(env,'SELECT * FROM nh_health WHERE id=1').first();
     const errors=Number(h.errors)+1, rates=Number(h.rate_fail)+(kind==='rate'?1:0);
     const serverWait=error instanceof Trouble?error.retry:0, wait=Math.max(2*HOUR,serverWait);
-    const message='自動再確認待ち：'+stage+'／'+(error instanceof Trouble?error.message:'保存・内部処理のエラー');
+    const message='自動再確認待ち：'+stage+'／'+failure(error);
     bump('errors');
     await env.DB.batch([
       ...metrics(), ...statItems(env,activeTag,'errors'),
       sql(env,'UPDATE nh_health SET rate_fail=?,errors=?,kind=? WHERE id=1',rates,errors,kind),
       sql(env,'UPDATE nh_control SET next_at=?,message=? WHERE id=1 AND token=?',Date.now()+wait,message,token),
-      sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+serverWait,env.SLOT)
+      sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+serverWait,slot)
     ]);
     if (['auth','config'].includes(kind)) await queueAlert(env,kind,message);
     return true;
   } finally { await release(env,token); }
 }
-async function dashboard(original, prefix = '') {
+async function dashboard(original, settings, prefix = '') {
   const blocks = [];
-  const settings = await getSettings(original);
-  const telegram = await sql(original,'SELECT * FROM nh_v14_telegram WHERE id=1').first();
-  const schedule = await schedulerState(original,settings);
+  const schedule = await schedulerState(original);
+  const summary = await original.DB.batch([
+    sql(original,"SELECT (chat_id<>'') AS paired,message,last_sent FROM nh_v14_telegram WHERE id=1"),
+    sql(original,'SELECT tag,SUM(checks) AS checks,SUM(sent) AS sent,SUM(skips) AS skips,SUM(errors) AS errors FROM nh_v14_stats WHERE day>=? GROUP BY tag ORDER BY checks DESC',day(6)),
+    sql(original,'SELECT slot,reason,SUM(count) AS count FROM nh_v15_metrics WHERE day>=? GROUP BY slot,reason ORDER BY slot,reason',day(6)),
+    sql(original,'SELECT at,message FROM nh_v15_audit ORDER BY id DESC LIMIT 10'),
+    ...SLOTS.map(slot=>sql(scoped(original,slot),`SELECT h.*,c.checked AS connection_checked,c.ok,c.message AS connection_message,
+      k.updated AS cookie_updated,(SELECT COUNT(*) FROM nh_v13_success WHERE day=? AND slot=?) AS today
+      FROM nh_health h JOIN nh_v13_connection c ON c.slot=?
+      LEFT JOIN nh_v13_credentials k ON k.slot=c.slot WHERE h.id=1`,day(),slot,slot))
+  ]);
+  const [tg,stats,metrics,audit] = summary;
+  const telegram=tg.results[0];
   const warnings=[];
   if (!original.SCHEDULER) warnings.push('SCHEDULERが未設定です。実行予約を作成できません。');
   if (!original.COOKIE_ENCRYPTION_KEY || !/^[a-f0-9]{64}$/i.test(original.COOKIE_ENCRYPTION_KEY.trim())) warnings.push('Cookie暗号化キーの形式を確認してください。');
   if (schedule.active.length && schedule.runtime.heartbeat && Date.now()-schedule.runtime.heartbeat>10*60000) warnings.push('予約処理の記録が10分以上更新されていません。Cloudflareのデプロイ・設定・ログを確認してください。');
   if (!schedule.runtime.heartbeat) warnings.push('v15の予約処理はまだ記録されていません。状態確認後、数分たってから再確認してください。');
   blocks.push('【動作設定】\nタグ：'+settings.tags.length+'個\n各アカウント：'+settings.interval_seconds+'秒以上の間隔\n同じ作者：2垢共通で'+settings.author_hours+'時間\n2垢ON時の処理開始間隔：'+settings.interval_seconds/2+'秒以上\n探索上限：'+settings.scan_tags+'タグ・記事詳細'+settings.scan_notes+'件\n候補なしのタグ：'+settings.empty_minutes+'分待ち\n予約処理の最終確認：'+time(schedule.runtime.heartbeat)+'\n次の予約予定：'+time(schedule.runtime.alarm_at)+(warnings.length?'\n\n【確認事項】\n'+warnings.join('\n'):''));
-  blocks.push('Telegram通知：' + (original.TELEGRAM_BOT_TOKEN && telegram.chat_id ? '連携済み' : '未設定') + '\n' + telegram.message + '\n最終通知成功：' + time(telegram.last_sent)+'\n通知対象はログイン・アクセス拒否・暗号化設定の問題。429の回数制限は通知せず休止します。');
-  for (const slot of SLOTS) {
-    const env = scoped(original,slot);
-    const s = await sql(env, 'SELECT * FROM nh_control WHERE id=1').first();
-    const h = await sql(env, 'SELECT * FROM nh_health WHERE id=1').first();
-    const c = await sql(env, 'SELECT * FROM nh_v13_connection WHERE slot=?',slot).first();
-    const saved = await sql(env, 'SELECT updated FROM nh_v13_credentials WHERE slot=?',slot).first();
-    const today = await sql(env, 'SELECT COUNT(*) AS count FROM nh_v13_success WHERE slot=? AND day=?',slot,day()).first();
-    const now = Date.now(), next = schedule.states.find(row=>row.slot===slot).eligible;
-    const verified = c.ok === 1 && c.checked >= s.checked;
+  blocks.push('Telegram通知：' + (original.TELEGRAM_BOT_TOKEN && telegram.paired ? '連携済み' : '未設定') + '\n' + telegram.message + '\n最終通知成功：' + time(telegram.last_sent)+'\n通知対象はログイン・アクセス拒否・暗号化設定の問題。429の回数制限は通知せず休止します。');
+  for (const [i,s] of schedule.states.entries()) {
+    const h = summary[4+i].results[0], slot=s.slot, now=Date.now(), next=s.eligible;
+    const verified = h.ok === 1 && h.connection_checked >= s.checked;
     let status;
     if (!s.enabled) status = '停止中（開始操作が必要）';
     else if (s.lease > now) status = 'ON・処理中';
@@ -622,20 +657,17 @@ async function dashboard(original, prefix = '') {
     else if (next > now) status = h.kind === 'rate' ? 'ON・回数制限で休止中' : h.kind ? 'ON・エラー後の休止中' : 'ON・次の実行待ち';
     else status = 'ON・実行予約待ち';
     blocks.push('アカウント ' + slot + '\n状態：' + status +
-      '\n今日のスキ確認成功：' + today.count + '件（日本時間）' +
+      '\n今日のスキ確認成功：' + h.today + '件（日本時間）' +
       '\n累計：' + s.total + '件\n最終自動実行：' + time(s.checked) + '\n最終送信成功：' + time(h.success_at) +
       (s.enabled ? '\n次回：' + (next > now ? time(next)+'以降の実行予約' : '次の実行予約') : '') +
       '\n失敗回数：' + h.errors + '\n429回数：' + h.rate_fail +
-      '\n\n【手動の接続確認・Cookie更新】\n確認日時：' + time(c.checked) + '\n' + c.message +
-      '\n※この確認日時時点の結果です。\nCookie保存先：' + (saved ? '暗号化保存済み（管理画面の設定を優先）' : 'CloudflareのSecret') +
-      (saved ? '\nCookie更新日時：' + time(saved.updated) : '') +
+      '\n\n【手動の接続確認・Cookie更新】\n確認日時：' + time(h.connection_checked) + '\n' + h.connection_message +
+      '\n※この確認日時時点の結果です。\nCookie保存先：' + (h.cookie_updated!=null ? '暗号化保存済み（管理画面の設定を優先）' : 'CloudflareのSecret') +
+      (h.cookie_updated!=null ? '\nCookie更新日時：' + time(h.cookie_updated) : '') +
       '\n\n前回の自動実行記録：' + s.message + '\n巡回順：' + orderFor(settings.tags,slot).join(' → '));
   }
-    const stats = await sql(original,'SELECT tag,SUM(checks) AS checks,SUM(sent) AS sent,SUM(skips) AS skips,SUM(errors) AS errors FROM nh_v14_stats WHERE day>=? GROUP BY tag ORDER BY checks DESC', new Date(Date.now()+9*HOUR-6*24*HOUR).toISOString().slice(0,10)).all();
   blocks.push('【タグ別実績・直近7日／2アカウント合算】\n' + (stats.results.length ? stats.results.map(r=>'#'+r.tag+'：巡回 '+r.checks+'／送信成功 '+r.sent+'／見送り '+r.skips+'／エラー '+r.errors).join('\n') : 'v14導入後から記録します。') + '\n見送りには候補なし・スキ済み・作者の間隔待ちなどを含みます。結果未確認の送信を後から確認した分はタグ別成功数には含めません。');
-  const metrics=await sql(original,'SELECT slot,reason,SUM(count) AS count FROM nh_v15_metrics WHERE day>=? GROUP BY slot,reason ORDER BY slot,reason',new Date(Date.now()+9*HOUR-6*24*HOUR).toISOString().slice(0,10)).all();
   blocks.push('【見送り理由・直近7日／v15導入後】\n'+(metrics.results.length?metrics.results.map(r=>'アカウント'+r.slot+' '+(REASONS[r.reason]||r.reason)+'：'+r.count).join('\n'):'まだ記録はありません。')+'\n候補の除外件数は人数ではありません。プロフィールのクリック数・相手が読んだかどうかは取得できません。');
-  const audit=await sql(original,'SELECT at,message FROM nh_v15_audit ORDER BY id DESC LIMIT 10').all();
   if (audit.results.length) blocks.push('【設定変更履歴】\n'+audit.results.map(r=>time(r.at)+' '+r.message).join('\n'));
   return [prefix,...blocks,'今日の件数はv13導入後に成功を確認した分です。過去の送信結果を後から確認した分も、確認した日に計上します。以前の累計は保持します。予約の遅れやCloudflare全体の停止は、このツールから通知できない場合があります。'].filter(Boolean).join('\n\n──────────\n\n');
 }
@@ -645,20 +677,20 @@ export default {
     if (url.pathname === '/' && request.method === 'GET') return page(undefined,url.searchParams.get('account') === '2' ? '2' : '1');
     if (url.pathname !== '/control' || request.method !== 'POST') return reply('Not found',false,404);
     if (request.headers.get('Origin') !== url.origin) return reply('操作画面を開き直してください。',false,403);
-    if (!original.ADMIN_KEY || !original.DB) return page('ADMIN_KEY または DB の設定を確認してください。');
-    let slot = '1';
+    if (!original.ADMIN_KEY) return page('CloudflareのADMIN_KEYが設定されていません。','1',null,503);
+    let slot = '1', action = '', message = '';
     try {
       const body = await request.text();
       if (body.length > 100000) return reply('入力が長すぎます。',false,413);
       const form = new URLSearchParams(body);
       if (form.get('key') !== original.ADMIN_KEY) return reply('管理用の鍵が違います。',false,403);
       slot = form.get('account') || '1';
-      const action = form.get('action');
+      action = form.get('action');
       if (!SLOTS.includes(slot) || !['status','start','stop','check','save','settings','export','tg_pair','tg_connect','tg_test','tg_off'].includes(action)) return reply('操作を選んでください。',false,400);
+      if (!original.DB) return page('CloudflareのD1バインディング DB を確認してください。',slot,null,503);
       await prepare(original);
-      if (action === 'export') return exportData(original);
+      if (action === 'export') return await exportData(original);
       const env = scoped(original,slot);
-      let message = '';
       if (action === 'settings') message = await saveSettings(original,form);
       else if (action.startsWith('tg_')) message = await telegramAction(original,action);
       else if (action === 'check' || action === 'save') message = await connection(original,slot,action === 'save' ? form.get('cookie') || '' : null);
@@ -674,39 +706,44 @@ export default {
           const other = await sql(scoped(original,slot === '1' ? '2' : '1'),'SELECT account FROM nh_control WHERE id=1').first();
           if (other.account === id) message = 'もう一方と同じnoteです。ログイン情報を確認してください。';
           else {
-            await sql(env,'UPDATE nh_control SET enabled=1, account=? WHERE id=1 AND token=?',id,token).run();
-            message = 'アカウント ' + slot + ' をONにしました。休止期限は保持します。';
+            const saved=await sql(env,'UPDATE nh_control SET enabled=1, account=? WHERE id=1 AND token=?',id,token).run();
+            message = saved.meta.changes ? 'アカウント ' + slot + ' をONにしました。休止期限は保持します。' : '処理期限のため開始を確認できませんでした。';
           }
         } finally { await release(env,token); }
       }
       try { await wakeScheduler(original); }
       catch { message += '\n実行予約の確認に失敗しました。CloudflareのSCHEDULER設定とログを確認してください。'; }
-      return page(await dashboard(original,message),slot,await getSettings(original));
+      const settings=await getSettings(original);
+      return page(await dashboard(original,settings,message),slot,settings);
     } catch (error) {
-      const message = error instanceof Trouble ? error.message : '接続・保存・設定の確認に失敗しました。';
-      try { return page(await dashboard(original,message),slot,await getSettings(original)); } catch { return page(message,slot); }
+      if (error instanceof Trouble) {
+        try {
+          const settings = await getSettings(original);
+          return page(await dashboard(original,settings,error.message),slot,settings,400);
+        } catch (displayError) {
+          return page(error.message+'\n\n'+failure(displayError),slot,null,503);
+        }
+      }
+      if (action === 'stop' && !message) message = '停止の保存を確認できません。状態欄に「停止中」と出るまで、停止済みとは判断できません。';
+      return page([message,failure(error)].filter(Boolean).join('\n\n'),slot,null,503);
     }
   },
   async scheduled(event, original, ctx) {
-    // Cronは予約の復旧専用。ここから直接いいねは送信しない。
+    // Cronは予約の復旧専用。
     ctx.waitUntil(wakeScheduler(original));
   }
 };
-
 async function wakeScheduler(env) {
   if (!env.SCHEDULER) throw new Error('Scheduler binding missing');
   const id = env.SCHEDULER.idFromName('note-helper-210-seconds');
   const response = await env.SCHEDULER.get(id).fetch('https://scheduler.internal/wake');
   if (!response.ok) throw new Error('Scheduler unavailable');
 }
-
-// 秒単位の予約だけを担当する。既存の履歴・認証・休止期限はD1で保持する。
 export class NoteScheduler {
   constructor(ctx, env) { this.ctx = ctx; this.env = env; this.busy = false; }
   async fetch() {
     if (!this.busy) {
       const at = await this.ctx.storage.getAlarm();
-      // 既存の未来の予約を前倒ししない。予約喪失時だけ復旧する。
       if (at === null || at < Date.now() - 300000) {
         await this.ctx.storage.setAlarm(Date.now() + 1000);
       }
@@ -716,7 +753,6 @@ export class NoteScheduler {
   async alarm() {
     this.busy = true;
     try {
-      // 異常終了時にも次の確認を予約。D1のlease/next_atで再送を抑止する。
       await this.ctx.storage.setAlarm(Date.now() + 120000);
       await prepare(this.env);
       await sql(this.env,'UPDATE nh_v15_runtime SET heartbeat=? WHERE id=1',Date.now()).run();
@@ -724,19 +760,29 @@ export class NoteScheduler {
       const due = schedule.active.find(s=>s.eligible<=Date.now());
       if (due) {
         await sql(this.env,'UPDATE nh_v15_runtime SET last_slot=?,last_at=? WHERE id=1',due.slot,Date.now()).run();
-        try { await run(scoped(this.env,due.slot)); }
-        catch { console.error('note-helper: account ' + due.slot + ' storage/runtime failure'); }
+        try { await run(this.env,due.slot); }
+        catch (error) {
+          if (readLimit(error)) throw error;
+          console.error('note-helper: account ' + due.slot + ' storage/runtime failure');
+        }
       }
       try { await flushAlerts(this.env); }
-      catch { console.error('note-helper: notification delivery deferred'); }
-      await this.plan();
+      catch (error) {
+        if (readLimit(error)) throw error;
+        console.error('note-helper: notification delivery deferred');
+      }
+      // 処理が状態を変えた場合だけ再取得。次のalarmでは必ず最新状態を取得する。
+      const current = due ? await schedulerState(this.env) : schedule;
+      let next = Date.now() + 120000;
+      for (const state of current.active) next=Math.min(next,Math.max(Date.now()+1000,state.eligible));
+      await this.ctx.storage.setAlarm(next);
+      await sql(this.env,'UPDATE nh_v15_runtime SET alarm_at=? WHERE id=1',next).run();
+    } catch (error) {
+      if (!readLimit(error)) throw new Error('note-helper: scheduler storage/runtime failure');
+      const nextReset = (Math.floor(Date.now()/(24*HOUR))+1)*24*HOUR;
+      // D1に触れず、同じDOの予約を翌UTC日へ。OFF・lease・next_atは次回にも確認する。
+      await this.ctx.storage.setAlarm(nextReset + 5000);
+      console.warn('note-helper: D1 daily row read limit; alarm deferred to UTC reset');
     } finally { this.busy = false; }
-  }
-  async plan() {
-    let next = Date.now() + 120000; // 停止・手動変更・通知再試行も定期確認する。
-    const schedule = await schedulerState(this.env);
-    for (const state of schedule.active) next=Math.min(next,Math.max(Date.now()+1000,state.eligible));
-    await this.ctx.storage.setAlarm(next);
-    await sql(this.env,'UPDATE nh_v15_runtime SET alarm_at=? WHERE id=1',next).run();
   }
 }
