@@ -1,4 +1,5 @@
-const VERSION = 'v15.2';
+const VERSION = 'v15.3';
+const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
 const HOUR = 3600000, INTERVAL = 240000, LEASE = 300000;
@@ -28,7 +29,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
-<p>通常の通信エラー後は2時間休止します。noteが長い待機時間を指定した場合は、その時間を守ります。</p>
+<p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
 <label>操作するアカウント<select name="account">
@@ -47,8 +48,8 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <details><summary>巡回タグ・間隔・探索件数を変更</summary>
 <p>「両方の状態を確認」を押すと現在の設定を読み込みます。タグは1行に1つ、最大35個。保存すると両アカウントに適用し、2番の巡回順をずらします。</p>
 <label>タグ一覧<textarea name="tags" rows="13" maxlength="3000" placeholder="状態確認で現在のタグを表示">${settings ? esc(settings.tags.join('\n')) : ''}</textarea></label>
-<label>同じ作者への間隔（時間・1〜168）<input name="author_hours" type="number" min="1" max="168" step="1" value="${settings ? settings.author_hours : ''}"></label>
-<p>同じ作者への待機は2垢で共有します。結果不明の送信も履歴に残し、別の作者を探します。旧版で記録済みの作者履歴を引き継ぎます。</p>
+<label>同じ作者への間隔（時間・1〜${MAX_AUTHOR_HOURS}）<input name="author_hours" type="number" min="1" max="${MAX_AUTHOR_HOURS}" step="1" value="${settings ? settings.author_hours : ''}"></label>
+<p>720時間で30日、2160時間で90日、8760時間で365日です。同じ作者への待機は2垢で共有します。結果不明の送信も履歴に残し、別の作者を探します。旧版で記録済みの作者履歴を引き継ぎます。</p>
 <label>各アカウントの実行間隔（秒・240〜3600、30秒刻み）<input name="interval_seconds" type="number" min="240" max="3600" step="30" value="${settings ? settings.interval_seconds : ''}"></label>
 <label>1回に取得するタグ一覧の上限（1〜3）<input name="scan_tags" type="number" min="1" max="3" step="1" value="${settings ? settings.scan_tags : ''}"></label>
 <label>1回に確認する記事詳細の上限（1〜5）<input name="scan_notes" type="number" min="1" max="5" step="1" value="${settings ? settings.scan_notes : ''}"></label>
@@ -205,7 +206,7 @@ async function saveSettings(env, form) {
   const tags = [...new Set(raw.split(/[\s,、・，]+/u).map(t=>t.replace(/^[#＃]+/u,'').trim()).filter(Boolean))];
   const hours = Number(form.get('author_hours'));
   if (!tags.length || tags.length>35 || tags.some(t=>[...t].length>50 || /[\x00-\x1f\x7f<>/#＃]/u.test(t))) throw new Trouble('タグは1〜35個、各50文字以内で入力してください','config');
-  if (!Number.isInteger(hours) || hours<1 || hours>168) throw new Trouble('作者への間隔は1〜168時間の整数で入力してください','config');
+  if (!Number.isInteger(hours) || hours<1 || hours>MAX_AUTHOR_HOURS) throw new Trouble('作者への間隔は1〜'+MAX_AUTHOR_HOURS+'時間の整数で入力してください','config');
   const current = await getSettings(env);
   const read = (name,min,max,step=1) => {
     const value = form.has(name) ? Number(form.get(name)) : current[name];
@@ -476,6 +477,7 @@ async function run(original,slot) {
   if (!token) return false;
   const trace = {calls:0}, counts = {runs:1};
   let env = {...baseEnv,TRACE:trace}, stage = 'ログイン確認', activeTag = null, settings;
+  let checkingSend = false;
   const bump = (reason,n=1) => { counts[reason]=(counts[reason]||0)+n; };
   const metrics = () => metricItems(env,{...counts,requests:trace.calls});
   const finish = async (message,success=false) => {
@@ -489,6 +491,7 @@ async function run(original,slot) {
   try {
     settings = await getSettings(env);
     const state = await sql(env,'SELECT * FROM nh_control WHERE id=1').first();
+    checkingSend = Boolean(state.inflight);
     env = await loadCookie(env,state.account);
     if (await account(env)!==state.account) throw new Trouble('登録済みのnoteとログイン情報が一致しません','auth');
     await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0',slot).run();
@@ -580,6 +583,7 @@ async function run(original,slot) {
           sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token)
         ]);
         if (!reserved[0].meta.changes || !reserved[1].meta.changes || !reserved[3].meta.changes) { bump('reserved'); continue; }
+        checkingSend=true;
         stage='スキ送信';
         await api(env,'/api/v3/notes/'+key+'/likes',true,referer);
         stage='送信後の確認';
@@ -607,11 +611,15 @@ async function run(original,slot) {
     return true;
   } catch (error) {
     if (readLimit(error)) throw error;
-    const kind=error instanceof Trouble?error.kind:'storage';
+    // 送信前のGET失敗は次の通常枠に回す。予約済みの送信や本人確認の拒否は従来の待機に従う。
+    const retryRead = !checkingSend && error instanceof Trouble &&
+      (error.kind==='network' || (error.kind==='response' && [0,404,408,410].includes(error.code)));
+    const kind = retryRead ? 'read' : (error instanceof Trouble ? error.kind : 'storage');
     const h=await sql(env,'SELECT * FROM nh_health WHERE id=1').first();
     const errors=Number(h.errors)+1, rates=Number(h.rate_fail)+(kind==='rate'?1:0);
-    const serverWait=error instanceof Trouble?error.retry:0, wait=Math.max(2*HOUR,serverWait);
-    const message='自動再確認待ち：'+stage+'／'+failure(error);
+    const serverWait=error instanceof Trouble?error.retry:0;
+    const wait=Math.max(retryRead ? settings.interval_seconds*1000 : 2*HOUR,serverWait);
+    const message=(retryRead ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error);
     bump('errors');
     await env.DB.batch([
       ...metrics(), ...statItems(env,activeTag,'errors'),
@@ -654,6 +662,7 @@ async function dashboard(original, settings, prefix = '') {
     else if (h.kind === 'auth' && !verified) status = s.message.includes('401') ? 'ON・ログイン情報の更新が必要' : 'ON・ログイン情報やアクセス拒否の確認が必要';
     else if (h.kind === 'config') status = 'ON・暗号化キーなどの設定確認が必要';
     else if (h.kind === 'auth' && verified) status = 'ON・接続修復を確認済み／自動実行待ち';
+    else if (h.kind === 'read' && next > now) status = 'ON・読み取りエラー後の次回巡回待ち';
     else if (next > now) status = h.kind === 'rate' ? 'ON・回数制限で休止中' : h.kind ? 'ON・エラー後の休止中' : 'ON・次の実行待ち';
     else status = 'ON・実行予約待ち';
     blocks.push('アカウント ' + slot + '\n状態：' + status +
