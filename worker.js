@@ -1,4 +1,4 @@
-const VERSION = 'v16.2';
+const VERSION = 'v16.2.1';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -856,13 +856,33 @@ function deskJson(data,status=200) {
 async function deskRoute(request,env) {
   if (request.method==='GET') return deskPage();
   if (request.method!=='POST') return deskJson({error:'操作方法を確認してください。'},405);
-  if (request.headers.get('Origin')!==new URL(request.url).origin || !env.ADMIN_KEY || request.headers.get('Authorization')!=='Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)))
-    return deskJson({error:'管理用の鍵・操作元を確認してください。'},403);
+  const isForm=request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase()==='application/x-www-form-urlencoded';
+  const failure=(message,status)=>isForm?deskPage(null,message,status):deskJson({error:message},status);
+  if(request.headers.get('Origin')!==new URL(request.url).origin)
+    return failure('操作元を確認できません。「520 作品管理」を開き直してください。',403);
+  if(!env.ADMIN_KEY)return failure('Cloudflareに管理用の鍵が設定されていません。',503);
   try {
-    const input=JSON.parse(await read520body(request,2000000));
-    return await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
+    let input;
+    if(isForm){
+      const form=new URLSearchParams(await read520body(request,2000000));
+      if(form.get('key')!==env.ADMIN_KEY)return failure('管理用の鍵が違います。入力し直してください。',403);
+      // A native browser form may only read the dashboard.
+      const offset=Number(form.get('offset')??0);
+      if(!Number.isSafeInteger(offset) || offset<0)return failure('ページ番号を確認してください。',400);
+      input={action:'status',offset};
+    }else{
+      if(request.headers.get('Authorization')!=='Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)))
+        return failure('管理用の鍵が違います。入力し直してください。',403);
+      input=JSON.parse(await read520body(request,2000000));
+    }
+    if(!env.SCHEDULER)return failure('作品管理の保存先 SCHEDULER が設定されていません。',503);
+    const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
+    if(!isForm)return res;
+    if(!res.ok)return failure('作品管理の記録を読み出せませんでした。少し待ってから、もう一度開いてください。',503);
+    return deskPage(await res.json(),'記録を開きました。「既刊と新作の掲載先」に結果を表示しました。');
   } catch(e) {
-    return deskJson({error:e instanceof Input520?e.message:e instanceof SyntaxError?'入力形式を確認してください。':'作品管理の保存先に接続できません。'},e instanceof Input520 || e instanceof SyntaxError?400:503);
+    const bad=e instanceof Input520 || e instanceof SyntaxError;
+    return failure(e instanceof Input520?e.message:bad?'入力または応答の形式を確認できません。':'作品管理の保存先に接続できません。少し待ってから、もう一度開いてください。',bad?400:503);
   }
 }
 function xmlValue520(raw) {
@@ -990,7 +1010,8 @@ class Desk520 {
         }
         default: throw new Input520('操作を選んでください。');
       }
-      return deskJson(this.view());
+      const records=this.view(input.action==='status' && Number.isSafeInteger(input.offset) && input.offset>=0?input.offset:0);
+      return deskJson({...records,recordText:deskRecordText(records)});
     } catch(e) {
       return deskJson({error:e instanceof Input520?e.message:'保存・読み出しを確認できません。管理画面を開き直してください。'},e instanceof Input520?400:503);
     }
@@ -1058,11 +1079,11 @@ class Desk520 {
     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),x=>x.toString(16).padStart(2,'0')).join('');
     this.rows('INSERT OR IGNORE INTO desk_photo(hash,jpeg,caption,added) VALUES(?,?,?,?)',digest,bytes.buffer,p.caption,now);
   }
-  view() {
+  view(offset=0) {
     const cfg=this.one('SELECT enabled,plan,rss_ok,rss_msg,tick_at,started,blocked FROM desk_cfg WHERE id=1');
     const eligible=this.eligibleMags(Date.now());
     const urls=new Set(eligible.map(m=>m.url));
-    return {cfg,archive:this.archivePage(0,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
       samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
@@ -2025,12 +2046,58 @@ function photoKeywords162(caption) {
   return [...new Set(terms)].join('、');
 }
 
-function deskPage() {
+function deskRecordText(s) {
+  const tm=t=>t?time(t):'未記録';
+  const val=v=>v===null || v===undefined?'欠測':String(v);
+  const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
+    '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+  if(s.probe.at) lines.push('取得テスト '+tm(s.probe.at)+' ／ RSS '+(s.probe.rss||'確認中')+' ／ フォロワー '+(s.probe.creator||'確認中')+' ／ スキ '+(s.probe.article||'確認中'));
+  if(s.cfg.blocked>Date.now()) lines.push('note指定の待機 '+tm(s.cfg.blocked)+'まで');
+  lines.push('','【登録作品】');
+  const priority=w=>w.d>='2026-11-19' && w.d<='2026-12-31';
+  const displayed=[...s.works.filter(priority),...s.works.filter(w=>!priority(w))];
+  for(const w of displayed) {
+    lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
+      w.pub?'公開確認 '+tm(w.pub):'RSSでの公開確認待ち',
+      w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
+    for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
+    for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
+    lines.push('');
+  }
+  lines.push('【週次・日本時間の月〜日公開分】','フォロワーは月曜正午から翌月曜正午。平均は公開7日後に測れた作品だけ。');
+  for(const w of s.weeks) lines.push(w.start+'週　純増 '+val(w.delta)+' ／ 平均スキ '+(w.avg7===null?'欠測':w.avg7.toFixed(1))+' ／ 計測 '+w.measured+'本・対象 '+w.eligible+'本　'+(w.final?'確定':'7日後の計測中'));
+  lines.push('','【520の新作・同じ経過時間で比較】');
+  for(const w of s.growth.observed)lines.push(w.title+'　24時間 '+(w.d1??w.state1??'未計測')+' ／ 7日 '+(w.d7??w.state7??'未計測')+' ／ その間の増減 '+(w.d1!==null && w.d7!==null?w.d7-w.d1:'—'));
+  lines.push('','【誌面RSSで掲載を確認した作品】');
+  for(const r of s.growth.references)lines.push(r.title+'　'+r.name+' ／ 初回確認 '+tm(r.observed));
+  lines.push('','【フォロワー数・毎日12:00から15分以内】');
+  for(const f of s.followers) lines.push(f.d+'　'+(f.value===null?f.state:f.value+'人　'+tm(f.at)));
+  return lines.join('\n');
+}
+function deskMagazineList(records) {
+  if(!records)return '';
+  const lines=records.imports.map(m=>m.name+' ／ '+(m.mode==='excluded'?'除外済み':m.allowed?m.state:m.memberReason||'運営資格を確認待ち'));
+  return lines.map(line=>'<p>'+esc(line)+'</p>').join('');
+}
+function deskArchiveList(archive) {
+  if(!archive)return '';
+  return archive.items.map(w=>{
+    const where=w.seen.length?'誌面で掲載を確認：'+w.seen.map(x=>x.name).join('、'):w.choice?'条件に合う1誌：'+w.choice+'（掲載未確認）':w.waiting;
+    const likes=w.at?' ／ '+time(w.at)+'時点 '+w.likes+'スキ':'';
+    const change=w.change===null?'':' ／ '+time(w.prior_at)+'からの増減 '+w.change;
+    return '<p>'+esc(w.title+' ／ '+where+' ／ '+w.state+likes+change)+' <a href="https://note.com/43__/n/'+encodeURIComponent(w.article)+'" target="_blank" rel="noopener noreferrer">作品を開く</a></p>';
+  }).join('');
+}
+function deskPage(records=null,message='',status=200) {
+  const archive=records?.archive;
+  const catalogue=archive?archive.message+' ／ 確認できた作品 '+archive.total+'本（固定記事を除く）':'';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.2</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
-<label>管理用の鍵<input id="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></label><button id="load">記録を開く</button><p id="msg" role="status"></p>
+<title>520 作品管理 v16.2.1</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.2.1</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+<button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button></form>
+<p id="msg" role="status" aria-live="polite">${esc(message)}</p>
 <p>新作の公開確認・計測・マガジンの確認は、更新後の定期起動から自動で始まります。管理用の鍵は記録を見るときに入力します。</p>
 <details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
@@ -2044,30 +2111,40 @@ function deskPage() {
 <details><summary>複数の完成稿を1回で登録（JSON）</summary><p>配列の各行に seq（順番）, title, body, d（YYYY-MM-DD）, t（HH:MM または空文字）, locked（予約済み true / false）, draft（記事IDまたは空文字）, genre, method を入れます。どれか1本に誤りがあれば一括登録全体を戻します。</p><label>JSONファイル<input id="batch" type="file" accept=".json,application/json"></label><button id="import">一括登録</button></details></details>
 <details id="magsection"><summary>マガジンの自動確認</summary>
 <p>520の公開ページなどから誌面を探し、無料・共同運営者・募集条件を確認します。以前の除外は保持します。</p>
-<p id="directory"></p><div id="imports"></div><div id="mags"></div>
+<p id="directory">${esc(records?.directory?.message)}</p><div id="imports">${deskMagazineList(records)}</div><div id="mags"></div>
 <details><summary>公開一覧にない誌のURLを補う（任意）</summary><label>マガジンURL<input id="oneurl" type="url"></label><button id="sourcemag">次回の確認に追加</button></details></details>
 <details><summary>共有可の写真を準備</summary><p>「共有可」に入れた自分の写真をまとめて選べます。画素からJPEGと短い説明を作ります。被写体を一言添えることもできます。画面に保存されるのは加工したJPEGです。実際の共有は、noteアプリの「アカウント」→「アップロードした画像」で加工済みの画像を選び、「共有」を押します。</p>
 <label>被写体（任意・場所や氏名は不要）<input id="subject" maxlength="40"></label>
 <label>共有可に入れる自作写真を選ぶ（複数可・作品のサムネを除く）<input id="photo" type="file" multiple accept="image/*"></label>
 <button id="prep">選んだ写真の準備を再試行</button><div id="photos"></div></details>
-<details open><summary>既刊と新作の掲載先</summary><p id="catalogue"></p><div id="archive"></div>
-<button id="prevarchive">前の30本</button><button id="nextarchive">次の30本</button></details>
-<h2>作品と計測</h2><pre id="result">管理用の鍵を入力し「記録を開く」を押してください。</pre>
-<script nonce="${nonce}">(${deskBrowser.toString()})();</script></body></html>`;
-  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}});
+<details open><summary>既刊と新作の掲載先</summary><p id="catalogue">${esc(catalogue)}</p><div id="archive">${deskArchiveList(archive)}</div>
+<button id="prevarchive" form="readform" type="submit" name="offset" value="${Math.max(0,(archive?.offset||0)-30)}"${archive?.offset?'':' disabled'}>前の30本</button><button id="nextarchive" form="readform" type="submit" name="offset" value="${(archive?.offset||0)+30}"${archive?.more?'':' disabled'}>次の30本</button></details>
+<h2>作品と計測</h2><pre id="result">${esc(records?.recordText??'管理用の鍵を入力し「記録を開く」を押してください。')}</pre>
+<script nonce="${nonce}">${DESK_BROWSER_SCRIPT}</script></body></html>`;
+  return new Response(html,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'same-origin','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}});
 }
-function deskBrowser() {
+const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   const $=id=>document.getElementById(id);
   const tm=t=>t?new Date(t).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}):'未記録';
-  const val=v=>v===null || v===undefined?'欠測':String(v);
   const msg=s=>{$('msg').textContent=s;};
   async function send(action,extra={}) {
-    const r=await fetch('/520',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+btoa(Array.from(new TextEncoder().encode($('key').value),x=>String.fromCharCode(x)).join(''))},body:JSON.stringify({action,...extra})});
-    if(r.ok && action==='download') return r.blob();
-    const s=await r.json();
-    if(!r.ok) throw Error(s.error || '操作を確認できません。');
-    if(action==='archive'){showArchive(s);return;}
-    show(s);
+    const key=$('key').value;
+    if(!key)throw Error('画面上部の「管理用の鍵」を入力してください。');
+    const controller=action==='status'?new AbortController():null;
+    const timer=controller?setTimeout(()=>controller.abort(),20000):null;
+    try {
+      const r=await fetch('/520',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+btoa(Array.from(new TextEncoder().encode(key),x=>String.fromCharCode(x)).join(''))},body:JSON.stringify({action,...extra}),signal:controller?.signal});
+      if(r.ok && action==='download') return r.blob();
+      if(!r.headers.get('Content-Type')?.includes('application/json'))throw Error('作品管理から記録を受け取れませんでした（HTTP '+r.status+'）。もう一度開いてください。');
+      const s=await r.json();
+      if(!r.ok) throw Error(s.error || '操作を確認できません。');
+      if(action==='archive'){showArchive(s);return;}
+      show(s);
+    }catch(error){
+      if(controller?.signal.aborted)throw Error('20秒以内に応答がありませんでした。「簡易表示で開く」を押してください。');
+      if(error instanceof TypeError)throw Error('作品管理に接続できませんでした。通信を確認して、もう一度開いてください。');
+      throw error;
+    }finally{if(timer!==null)clearTimeout(timer);}
   }
   let busy=false;
   function wrap(f){return async()=>{
@@ -2081,9 +2158,7 @@ function deskBrowser() {
     const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=wrap(fn);parent.append(b);
   }
   function line(parent,s){const p=document.createElement('p');p.textContent=s;parent.append(p);return p;}
-  let archiveOffset=0;
   function showArchive(a) {
-    archiveOffset=a.offset;
     $('catalogue').textContent=a.message+' ／ 確認できた作品 '+a.total+'本（固定記事を除く）';
     $('archive').replaceChildren();
     for(const w of a.items){
@@ -2092,38 +2167,14 @@ function deskBrowser() {
         (w.change!==null?' ／ '+tm(w.prior_at)+'からの増減 '+w.change:''));
       external(el,'作品を開く','https://note.com/43__/n/'+w.article);
     }
+    $('prevarchive').value=Math.max(0,a.offset-30);$('nextarchive').value=a.offset+30;
     $('prevarchive').disabled=a.offset===0;$('nextarchive').disabled=!a.more;
   }
-  $('prevarchive').onclick=wrap(()=>send('archive',{offset:Math.max(0,archiveOffset-30)}));
-  $('nextarchive').onclick=wrap(()=>send('archive',{offset:archiveOffset+30}));
   function show(s){
     showArchive(s.archive);
 
     if(!$('seq').value) $('seq').value=(s.works.at(-1)?.seq??0)+1;
-    const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
-      '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
-    if(s.probe.at) lines.push('取得テスト '+tm(s.probe.at)+' ／ RSS '+(s.probe.rss||'確認中')+' ／ フォロワー '+(s.probe.creator||'確認中')+' ／ スキ '+(s.probe.article||'確認中'));
-    if(s.cfg.blocked>Date.now()) lines.push('note指定の待機 '+tm(s.cfg.blocked)+'まで');
-    lines.push('','【登録作品】');
-    const priority=w=>w.d>='2026-11-19' && w.d<='2026-12-31';
-    const displayed=[...s.works.filter(priority),...s.works.filter(w=>!priority(w))];
-    for(const w of displayed) {
-      lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
-        w.pub?'公開確認 '+tm(w.pub):'RSSでの公開確認待ち',
-        w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
-      for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
-      for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
-      lines.push('');
-    }
-    lines.push('【週次・日本時間の月〜日公開分】','フォロワーは月曜正午から翌月曜正午。平均は公開7日後に測れた作品だけ。');
-    for(const w of s.weeks) lines.push(w.start+'週　純増 '+val(w.delta)+' ／ 平均スキ '+(w.avg7===null?'欠測':w.avg7.toFixed(1))+' ／ 計測 '+w.measured+'本・対象 '+w.eligible+'本　'+(w.final?'確定':'7日後の計測中'));
-    lines.push('','【520の新作・同じ経過時間で比較】');
-    for(const w of s.growth.observed)lines.push(w.title+'　24時間 '+(w.d1??w.state1??'未計測')+' ／ 7日 '+(w.d7??w.state7??'未計測')+' ／ その間の増減 '+(w.d1!==null && w.d7!==null?w.d7-w.d1:'—'));
-    lines.push('','【誌面RSSで掲載を確認した作品】');
-    for(const r of s.growth.references)lines.push(r.title+'　'+r.name+' ／ 初回確認 '+tm(r.observed));
-    lines.push('','【フォロワー数・毎日12:00から15分以内】');
-    for(const f of s.followers) lines.push(f.d+'　'+(f.value===null?f.state:f.value+'人　'+tm(f.at)));
-    $('result').textContent=lines.join('\n');
+    $('result').textContent=s.recordText;
     $('directory').textContent=s.directory.message;
     $('imports').replaceChildren();$('mags').replaceChildren();
     for(const m of s.imports){
@@ -2153,7 +2204,22 @@ function deskBrowser() {
     const a=document.createElement('a');a.href=url;a.textContent=label;a.target='_blank';a.rel='noopener noreferrer';parent.append(' ',a);
   }
   $('sourcemag').onclick=wrap(()=>send('mag_source',{url:$('oneurl').value.trim()}));
-  $('load').onclick=wrap(()=>send('status'));
+  $('readform').onsubmit=event=>{
+    if(event.submitter===$('basic'))return;
+    event.preventDefault();
+    if(busy)return;
+    if(event.submitter?.name==='offset')return wrap(()=>send('archive',{offset:Number(event.submitter.value)}))();
+    return wrap(async()=>{
+      $('basic').hidden=true;
+      try {
+        await send('status');
+        return '記録を開きました。「既刊と新作の掲載先」に結果を表示しました。';
+      }catch(error){
+        $('basic').hidden=false;
+        throw error;
+      }
+    })();
+  };
   $('add').onclick=wrap(async()=>{
     const f=$('manuscript').files[0];
     if(f && $('body').value) throw Error('本文とファイルのどちらか1つを入力してください。');
@@ -2209,4 +2275,4 @@ function deskBrowser() {
       await send('photo',{jpeg,caption,allowed:true});
     }finally{URL.revokeObjectURL(u);}
   }
-}
+})();`;
