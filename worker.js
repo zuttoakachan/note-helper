@@ -1,4 +1,4 @@
-const VERSION = 'v16.4';
+const VERSION = 'v16.4.2';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -825,6 +825,24 @@ function text520(v,max) { return typeof v==='string' && v.trim()!=='' && v.lengt
 function date520(s) {
   return typeof s==='string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(jstStart(s)) && jstDay(jstStart(s))===s;
 }
+function sharedDraftKey(value) {
+  let url;
+  try { url=new URL(String(value||'').trim()); } catch {}
+  const match=url?.origin==='https://note.com' && !url.username && !url.password &&
+    /^\/preview\/(n[a-z0-9]{1,64})\/?$/.exec(url.pathname);
+  need520(match && url.searchParams.get('prev_access_key'),'noteの下書きの「共有用リンク」を貼ってください。');
+  return match[1];
+}
+// A missing field does not establish that the author selected no image.
+function coverId(value) {
+  if(value===null || value==='')return '';
+  try {
+    const u=new URL(value);
+    if(u.protocol==='https:' && !u.username && !u.password && !u.port && /^(?:[a-z0-9-]+\.)+st-note\.com$/.test(u.hostname) && u.pathname.length>1)
+      return u.origin+u.pathname;
+  } catch {}
+  return null;
+}
 function same520(a,b,fields) { return fields.every(k=>a[k]===b[k]); }
 function stub520(env) {
   return env.SCHEDULER.get(env.SCHEDULER.idFromName('note-helper-210-seconds'));
@@ -866,10 +884,15 @@ async function deskRoute(request,env) {
     if(isForm){
       const form=new URLSearchParams(await read520body(request,2000000));
       if(form.get('key')!==env.ADMIN_KEY)return failure('管理用の鍵が違います。入力し直してください。',403);
-      // A native browser form may only read the dashboard.
-      const offset=Number(form.get('offset')??0);
-      if(!Number.isSafeInteger(offset) || offset<0)return failure('ページ番号を確認してください。',400);
-      input={action:'status',offset};
+      if(['reserve_link','cancel_link','preview_link'].includes(form.get('work_action'))){
+        input={action:form.get('work_action'),article:sharedDraftKey(form.get('share')),d:form.get('link_date'),t:form.get('link_time')};
+      }else if(form.get('work_action')==='clear_reserved'){
+        input={action:'clear_reserved',seqs:form.getAll('reserved_seq').map(Number)};
+      }else{
+        const offset=Number(form.get('offset')??0);
+        if(!Number.isSafeInteger(offset) || offset<0)return failure('ページ番号を確認してください。',400);
+        input={action:'status',offset};
+      }
     }else{
       if(request.headers.get('Authorization')!=='Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)))
         return failure('管理用の鍵が違います。入力し直してください。',403);
@@ -878,8 +901,12 @@ async function deskRoute(request,env) {
     if(!env.SCHEDULER)return failure('作品管理の保存先 SCHEDULER が設定されていません。',503);
     const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
     if(!isForm)return res;
-    if(!res.ok)return failure('作品管理の記録を読み出せませんでした。少し待ってから、もう一度開いてください。',503);
-    return deskPage(await res.json(),'記録を開きました。「既刊と新作の掲載先」に結果を表示しました。');
+    const data=await res.json();
+    if(!res.ok){
+      if(res.status===400 && ['reserve_link','cancel_link','preview_link','clear_reserved'].includes(input.action))return failure(data.error,400);
+      return failure('作品管理の記録を読み出せませんでした。少し待ってから、もう一度開いてください。',503);
+    }
+    return deskPage(data,data.correctionMessage||'記録を開きました。「既刊と新作の掲載先」に結果を表示しました。');
   } catch(e) {
     const bad=e instanceof Input520 || e instanceof SyntaxError;
     return failure(e instanceof Input520?e.message:bad?'入力または応答の形式を確認できません。':'作品管理の保存先に接続できません。少し待ってから、もう一度開いてください。',bad?400:503);
@@ -1164,7 +1191,7 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
           const hrefs=new Set(all(row,'a[href]').map(el=>editorLink(el.href)?.key).filter(Boolean));hrefs.add(entry.key);
           if(hrefs.size!==1)break;
           const words=(row.innerText||'').split('\n').map(v=>v.trim()).filter(Boolean);
-          if(!words.includes(arg.title.trim()) || !words.some(t=>t==='下書き'||/予約中|予約済|公開予約|公開予定|公開済/.test(t)))continue;
+          if((!arg.byLink && !words.includes(arg.title.trim())) || !words.some(t=>t==='下書き'||/予約中|予約済|公開予約|公開予定|公開済/.test(t)))continue;
           if(words.some(t=>/予約中|予約済|公開予約|公開予定|公開済/.test(t)))return {state:'reserved'};
           hits.push(entry);break;
         }
@@ -1186,7 +1213,14 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
       const titles=all(document,'textarea,input,[contenteditable=true]').filter(e=>/^(記事)?タイトル(を入力)?$/.test(e.getAttribute('placeholder')||e.getAttribute('aria-label')||e.getAttribute('data-placeholder')||''));
       const title=unique(titles);
       const body=unique(all(document,'[contenteditable=true].ProseMirror,[contenteditable=true][role=textbox],[contenteditable=true][data-placeholder]').filter(e=>e!==title));
-      if(!body || !title || value(title)!==arg.title)return false;
+      if(!body || !title)return false;
+      if(arg.byLink){
+        const name=value(title);
+        if(!name?.trim() || name.trim()==='521' || name.length>300 || (!body.innerText?.trim() && !body.querySelector('img,figure,iframe,video')))return false;
+        if(step==='linkTitle')return name;
+        return name===arg.title;
+      }
+      if(value(title)!==arg.title)return false;
       // Only project ordinary text paragraphs. Preserve whitespace and blank paragraphs.
       const plain=node=>{
         let out='';
@@ -1207,6 +1241,15 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
       }
       return parts.join('\n')===arg.body.replace(/\r\n?/g,'\n');
     };
+    if(step==='linkTitle')return checkedDraft()||null;
+    if(step==='linkCover'){
+      const slots=all(document,'img[alt="見出し画像"],[data-testid="eyecatch"] img,[data-testid="eyecatch-image"] img,[data-testid="header-image"] img').filter(i=>!i.closest('[contenteditable=true]'));
+      if(slots.length===1 && slots[0].complete && slots[0].naturalWidth>0)
+        return {src:slots[0].currentSrc || slots[0].src};
+      // An unlabeled blank editor or a loading image is not evidence of an empty cover.
+      if(!slots.length && button(document,['見出し画像を追加','見出し画像を設定']))return {src:null};
+      return null;
+    }
     if(step==='draft')return checkedDraft()?'ready':'mismatch';
     if(step==='settings')return checkedDraft()?press(button(document,['公開設定'])):'mismatch';
     if(step==='publishReady'||step==='publish'){
@@ -1264,6 +1307,20 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
   return 'missing';
 }
 `;
+// Runs inside the authenticated note.com tab. Return only the data needed for comparison.
+async function readDraftCover(key,accountId) {
+  if(location.origin!=='https://note.com' || !/^n[a-z0-9]{1,64}$/.test(key))return null;
+  try {
+    const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});
+    if(!r.ok)return null;
+    const n=(await r.json())?.data;
+    if(!n || n.key!==key)return null;
+    if(n.user?.urlname && n.user.urlname!=='43__' || n.user?.id && String(n.user.id)!==accountId || ['published','reserved','scheduled'].includes(n.status) ||
+       [n.scheduledPublishAt,n.scheduled_publish_at,n.publishAt,n.publish_at].some(t=>t && Date.parse(t)>Date.now()))return {unsafe:true};
+    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId || !Object.hasOwn(n,'eyecatch'))return null;
+    return {name:n.name,cover:n.eyecatch};
+  }catch{return null;}
+}
 async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
   return inNoteBrowser(binding,cookie,job.kind==='publish',async ({command,evaluate,blocked,blockedResult})=>{
     const end=Date.now()+36000;
@@ -1277,7 +1334,8 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       return null;
     };
     const state=(step,arg,values)=>poll(()=>frame(step,arg),v=>values.includes(v));
-    const arg={key:job.key,title:job.title};
+    const arg={key:job.key,title:job.title,byLink:!!job.link};
+    let cover=null;
     const page=job.kind==='publish'?'https://note.com/notes':'https://note.com/43__/n/'+job.key;
     await navigate(page);
     const identity=await poll(()=>evaluate(noteIdentityJS),v=>!!v);
@@ -1307,9 +1365,27 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       const editor=new URL(draft.url);
       if(!/^n[a-z0-9]{1,64}$/.test(draft.key) || !['https://editor.note.com','https://note.com'].includes(editor.origin) ||
           editor.pathname.replace(/\/$/,'')!=='/notes/'+draft.key+'/edit')return {message:'本人の編集ページを確認待ち'};
+      // Read the existing draft's explicit cover field while still on note.com's own domain.
+      const metadata=await evaluate('('+readDraftCover.toString()+')('+JSON.stringify(draft.key)+','+JSON.stringify(accountId)+')');
+      if(blocked())return blockedResult();
+      if(metadata?.unsafe)return {message:'公開済み・予約済みまたは所有者の不一致を確認・公開保留'};
       await navigate(editor.href);
       Object.assign(arg,{key:draft.key,body:job.body});
+      if(job.link){
+        const name=await poll(()=>frame('linkTitle',arg),v=>typeof v==='string' && !!v);
+        if(!name)return {message:'元の下書きのタイトルと編集画面を確認できず・公開保留'};
+        arg.title=name;
+      }
+      if(metadata?.name && metadata.name!==arg.title)return {message:'下書きのタイトルが一致せず・公開保留'};
       if(!await state('draft',arg,['ready']))return blocked()?blockedResult():{message:'下書きのタイトル・本文・改行の一致を確認待ち'};
+      const img=await frame('linkCover',arg);
+      const domCover=img?coverId(img.src):null;
+      const dataCover=metadata && Object.hasOwn(metadata,'cover')?coverId(metadata.cover):null;
+      if(dataCover!==null && domCover!==null && dataCover!==domCover)return {message:'見出し画像の記録と編集画面が一致せず・公開保留'};
+      // Only an explicit field in the saved draft can confirm there is no header.
+      cover=dataCover??(domCover || null);
+      if(cover===null)return {message:'下書きの見出し画像を確認できず・公開保留'};
+      if(job.preview)return {message:'「'+arg.title+'」 ／ '+(cover?'設定済みの見出し画像を確認しました。':'見出し画像は未設定です。')};
       if(blocked() || await frame('settings',arg)!=='clicked')return blocked()?blockedResult():{message:'公開設定を確認待ち'};
       // Text is no longer needed in the browser commands for the publish screen.
       delete arg.body;
@@ -1325,7 +1401,9 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       finalStep='magAdd';
     }
     if(blocked())return blockedResult();
-    if(Date.now()>=end || !await markAttempt(arg.key))return {message:'予定・待機・掲載条件を再確認待ち'};
+    if(Date.now()>=end)return {message:'確認時間を超過・操作保留'};
+    const gate=await markAttempt(arg.key,job.kind==='publish'?{title:arg.title,cover}:null);
+    if(gate!==true)return {message:typeof gate==='string'?gate:'予定・待機・掲載条件を再確認待ち'};
     if(!blocked()){
       await frame(finalStep,arg);
       await pause520(1000);
@@ -1357,6 +1435,22 @@ class Desk520 {
       });
     }
     this.initDelivery();
+    if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_link_plan'")){
+      this.storage.transactionSync(()=>{
+        this.rows("CREATE TABLE desk_link_plan(article TEXT PRIMARY KEY, scheduled INTEGER NOT NULL, title TEXT, pub INTEGER, cover TEXT, check_at INTEGER, result TEXT)");
+        this.rows('CREATE TABLE desk_preview_gate(id INTEGER PRIMARY KEY,next INTEGER NOT NULL)');
+        this.rows('INSERT INTO desk_preview_gate(id,next) VALUES(1,0)');
+        this.rows('CREATE INDEX desk_link_time ON desk_link_plan(scheduled) WHERE pub IS NULL');
+        this.rows('CREATE INDEX desk_link_check ON desk_link_plan(check_at) WHERE check_at IS NOT NULL');
+        this.rows("CREATE INDEX desk_published_key ON desk_job(target) WHERE kind='publish' AND phase IN ('sent','seen','confirmed')");
+      });
+    }
+    if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_work_cover'")){
+      this.storage.transactionSync(()=>{
+        this.rows('CREATE TABLE desk_work_cover(seq INTEGER PRIMARY KEY, article TEXT UNIQUE NOT NULL, scheduled INTEGER NOT NULL, cover TEXT NOT NULL, check_at INTEGER, result TEXT NOT NULL)');
+        this.rows('CREATE INDEX desk_work_cover_due ON desk_work_cover(check_at) WHERE check_at IS NOT NULL');
+      });
+    }
     this.ready=true;
   }
   async admin(req) {
@@ -1364,6 +1458,7 @@ class Desk520 {
       const input=await req.json();
       this.init();
       const now=Date.now();
+      let correctionMessage='';
       switch(input.action) {
         case 'status': break;
         case 'archive': {
@@ -1378,6 +1473,29 @@ class Desk520 {
         case 'works': {
           need520(Array.isArray(input.works) && input.works.length>0 && input.works.length<=100,'一度に1〜100本の完成稿を指定してください。');
           this.storage.transactionSync(()=>{ for(const w of input.works) this.addWork(w); this.planTimes(now); this.match(now); });
+          break;
+        }
+        case 'preview_link':
+          correctionMessage=await this.previewDraft(input.article,now);
+          break;
+        case 'reserve_link':
+        case 'cancel_link':
+          correctionMessage=this.storage.transactionSync(()=>this.editLink(input,now));
+          break;
+        case 'clear_reserved': {
+          const ids=input.seqs;
+          need520(Array.isArray(ids) && ids.length && ids.every(id=>Number.isSafeInteger(id) && id>0 && id<=999999),'直す作品を一覧から選んでください。');
+          const selected=[...new Set(ids)];
+          const count=this.storage.transactionSync(()=>{
+            let changed=0;
+            for(const seq of selected){
+              const row=this.one('UPDATE desk_work SET locked=0 WHERE seq=? AND locked=1 AND pub IS NULL AND article IS NULL RETURNING seq',seq);
+              if(row)changed++;
+            }
+            return changed;
+          });
+          correctionMessage=count+'件の「予約済み」を外しました。';
+          if(count<selected.length)correctionMessage+='現在の状態では変更対象外の作品が'+(selected.length-count)+'件あります。';
           break;
         }
         case 'delivery_switch': {
@@ -1415,15 +1533,40 @@ class Desk520 {
         default: throw new Input520('操作を選んでください。');
       }
       const records=this.view(input.action==='status' && Number.isSafeInteger(input.offset) && input.offset>=0?input.offset:0);
-      return deskJson({...records,recordText:deskRecordText(records)});
+      return deskJson({...records,correctionMessage,recordText:deskRecordText(records)});
     } catch(e) {
       return deskJson({error:e instanceof Input520?e.message:'保存・読み出しを確認できません。管理画面を開き直してください。'},e instanceof Input520?400:503);
     }
+  }
+  editLink(input,now) {
+    const key=input.article;
+    need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
+    const old=this.one('SELECT scheduled,pub FROM desk_link_plan WHERE article=?',key);
+    need520(!old?.pub && !this.publicationSent(key) && !this.one('SELECT 1 FROM desk_archive WHERE article=?',key),'すでに公開済み、または公開操作の結果を確認中です。');
+    if(input.action==='cancel_link') {
+      need520(old,'このリンクの予定はありません。');
+      this.rows('DELETE FROM desk_link_plan WHERE article=?',key);
+    }else{
+      need520(date520(input.d) && typeof input.t==='string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input.t),'公開日と時刻を日本時間で入力してください。');
+      const at=Date.parse(input.d+'T'+input.t+':00+09:00');
+      if(old?.scheduled===at)return '同じ下書き・同じ日時をすでに登録しています。';
+      need520(at>now,'これからの公開日時を選んでください。');
+      need520(!this.one('SELECT 1 FROM desk_work WHERE draft=?',key),'この下書きは完成稿の欄に登録済みです。必要なら「登録済みの『予約済み』を直す」を開いてください。');
+      this.rows('INSERT INTO desk_link_plan(article,scheduled) VALUES(?,?) ON CONFLICT(article) DO UPDATE SET scheduled=excluded.scheduled',key,at);
+    }
+    this.rows("DELETE FROM desk_job WHERE kind='publish' AND subject=? AND phase='wait'",key);
+    return input.action==='cancel_link'?'このリンクの公開予定を取り消しました。noteにある下書きは残っています。':
+      '公開予定を保存しました。'+time(this.one('SELECT scheduled FROM desk_link_plan WHERE article=?',key).scheduled)+'（日本時間）／記事ID '+key+
+      (this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled && this.one('SELECT enabled FROM desk_cfg WHERE id=1').enabled?'':' ／ 現在は休止中です。自動公開の設定を確認してください。');
+  }
+  publicationSent(key) {
+    return !!this.one("SELECT 1 FROM desk_job WHERE kind='publish' AND target=? AND phase IN ('sent','seen','confirmed') LIMIT 1",key);
   }
   addWork(w) {
     need520(w && Number.isSafeInteger(w.seq) && w.seq>0 && w.seq<=999999 && text520(w.title,300) && w.title.trim()!=='521' && text520(w.body,240000),'順番・タイトル・完成稿を確認してください。固定記事「521」は登録できません。');
     need520(date520(w.d) && typeof w.t==='string' && (w.t==='' || /^([01]\d|2[0-3]):[0-5]\d$/.test(w.t)),'公開日と日本時間の時刻を確認してください。');
     need520(typeof w.locked==='boolean' && typeof w.draft==='string' && (!w.draft || /^n[a-z0-9]{1,60}$/.test(w.draft)) && genre520.includes(w.genre) && method520.includes(w.method),'予約済み・記事ID・ジャンル・制作方法を確認してください。');
+    if(w.draft)need520(!this.one('SELECT 1 FROM desk_link_plan WHERE article=?',w.draft),'この下書きは共有リンクで登録済みです。');
     const keys=['seq','title','body','d','t','draft','locked','genre','method'];
     const a={...w,locked:Number(w.locked)};
     const old=this.one('SELECT * FROM desk_work WHERE seq=?',w.seq);
@@ -1492,8 +1635,8 @@ class Desk520 {
       SUM(likes-previous) net FROM desk_archive WHERE prior_at IS NOT NULL AND at>=? AND at<=?
       AND at-prior_at BETWEEN ? AND ? AND pub<=prior_at-? AND likes IS NOT NULL AND previous IS NOT NULL`,
       now-7*D520,now,6*D520,8*D520,30*D520);
-    return {cfg,backlist,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
-      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
+    return {cfg,backlist,linkPlans:this.rows("SELECT l.article,l.title,l.scheduled,l.pub,l.result,j.phase,j.message FROM desk_link_plan l LEFT JOIN desk_job j ON j.kind='publish' AND j.subject=l.article ORDER BY l.scheduled"),deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.article,w.pub,c.result AS coverResult,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
       samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
       followers:this.rows('SELECT * FROM desk_follower ORDER BY d DESC LIMIT 60'),
@@ -1577,6 +1720,7 @@ class Desk520 {
     const changedWeeks=new Set();
     if(!alreadyStored)entries=entries.filter(e=>this.rememberPublic(e.key,e.title,e.pub));
     for(const e of entries) {
+      this.rows("UPDATE desk_link_plan SET pub=COALESCE(pub,?),title=? WHERE article=? AND (pub IS NULL OR title<>?)",e.pub,e.title,e.key,e.title);
       this.rows("UPDATE desk_job SET phase='confirmed',at=?,message='520の公開記事を確認済み' WHERE kind='publish' AND target=? AND label=? AND phase='sent'",now,e.key,e.title);
       const w=this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
       const midnight=jstStart(jstDay(e.pub));
@@ -2145,7 +2289,19 @@ class Desk520 {
       this.rows('INSERT INTO desk_delivery(id,start) VALUES(1,?)',Date.now());
     });
   }
+  dueLink(now,key=null){
+    const p=this.one('SELECT article,scheduled FROM desk_link_plan l WHERE pub IS NULL AND scheduled BETWEEN ? AND ? '+
+      (key?'AND article=? ':'')+
+      "AND NOT EXISTS(SELECT 1 FROM desk_archive WHERE article=l.article) AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE kind='publish' AND subject=l.article AND "+
+      (key?"phase<>'wait'":"(phase<>'wait' OR next>?)")+") ORDER BY scheduled,article LIMIT 1",now-5*M520,now,...(key?[key]:[now]));
+    return p?{kind:'publish',link:true,subject:p.article,key:p.article,target:p.article,title:p.article,scheduled:p.scheduled}:null;
+  }
   duePublication(now){
+    const w=this.dueManuscript(now);
+    if(w && !this.one("SELECT 1 FROM desk_job WHERE kind='publish' AND subject=? AND (phase<>'wait' OR next>?)",w.subject,now))return w;
+    return this.dueLink(now);
+  }
+  dueManuscript(now){
     // Preserve the registered order, including an earlier work awaiting its own reservation.
     const w=this.one('SELECT * FROM desk_work WHERE d=? AND pub IS NULL ORDER BY seq LIMIT 1',jstDay(now));
     if(!w || w.locked || w.title.trim()==='521' || w.d!==jstDay(now))return null;
@@ -2154,7 +2310,7 @@ class Desk520 {
     const scheduled=Date.parse(w.d+'T'+clock+':00+09:00');
     if(!Number.isFinite(scheduled) || scheduled>now || now>scheduled+5*M520 || scheduled<this.one('SELECT start FROM desk_delivery WHERE id=1').start)return null;
     if(this.one('SELECT article FROM desk_archive WHERE title=? LIMIT 1',w.title))return null;
-    return {kind:'publish',subject:String(w.seq),key:w.draft,target:w.draft,title:w.title,body:w.body};
+    return {kind:'publish',subject:String(w.seq),key:w.draft,target:w.draft,title:w.title,body:w.body,scheduled};
   }
   eligiblePlacement(key,now){
     const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
@@ -2179,8 +2335,8 @@ class Desk520 {
   canDeliver(job,now){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return false;
-    const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now):this.duePublication(now);
-    return !!fresh && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title;
+    const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now):job.link?this.dueLink(now,job.key):this.dueManuscript(now);
+    return !!fresh && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title && (!job.link || job.scheduled===fresh.scheduled);
   }
   async deliveryAccount(){
     const numeric=u=>u?.urlname==='43__' && /^[1-9]\d{0,19}$/.test(String(u.id))?String(u.id):'';
@@ -2199,6 +2355,29 @@ class Desk520 {
     if(matches.length!==1)return null;
     const slot=matches[0],gate=rows[SLOTS.indexOf(slot)].results[0];
     return {id,slot,until:Math.max(gate.lease,gate.hold_until,gate.kind?gate.next_at:0)};
+  }
+  async previewDraft(key,now){
+    need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
+    if(typeof this.env.BROWSER?.acquire!=='function')return 'CloudflareのBROWSER設定を確認してください。';
+    const cfg=this.one('SELECT blocked FROM desk_cfg WHERE id=1');
+    if(cfg.blocked>now)return 'note指定の待機中です。';
+    if(!this.one('UPDATE desk_preview_gate SET next=? WHERE id=1 AND next<=? RETURNING id',now+5*M520,now))return '画像の確認テストは5分に1回です。';
+    const account=await this.deliveryAccount();
+    if(!account || account.until>Date.now())return '520本人の接続または前の処理の終了を確認待ちです。';
+    const env=scoped(this.env,account.slot);
+    const lease=await acquire(env,false);
+    if(!lease)return '520が処理中です。';
+    try {
+      const credential=await loadCookie(env,account.id);
+      const job={kind:'publish',link:true,preview:true,key,title:key};
+      const result=await browserDelivery(this.env.BROWSER,account.id,cleanCookie(credential.NOTE_SESSION),job,async()=>false);
+      if(result.hold){
+        const until=Date.now()+result.hold;
+        this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
+        await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,account.slot).run();
+      }
+      return '公開せずに確認 ／ '+result.message;
+    }finally{await release(env,lease);}
   }
   async dispatch(now){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
@@ -2245,12 +2424,27 @@ class Desk520 {
       if(!this.canDeliver(job,Date.now()))return;
       if(job.kind==='mag')this.rows('UPDATE desk_delivery SET mags=mags+1,old_first=? WHERE id=1',+!job.old);
       else this.rows('UPDATE desk_delivery SET pubs=pubs+1 WHERE id=1');
-      const result=await browserDelivery(this.env.BROWSER,account.id,cookie,job,async key=>{
+      const result=await browserDelivery(this.env.BROWSER,account.id,cookie,job,async (key,info)=>{
         // Recheck holds and the leased account just before persisting the irreversible action.
         const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',slot).first();
         const at=Date.now();
+        if(job.link && info?.title && this.one("SELECT 1 FROM desk_work WHERE pub IS NULL AND (draft=? OR (draft='' AND title=?)) LIMIT 1",key,info.title)){
+          return '同じ作品が完成稿欄に登録済みです。既存の予定と「予約済み」を確認してください。';
+        }
         if(!live || live.account!==account.id || live.token!==lease || live.lease<=at || live.hold_until>at || (live.kind && live.next_at>at) || !this.canDeliver(job,at))return false;
-        return !!this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
+        return this.storage.transactionSync(()=>{
+          if(job.kind==='publish' && (!info || info.cover===null || !info.title || this.publicationSent(key) || this.one('SELECT 1 FROM desk_archive WHERE article=?',key)))return false;
+          const marked=this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
+          if(!marked)return false;
+          const pending='公開後の見出し画像を確認待ち';
+          if(job.link){
+            this.rows('UPDATE desk_link_plan SET cover=?,title=?,check_at=?,result=? WHERE article=?',info.cover,info.title,at+5*M520,pending,key);
+            this.rows("UPDATE desk_job SET label=? WHERE kind='publish' AND subject=?",info.title,key);
+          }else if(job.kind==='publish'){
+            this.rows('INSERT INTO desk_work_cover(seq,article,scheduled,cover,check_at,result) VALUES(?,?,?,?,?,?)',Number(job.subject),key,job.scheduled,info.cover,at+5*M520,pending);
+          }
+          return true;
+        });
       });
       message=result.message;
       if(result.seen)this.rows("UPDATE desk_job SET phase='seen',message=?,at=? WHERE kind=? AND subject=? AND phase='wait'",message,Date.now(),job.kind,job.subject);
@@ -2336,6 +2530,28 @@ class Desk520 {
       if(newDue)await this.measure(Date.now());
     } catch {}
   }
+  async verifyLinkCover(now){
+    const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
+    if(!cfg.enabled || cfg.blocked>now)return;
+    const p=this.one('SELECT article,cover,scheduled,check_at,1 AS link FROM desk_link_plan WHERE check_at<=? UNION ALL SELECT article,cover,scheduled,check_at,0 AS link FROM desk_work_cover WHERE check_at<=? ORDER BY check_at LIMIT 1',now,now);
+    if(!p)return;
+    const expired=now>p.scheduled+7*D520;
+    const table=p.link?'desk_link_plan':'desk_work_cover';
+    this.rows('UPDATE '+table+' SET check_at=?,result=? WHERE article=?',expired?null:now+HOUR,'公開後の見出し画像は未確認',p.article);
+    try {
+      const n=(await this.publicRead('https://note.com/api/v3/notes/'+p.article,'json'))?.data;
+      const pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt);
+      if(n?.key!==p.article || n.user?.urlname!=='43__' || !text520(n.name,300) || n.name.trim()==='521' || !Number.isFinite(pub) || pub<=0 || pub>now ||
+        (n.status ? n.status!=='published' : !this.one('SELECT pub FROM desk_archive WHERE article=?',p.article)))return;
+      this.storage.transactionSync(()=>this.registerEntries([{key:p.article,pub,title:n.name}],now));
+      if(!Object.hasOwn(n,'eyecatch'))return;
+      const after=coverId(n.eyecatch);
+      if(after===null)return;
+      const result=p.cover!==after?'公開前後で見出し画像が異なります。noteの記事で確認してください。':
+        after?'公開前後で見出し画像の参照先が一致':'公開前後とも見出し画像なし（自動サムネイルの見た目は未確認）';
+      this.rows('UPDATE '+table+' SET result=?,check_at=NULL WHERE article=?',result,p.article);
+    }catch{ /* A failed read leaves the result unknown; it never queues another publication. */ }
+  }
   async tick() {
     this.init();
     const now=Date.now();
@@ -2343,6 +2559,7 @@ class Desk520 {
       this.ensureRecommendation(now),this.frontPageBackup(now)]);
     this.planArchive(Date.now());
     await this.dispatch(Date.now());
+    await this.verifyLinkCover(Date.now());
   }
   async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
@@ -2689,6 +2906,13 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+  if(s.linkPlans?.length){
+    lines.push('【共有リンクの公開予定】');
+    for(const p of s.linkPlans){
+      const status=p.pub?'公開確認済み':p.phase==='sent'?'公開操作済み・結果確認待ち':Date.now()>p.scheduled+5*M520?'時間枠終了・自動公開は保留':'予定あり';
+      lines.push(tm(p.scheduled)+'　'+(p.title||p.article)+'　'+status+(p.message?' ／ '+p.message:'')+(p.result?' ／ '+p.result:''));
+    }
+  }
   if(s.delivery){
     lines.push('【自動公開・共同誌への追加　'+(s.deliveryOn?'ON':'休止中')+'】');
     if(s.mags)lines.push('無料・共同運営と募集条件を確認済みの候補誌　'+s.mags.length+'誌');
@@ -2707,6 +2931,7 @@ function deskRecordText(s) {
     lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
       w.pub?'公開確認 '+tm(w.pub):!w.locked && (w.t||w.suggested) && Date.now()>Date.parse(w.d+'T'+(w.t||w.suggested)+':00+09:00')+5*M520?'自動公開の時間枠終了・公開結果は確認待ち':'RSSでの公開確認待ち',
       w.magazine?'条件に合う1誌 '+w.magazine+' ／ 誌面での掲載は確認待ち':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
+    if(w.coverResult)lines.push('見出し画像 ／ '+w.coverResult);
     for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
     for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
     lines.push('');
@@ -2738,12 +2963,29 @@ function deskArchiveList(archive) {
 function deskPage(records=null,message='',status=200) {
   const archive=records?.archive;
   const catalogue=archive?archive.message+' ／ 確認できた作品 '+archive.total+'本（固定記事を除く）':'';
+  const reserved=records?.works.filter(w=>w.locked && w.pub==null && w.article==null);
+  const reservedList=reserved?.length?reserved.map(w=>'<label><input type="checkbox" name="reserved_seq" value="'+w.seq+'"> '+esc(w.d+' '+(w.t||w.suggested||'時刻未定')+'　'+w.title)+'</label>').join(''):
+    reserved?'「予約済み」の未公開作品はありません。':'上の「記録を開く」を押してください。';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.4</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.4</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<title>520 作品管理 v16.4.2</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.4.2</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
-<button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button></form>
+<button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
+<details><summary>下書きの共有リンクで予約</summary>
+<label>下書きの共有用リンク<input type="text" inputmode="url" name="share" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+<label>公開日（日本時間）<input type="date" name="link_date"></label>
+<label>公開時刻（日本時間）<input type="time" name="link_time"></label>
+<button type="submit" name="work_action" value="preview_link">公開せずに画像を確認</button>
+<button type="submit" name="work_action" value="reserve_link">この下書きの公開予定を保存</button>
+<p>指定時刻に520の下書きを開きます。登録後に編集した場合は最新の保存内容が対象です。本文・タイトル・画像は転記しません。すでにnoteで予約した記事は対象外です。</p>
+<small>同じリンクで日時を保存し直すと予定を変更できます。取り消すときはリンクだけを入力してください。</small>
+<button type="submit" name="work_action" value="cancel_link">このリンクの予定を取り消す</button></details>
+<details id="corrections"><summary>登録済みの「予約済み」を直す</summary>
+<p>noteに下書きだけがある作品を選んでください。チェックを外すと、登録日時にツールの自動公開の対象になります。</p>
+<div id="reservedlist">${reservedList}</div>
+<button id="unreserve" type="submit" name="work_action" value="clear_reserved"${reserved?.length?'':' disabled'}>選んだ作品の「予約済み」を外す</button>
+</details></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
 <details><summary>自動公開・共同誌への追加を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
@@ -2751,7 +2993,7 @@ function deskPage(records=null,message='',status=200) {
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
 <label>公開日<input id="d" type="date"></label><label>指定済みの時刻（任意）<input id="t" type="time"></label>
-<label><input type="checkbox" id="locked"> note側ですでに予約済み</label>
+<label><input type="checkbox" id="locked"> note側ですでに予約済み（下書きだけならチェック不要）</label>
 <label>記事ID（任意・既存の下書きの n で始まるID）<input id="draft" autocapitalize="none" spellcheck="false"></label>
 <label>ジャンル<select id="genre">${genre520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
 <label>制作方法<select id="method"><option value="">選択してください</option>${method520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
@@ -2820,6 +3062,17 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   }
   function show(s){
     showArchive(s.archive);
+    const reserved=s.works.filter(w=>w.locked && w.pub==null && w.article==null);
+    const list=$('reservedlist');
+    list.replaceChildren();
+    for(const w of reserved){
+      const label=document.createElement('label'), box=document.createElement('input');
+      box.type='checkbox';box.name='reserved_seq';box.value=String(w.seq);
+      label.append(box,' '+w.d+' '+(w.t||w.suggested||'時刻未定')+'　'+w.title);
+      list.append(label);
+    }
+    if(!reserved.length)list.textContent='「予約済み」の未公開作品はありません。';
+    $('unreserve').disabled=reserved.length===0;
 
     if(!$('seq').value) $('seq').value=(s.works.at(-1)?.seq??0)+1;
     $('result').textContent=s.recordText;
@@ -2855,7 +3108,13 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   if($('autoresume'))$('autoresume').onclick=wrap(()=>send('delivery_switch',{enable:true}));
   $('sourcemag').onclick=wrap(()=>send('mag_source',{url:$('oneurl').value.trim()}));
   $('readform').onsubmit=event=>{
-    if(event.submitter===$('basic'))return;
+    if(event.submitter===$('basic') || ['reserve_link','cancel_link','preview_link'].includes(event.submitter?.value))return;
+    if(event.submitter===$('unreserve')){
+      if(!event.currentTarget.querySelector('input[name="reserved_seq"]:checked')){
+        event.preventDefault();msg('直す作品を一覧から選んでください。');
+      }
+      return;
+    }
     event.preventDefault();
     if(busy)return;
     if(event.submitter?.name==='offset')return wrap(()=>send('archive',{offset:Number(event.submitter.value)}))();
