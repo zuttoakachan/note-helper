@@ -2,6 +2,12 @@
   "name": "note-helper",
   "main": "worker.js",
   "compatibility_date": "2026-10-10",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
   "d1_databases": [
     {
       "binding": "DB",
