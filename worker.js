@@ -1,4 +1,4 @@
-const VERSION = 'v16.3';
+const VERSION = 'v16.4';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -809,7 +809,7 @@ export class NoteScheduler {
     } finally { this.busy = false; }
   }
 }
-// 作品の公開情報は既存DOのSQLiteに記録。本人のおすすめ設定の確認時だけ既存の認証を使う。
+// 作品の公開情報は既存DOのSQLiteに記録。設定の確認と、本人の下書きの公開・参加済み共同誌への追加に既存の認証を使う。
 const D520 = 86400000, M520 = 60000, WINDOW520 = 15*M520;
 const jstDay = t => new Date(t+9*HOUR).toISOString().slice(0,10);
 const jstStart = d => Date.parse(d+'T00:00:00+09:00');
@@ -1030,7 +1030,10 @@ function pageCommand(socket) {
   });
 }
 const pause520 = ms => new Promise(resolve=>setTimeout(resolve,ms));
-async function browserRecommendation(binding, accountId, cookie, lastAttempt, tries, markAttempt) {
+const noteIdentityJS=`(async()=>{if(location.origin!=='https://note.com')return null;
+      const r=await fetch('/api/v2/current_user',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
+      if(!r.ok)return null;const j=await r.json(),d=j.data??j,u=d.user??d;return {id:String(u.id),name:u.urlname};})()`;
+async function inNoteBrowser(binding,cookie,allowEditor,action){
   const session=await binding.acquire({keepAlive:15000,recording:false,
     guardrails:{allowedDomains:['note.com','assets.st-note.com','*.st-note.com','*.note.com']}});
   let socket;
@@ -1047,13 +1050,13 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
       try {data=JSON.parse(event.data);} catch{return;}
       if(data.method!=='Network.responseReceived')return;
       const {type,response}=data.params;
-      if(!['Document','XHR','Fetch'].includes(type) || !response.url.startsWith('https://note.com/'))return;
+      if(!['Document','XHR','Fetch'].includes(type) || !/^https:\/\/(?:editor\.)?note\.com\//.test(response.url))return;
       const raw=Object.entries(response.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
       if(raw!==undefined){
         const delay=/^\d+$/.test(String(raw))?Number(raw)*1000:Date.parse(raw)-Date.now();
         if(Number.isFinite(delay))retry=Math.max(retry,delay);
       }
-      if([401,403,429].includes(response.status))denied=response.status;
+      if([401,403,429].includes(response.status) || (allowEditor && response.status>=500))denied=response.status;
     });
     const command=pageCommand(socket);
     const evaluate=async expression=>{
@@ -1062,6 +1065,26 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
       return r.result.value;
     };
     const blocked=()=>denied || retry>0;
+    const blockedResult=()=>({message:denied?'note応答 HTTP '+denied+'・操作結果は未確認':'note指定の待機・操作結果は未確認',hold:Math.max(denied===429?2*HOUR:0,retry)});
+    await command('Network.enable');
+    await command('Network.setCacheDisabled',{cacheDisabled:true});
+    const installed=await command('Network.setCookie',{url:'https://note.com/',name:'_note_session_v5',value:cookie,secure:true,httpOnly:true,sameSite:'Lax'});
+    if(installed.success===false)throw Error('session');
+    if(allowEditor){
+      const installed=await command('Network.setCookie',{url:'https://editor.note.com/',name:'_note_session_v5',value:cookie,secure:true,httpOnly:true,sameSite:'Lax'});
+      if(installed.success===false)throw Error('editor session');
+    }
+    return await action({command,evaluate,blocked,blockedResult});
+  } catch {
+    return denied || retry>0?{message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:'noteの画面との通信を再確認待ち'};
+  } finally {
+    try {socket?.close();} catch {}
+    await binding.closeSession(session.sessionId).catch(()=>{});
+  }
+}
+
+async function browserRecommendation(binding, accountId, cookie, lastAttempt, tries, markAttempt) {
+  return inNoteBrowser(binding,cookie,false,async ({command,evaluate,blocked,blockedResult})=>{
     const waitState=async()=>{
       let stable='';
       for(let i=0;i<14;i++){
@@ -1076,11 +1099,6 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
       }
       return 'missing';
     };
-    const blockedResult=()=>({message:denied?'note応答 HTTP '+denied+'・設定は未確認':'note指定の待機・設定は未確認',hold:Math.max(denied===429?2*HOUR:0,retry)});
-    await command('Network.enable');
-    await command('Network.setCacheDisabled',{cacheDisabled:true});
-    const installed=await command('Network.setCookie',{url:'https://note.com/',name:'_note_session_v5',value:cookie,secure:true,httpOnly:true,sameSite:'Lax'});
-    if(installed.success===false)throw Error('session');
     await command('Page.navigate',{url:noteSettingsURL});
     let state=await waitState();
     if(state==='missing' && !blocked()){
@@ -1104,9 +1122,7 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
     if(state==='login')return {message:'noteがログイン画面を表示・設定は未確認'};
     if(!['on','off'].includes(state))return {message:'設定項目を一意に確認できず・変更なし'};
     // Authenticate *inside this isolated session* before trusting either state.
-    const identity=await evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;
-      const r=await fetch('/api/v2/current_user',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
-      if(!r.ok)return null;const j=await r.json(),d=j.data??j,u=d.user??d;return {id:String(u.id),name:u.urlname};})()`);
+    const identity=await evaluate(noteIdentityJS);
     if(blocked())return blockedResult();
     if(identity?.id!==accountId || identity?.name!=='43__')return {message:'520本人を確認できず・変更なし'};
     if(state==='on')return {message:lastAttempt?'ONを再確認済み':'すでにON・本人の設定で確認済み',done:true};
@@ -1121,14 +1137,202 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
     if(blocked())return blockedResult();
     // Verification is a separate Cron run and a separately acquired browser session.
     return {message:'ON操作済み・別のブラウザー起動で保存結果を確認待ち',verify:true};
-  } catch {
-    return denied || retry>0?{message:'note側で待機・設定は未確認',hold:Math.max(2*HOUR,retry)}:{message:'設定画面との通信未確認・自動再確認待ち'};
-  } finally {
-    try {socket?.close();} catch {}
-    await binding.closeSession(session.sessionId).catch(()=>{});
-  }
+  });
 }
-
+const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
+  const visible=e=>!!(e && e.getClientRects().length && getComputedStyle(e).visibility!=='hidden');
+  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);
+  const label=e=>(e.getAttribute('aria-label') || e.getAttribute('title') || e.innerText || '').trim();
+  const unique=xs=>xs.length===1?xs[0]:null;
+  const button=(root,names)=>unique(all(root,'button,[role=button]').filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true' && names.includes(label(e))));
+  const press=e=>{if(!e)return 'missing';e.click();return 'clicked';};
+  const editorLink=url=>{
+    try {
+      const u=new URL(url,location.href);
+      const m=/^\/notes\/(n[a-z0-9]{1,64})\/edit\/?$/.exec(u.pathname);
+      return ['https://editor.note.com','https://note.com'].includes(u.origin) && !u.username && !u.password && m ? {key:m[1],url:u.origin+u.pathname} : null;
+    }catch{return null;}
+  };
+  if(location.origin==='https://note.com' && /^\/notes\/?$/.test(location.pathname)){
+    if(step==='findDraft'){
+      const hits=[];
+      for(const a of all(document,'a[href]')){
+        const entry=editorLink(a.href);
+        if(!entry || (arg.key && arg.key!==entry.key))continue;
+        let row=a;
+        for(let depth=0;row && depth<7;depth++,row=row.parentElement){
+          const hrefs=new Set(all(row,'a[href]').map(el=>editorLink(el.href)?.key).filter(Boolean));hrefs.add(entry.key);
+          if(hrefs.size!==1)break;
+          const words=(row.innerText||'').split('\n').map(v=>v.trim()).filter(Boolean);
+          if(!words.includes(arg.title.trim()) || !words.some(t=>t==='下書き'||/予約中|予約済|公開予約|公開予定|公開済/.test(t)))continue;
+          if(words.some(t=>/予約中|予約済|公開予約|公開予定|公開済/.test(t)))return {state:'reserved'};
+          hits.push(entry);break;
+        }
+      }
+      const map=new Map(hits.map(x=>[x.key,x]));
+      return map.size===1?{state:'found',...map.values().next().value}:{state:map.size?'ambiguous':'missing'};
+    }
+    if(step==='draftPage'){
+      const a=unique(all(document,'a[href]').filter(e=>['次へ','次のページ','次の30件'].includes(label(e)) || e.rel==='next'));
+      if(!a)return null;
+      const next=new URL(a.href);
+      return next.origin===location.origin && /^\/notes\/?$/.test(next.pathname) && next.href!==location.href ? next.href:null;
+    }
+  }
+  if(['https://editor.note.com','https://note.com'].includes(location.origin) && arg.key &&
+     new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname)){
+    const value=e=>'value' in e?e.value:e.innerText;
+    const checkedDraft=()=>{
+      const titles=all(document,'textarea,input,[contenteditable=true]').filter(e=>/^(記事)?タイトル(を入力)?$/.test(e.getAttribute('placeholder')||e.getAttribute('aria-label')||e.getAttribute('data-placeholder')||''));
+      const title=unique(titles);
+      const body=unique(all(document,'[contenteditable=true].ProseMirror,[contenteditable=true][role=textbox],[contenteditable=true][data-placeholder]').filter(e=>e!==title));
+      if(!body || !title || value(title)!==arg.title)return false;
+      // Only project ordinary text paragraphs. Preserve whitespace and blank paragraphs.
+      const plain=node=>{
+        let out='';
+        for(const child of node.childNodes){
+          if(child.nodeType===3)out+=child.nodeValue;
+          else if(child.nodeName==='BR'){if(!child.classList.contains('ProseMirror-trailingBreak'))out+='\n';}
+          else if(['SPAN','STRONG','EM','B','I','S','U','A','CODE'].includes(child.nodeName)){const x=plain(child);if(x===null)return null;out+=x;}
+          else return null;
+        }
+        return out;
+      };
+      const parts=[];
+      for(const paragraph of body.childNodes){
+        if(!['P','DIV'].includes(paragraph.nodeName))return false;
+        let line=plain(paragraph);if(line===null)return false;
+        if(paragraph.childNodes.length===1 && paragraph.firstChild.nodeName==='BR')line='';
+        parts.push(line);
+      }
+      return parts.join('\n')===arg.body.replace(/\r\n?/g,'\n');
+    };
+    if(step==='draft')return checkedDraft()?'ready':'mismatch';
+    if(step==='settings')return checkedDraft()?press(button(document,['公開設定'])):'mismatch';
+    if(step==='publishReady'||step==='publish'){
+      const submit=button(document,['投稿する']);
+      if(!submit)return 'missing';
+      const scope=submit.closest('[role=dialog],dialog') || document;
+      const selected=all(scope,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(label);
+      for(const el of scope.querySelectorAll('input:checked')){
+        const text=[...(el.labels||[])].map(label).join('').trim();selected.push(text||label(el));
+      }
+      if(!selected.some(t=>t==='無料') || selected.some(t=>/有料|メンバーシップ|日時指定|予約|Xに|SNSに/.test(t)))return 'unsafe';
+      if(all(scope,'input[type="datetime-local"],[name*="schedul"][type=hidden]').some(e=>e.value))return 'unsafe';
+      const tag=unique(all(scope,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||'')));
+      if(!tag || tag.value.trim())return 'unsafe';
+      // Find the tag entry (not the list of suggested tags); unknown chips are not removed.
+      const region=tag.closest('[role=combobox],fieldset,[class*=tagInput],[class*=TagInput]') || tag.parentElement;
+      if(!region || [...region.querySelectorAll('a,button,[role=button],[data-tag],[class*=chip],[class*=Chip]')].some(e=>visible(e) && (/削除|取り消す|^#|外す/.test(label(e))||e.matches('[data-tag],[class*=chip],[class*=Chip]'))))return 'unsafe';
+      if(all(scope,'[aria-label*=ハッシュタグ][aria-label*=削除],[class*=tagChip],[class*=TagChip],[data-selected-tag],input[name="hashtags[]"]').length)return 'unsafe';
+      return step==='publish'?press(submit):'ready';
+    }
+  }
+  if(location.origin==='https://note.com' && location.pathname.replace(/\/$/,'')==='/43__/n/'+arg.key){
+    const canonical=document.querySelector('link[rel=canonical]')?.href;
+    const h=unique(all(document,'h1'));
+    if(!h || h.textContent.trim()!==arg.title.trim() || !canonical || new URL(canonical).pathname.replace(/\/$/,'')!=='/43__/n/'+arg.key || new URL(canonical).origin!==location.origin)return 'wrong';
+    if(step==='openMag')return press(button(document,['記事を保存','マガジンに追加','記事をマガジンに追加']));
+    const modal=unique(all(document,'dialog[open],[role=dialog],[aria-modal=true]'));
+    if(!modal)return 'missing';
+    const isTarget=e=>{
+      if(e.dataset?.magazineKey===arg.mag || e.dataset?.magazineId===arg.mag || (e.tagName==='INPUT' && e.value===arg.mag))return true;
+      if(e.tagName!=='A')return false;
+      const u=new URL(e.href,location.href);return u.origin==='https://note.com' && new RegExp('^/(?:[\\w-]+/)?m/'+arg.mag+'/?$').test(u.pathname);
+    };
+    const markerSel='a[href],[data-magazine-key],[data-magazine-id],input[value]';
+    const markers=all(modal,markerSel).filter(isTarget);
+    const matches=new Set();
+    for(const marker of markers){
+      for(let row=marker;row && row!==modal;row=row.parentElement){
+        if([...row.querySelectorAll(markerSel)].some(e=>{
+          const href=e.tagName==='A'?e.getAttribute('href')||'':'';
+          return (/\/m\/m[a-z0-9]+/.test(href)||e.dataset?.magazineKey||e.dataset?.magazineId) && !isTarget(e);}))break;
+        const controls=all(row,'button,[role=button],input[type=checkbox],[role=checkbox]').filter(e=>
+          ['追加','追加済','追加済み','削除','解除'].includes(label(e)) || e.matches('input[type=checkbox],[role=checkbox]'));
+        if(controls.length===1){matches.add(controls[0]);break;}
+        if(controls.length>1)break;
+      }
+    }
+    const control=unique([...matches]);if(!control)return 'missing';
+    const checked=control.matches('input[type=checkbox]')?control.checked:control.getAttribute('aria-checked');
+    if(checked===true || checked==='true' || ['追加済','追加済み','解除'].includes(label(control)))return 'already';
+    if(control.disabled||control.getAttribute('aria-disabled')==='true' || !(checked===false||checked==='false'||label(control)==='追加'))return 'missing';
+    if(step==='magReady')return 'ready';
+    if(step==='magAdd')return press(control);
+  }
+  return 'missing';
+}
+`;
+async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
+  return inNoteBrowser(binding,cookie,job.kind==='publish',async ({command,evaluate,blocked,blockedResult})=>{
+    const end=Date.now()+36000;
+    const navigate=url=>command('Page.navigate',{url});
+    const frame=async(step,arg)=>evaluate('('+nativeScreenJS+')('+JSON.stringify(step)+','+JSON.stringify(arg)+')');
+    const poll=async(read,accept)=>{
+      for(let i=0;i<10 && !blocked() && Date.now()<end;i++){
+        try{const v=await read();if(accept(v))return v;}catch{}
+        await pause520(200);
+      }
+      return null;
+    };
+    const state=(step,arg,values)=>poll(()=>frame(step,arg),v=>values.includes(v));
+    const arg={key:job.key,title:job.title};
+    const page=job.kind==='publish'?'https://note.com/notes':'https://note.com/43__/n/'+job.key;
+    await navigate(page);
+    const identity=await poll(()=>evaluate(noteIdentityJS),v=>!!v);
+    if(blocked())return blockedResult();
+    if(identity?.id!==accountId || identity.name!=='43__')return {message:'520本人のログインを確認待ち'};
+    let finalStep;
+    if(job.kind==='publish'){
+      let draft, url=page;
+      const visited=new Set();
+      for(let i=0;i<4 && url && !visited.has(url);i++){
+        visited.add(url);
+        if(i)await navigate(url);
+        // Wait for this exact page's article list to mount before reading its next link.
+        const loaded=await poll(()=>evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')'),v=>v===true);
+        if(!loaded)return blocked()?blockedResult():{message:'下書きの一覧を読み込み待ち'};
+        const result=await frame('findDraft',arg);
+        if(result?.state==='found'){
+          if(draft && draft.key!==result.key)return {message:'同名の下書きが複数・公開保留'};
+          draft=result;
+        }else if(['reserved','ambiguous'].includes(result?.state))return {message:'予約・公開済みまたは同名の候補あり・公開保留'};
+        if(draft && job.key)break;
+        url=await frame('draftPage',arg);
+        if(url && (i===3 || visited.has(url)) && !job.key)return {message:'同名下書きの照合範囲を超過・公開保留'};
+      }
+      if(blocked())return blockedResult();
+      if(!draft)return {message:'本人の記事一覧で一致する下書きを確認待ち'};
+      const editor=new URL(draft.url);
+      if(!/^n[a-z0-9]{1,64}$/.test(draft.key) || !['https://editor.note.com','https://note.com'].includes(editor.origin) ||
+          editor.pathname.replace(/\/$/,'')!=='/notes/'+draft.key+'/edit')return {message:'本人の編集ページを確認待ち'};
+      await navigate(editor.href);
+      Object.assign(arg,{key:draft.key,body:job.body});
+      if(!await state('draft',arg,['ready']))return blocked()?blockedResult():{message:'下書きのタイトル・本文・改行の一致を確認待ち'};
+      if(blocked() || await frame('settings',arg)!=='clicked')return blocked()?blockedResult():{message:'公開設定を確認待ち'};
+      // Text is no longer needed in the browser commands for the publish screen.
+      delete arg.body;
+      if(!await state('publishReady',arg,['ready']))return blocked()?blockedResult():{message:'無料・タグなし・通常公開の設定を確認待ち'};
+      finalStep='publish';
+    }else{
+      arg.mag=job.target;
+      if(!await state('openMag',arg,['clicked']))return blocked()?blockedResult():{message:'520の記事の保存メニューを確認待ち'};
+      const ready=await state('magReady',arg,['ready','already']);
+      if(blocked())return blockedResult();
+      if(ready==='already')return {seen:true,message:'noteの画面で追加済み・誌面での確認待ち'};
+      if(!ready)return {message:'一致する誌面と追加ボタンを確認待ち'};
+      finalStep='magAdd';
+    }
+    if(blocked())return blockedResult();
+    if(Date.now()>=end || !await markAttempt(arg.key))return {message:'予定・待機・掲載条件を再確認待ち'};
+    if(!blocked()){
+      await frame(finalStep,arg);
+      await pause520(1000);
+    }
+    return blocked()?blockedResult():{message:'操作記録済み・公開情報で結果を確認待ち'};
+  });
+}
 function publicEntry520(n){return {key:n.key,title:n.name,pub:Date.parse(n.publishAt||n.publish_at||n.publishedAt)};}
 function isPublishedBy520(n){
   return n && (n.user?.urlname==='43__' || (!n.user?.urlname && publicKey520(String(n.noteUrl||n.note_url||''))===n.key)) &&
@@ -1152,6 +1356,7 @@ class Desk520 {
         this.rows('CREATE INDEX IF NOT EXISTS desk_archive_observed ON desk_archive(at) WHERE prior_at IS NOT NULL');
       });
     }
+    this.initDelivery();
     this.ready=true;
   }
   async admin(req) {
@@ -1173,6 +1378,11 @@ class Desk520 {
         case 'works': {
           need520(Array.isArray(input.works) && input.works.length>0 && input.works.length<=100,'一度に1〜100本の完成稿を指定してください。');
           this.storage.transactionSync(()=>{ for(const w of input.works) this.addWork(w); this.planTimes(now); this.match(now); });
+          break;
+        }
+        case 'delivery_switch': {
+          need520(typeof input.enable==='boolean','運用の指定を確認してください。');
+          this.rows('UPDATE desk_delivery SET enabled=? WHERE id=1',Number(input.enable));
           break;
         }
         case 'find_mags': await this.discoverMagazines(now,true); break;
@@ -1282,7 +1492,7 @@ class Desk520 {
       SUM(likes-previous) net FROM desk_archive WHERE prior_at IS NOT NULL AND at>=? AND at<=?
       AND at-prior_at BETWEEN ? AND ? AND pub<=prior_at-? AND likes IS NOT NULL AND previous IS NOT NULL`,
       now-7*D520,now,6*D520,8*D520,30*D520);
-    return {cfg,backlist,recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
       samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
@@ -1367,6 +1577,7 @@ class Desk520 {
     const changedWeeks=new Set();
     if(!alreadyStored)entries=entries.filter(e=>this.rememberPublic(e.key,e.title,e.pub));
     for(const e of entries) {
+      this.rows("UPDATE desk_job SET phase='confirmed',at=?,message='520の公開記事を確認済み' WHERE kind='publish' AND target=? AND label=? AND phase='sent'",now,e.key,e.title);
       const w=this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
       const midnight=jstStart(jstDay(e.pub));
       const ambiguous=w && !w.draft && this.one('SELECT 1 FROM desk_archive WHERE title=? AND pub>=? AND pub<? AND article<>? LIMIT 1',e.title,midnight,midnight+D520,e.key);
@@ -1506,6 +1717,7 @@ class Desk520 {
       const key=publicKey520(e.link);
       if(!key)continue;
       this.rows('INSERT OR IGNORE INTO desk_ref(article,id,name,url,observed) VALUES(?,?,?,?,?)',key,link.id,name||link.id,link.url,now);
+      this.rows("UPDATE desk_job SET phase='confirmed',at=?,message='誌面のRSSで掲載を確認済み' WHERE kind='mag' AND subject=? AND target=? AND phase IN ('sent','seen')",now,key,link.id);
     }
   }
   magazineHints(data) {
@@ -1921,6 +2133,139 @@ class Desk520 {
       if(!final) break;
     }
   }
+  initDelivery(){
+    if(this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_job'"))return;
+    this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_job(kind TEXT NOT NULL,subject TEXT NOT NULL,target TEXT NOT NULL DEFAULT '',label TEXT NOT NULL,phase TEXT NOT NULL DEFAULT 'wait',next INTEGER NOT NULL,at INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(kind,subject))");
+      this.rows('CREATE INDEX desk_job_at ON desk_job(at DESC)');
+      this.rows('CREATE INDEX desk_job_target ON desk_job(kind,target) WHERE phase IN (\'sent\',\'seen\')');
+      this.rows('CREATE INDEX desk_archive_candidate ON desk_archive(pub,article) WHERE choice IS NOT NULL');
+      this.rows('CREATE INDEX desk_open_work ON desk_work(d,seq) WHERE pub IS NULL');
+      this.rows('CREATE TABLE desk_delivery(id INTEGER PRIMARY KEY,start INTEGER NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,utc_day INTEGER DEFAULT -1,pubs INTEGER DEFAULT 0,mags INTEGER DEFAULT 0,old_first INTEGER DEFAULT 1,due INTEGER DEFAULT 0)');
+      this.rows('INSERT INTO desk_delivery(id,start) VALUES(1,?)',Date.now());
+    });
+  }
+  duePublication(now){
+    // Preserve the registered order, including an earlier work awaiting its own reservation.
+    const w=this.one('SELECT * FROM desk_work WHERE d=? AND pub IS NULL ORDER BY seq LIMIT 1',jstDay(now));
+    if(!w || w.locked || w.title.trim()==='521' || w.d!==jstDay(now))return null;
+    const clock=w.t||w.suggested;
+    if(!clock)return null;
+    const scheduled=Date.parse(w.d+'T'+clock+':00+09:00');
+    if(!Number.isFinite(scheduled) || scheduled>now || now>scheduled+5*M520 || scheduled<this.one('SELECT start FROM desk_delivery WHERE id=1').start)return null;
+    if(this.one('SELECT article FROM desk_archive WHERE title=? LIMIT 1',w.title))return null;
+    return {kind:'publish',subject:String(w.seq),key:w.draft,target:w.draft,title:w.title,body:w.body};
+  }
+  eligiblePlacement(key,now){
+    const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
+    if(!a?.choice || a.title.trim()==='521' || this.one('SELECT 1 FROM desk_ref WHERE article=? LIMIT 1',key))return null;
+    const mag=this.archiveFits(a,this.eligibleMags(now),now).find(m=>m.url===a.choice);
+    const link=noteLink161(mag?.url);
+    if(!link || link.owner==='43__')return null;
+    return {kind:'mag',key,subject:key,target:link.id,url:link.url,title:a.title,name:mag.name,old:a.pub<=now-30*D520};
+  }
+  nextPlacement(now,oldFirst){
+    for(const old of [oldFirst,!oldFirst]){
+      const keys=this.rows('SELECT a.article FROM desk_archive a WHERE a.choice IS NOT NULL AND a.pub '+(old?'<=?':'>?')+
+        " AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='mag' AND j.subject=a.article AND (j.phase<>'wait' OR j.next>?)) AND NOT EXISTS(SELECT 1 FROM desk_ref r WHERE r.article=a.article) ORDER BY a.pub DESC,a.article LIMIT 4",now-30*D520,now);
+      for(const {article} of keys){
+        const job=this.eligiblePlacement(article,now);
+        if(job)return job;
+        this.rows('UPDATE desk_archive SET choice=NULL WHERE article=?',article);
+      }
+    }
+    return null;
+  }
+  canDeliver(job,now){
+    const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
+    if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return false;
+    const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now):this.duePublication(now);
+    return !!fresh && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title;
+  }
+  async deliveryAccount(){
+    const numeric=u=>u?.urlname==='43__' && /^[1-9]\d{0,19}$/.test(String(u.id))?String(u.id):'';
+    let id='';
+    try{id=numeric((await this.publicRead('https://note.com/api/v2/creators/43__','json'))?.data);}catch{}
+    if(!id){
+      const a=this.one('SELECT article FROM desk_archive ORDER BY pub DESC,article LIMIT 1');
+      if(!a)return null;
+      const n=(await this.publicRead('https://note.com/api/v3/notes/'+a.article,'json'))?.data;
+      if(n?.key===a.article)id=numeric(n.user);
+    }
+    if(!id)return null;
+    const rows=await this.env.DB.batch(SLOTS.map(slot=>sql(scoped(this.env,slot),
+      'SELECT c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1 AND c.account=?',slot,id)));
+    const matches=SLOTS.filter((_,i)=>rows[i].results.length===1);
+    if(matches.length!==1)return null;
+    const slot=matches[0],gate=rows[SLOTS.indexOf(slot)].results[0];
+    return {id,slot,until:Math.max(gate.lease,gate.hold_until,gate.kind?gate.next_at:0)};
+  }
+  async dispatch(now){
+    const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
+    const state=this.one('SELECT * FROM desk_delivery WHERE id=1');
+    if(!cfg.enabled || !state.enabled || cfg.blocked>now || state.due>now || typeof this.env?.BROWSER?.acquire!=='function')return;
+    const day=Math.floor(now/D520);
+    if(state.utc_day!==day){this.rows('UPDATE desk_delivery SET utc_day=?,pubs=0,mags=0 WHERE id=1',day);state.pubs=0;state.mags=0;}
+    let job=state.pubs<4?this.duePublication(now):null;
+    if(job && this.one("SELECT 1 FROM desk_job WHERE kind='publish' AND subject=? AND (phase<>'wait' OR next>?)",job.subject,now))job=null;
+    if(!job && state.mags<2)job=this.nextPlacement(now,!!state.old_first);
+    if(!job)return;
+    const label=job.kind==='publish'?job.title:job.title+' → '+job.name;
+    this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,message) VALUES(?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+15*M520);
+    this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
+    let message='通信を確認待ち',slot,lease,env,retry=job.kind==='mag'?D520:15*M520;
+    try{
+      const account=await this.deliveryAccount();
+      if(!account){message='520の登録を確認待ち';return;}
+      if(account.until>Date.now()){retry=account.until-Date.now()+1000;message='520の処理・note指定の待機終了を確認待ち';return;}
+      slot=account.slot;env=scoped(this.env,slot);
+      if(job.kind==='mag'){
+        const entry=this.one('SELECT * FROM desk_import WHERE id=?',job.target);
+        const [info,page,rules]=await Promise.allSettled([
+          this.publicRead('https://note.com/api/v1/magazines/'+job.target,'json'),
+          this.publicRead(job.url,'html'),this.sourceForMagazine(entry)
+        ]);
+        const data=info.value?.data,mag=data?.magazine??data,html=page.value||'';
+        const canonical=noteLink161(meta161(html,'og:url'));
+        const owner=(mag?.key===job.target && (mag.owner?.urlname||noteLink161(mag.magazineUrl||mag.magazine_url||mag.url)?.owner))
+          || (canonical?.id===job.target && canonical.owner);
+        if(!owner || owner==='43__' || !editorialProof162(noteLink161(job.url),info.value,html).ok){
+          message='他の運営者の誌面・520の編集権限を確認待ち';return;
+        }
+        const article=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',job.key);
+        const policy=rules.value?.policy;
+        if(!article || !policy || !this.archiveFits(article,[{p:policy}],Date.now()).length){
+          message='現在の募集条件で作品の掲載可否を確認待ち';return;
+        }
+      }
+      lease=await acquire(env,false);
+      if(!lease){message='別の処理が終了するのを待機中';retry=5*M520;return;}
+      const credential=await loadCookie(env,account.id);
+      const cookie=cleanCookie(credential.NOTE_SESSION);
+      if(!this.canDeliver(job,Date.now()))return;
+      if(job.kind==='mag')this.rows('UPDATE desk_delivery SET mags=mags+1,old_first=? WHERE id=1',+!job.old);
+      else this.rows('UPDATE desk_delivery SET pubs=pubs+1 WHERE id=1');
+      const result=await browserDelivery(this.env.BROWSER,account.id,cookie,job,async key=>{
+        // Recheck holds and the leased account just before persisting the irreversible action.
+        const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',slot).first();
+        const at=Date.now();
+        if(!live || live.account!==account.id || live.token!==lease || live.lease<=at || live.hold_until>at || (live.kind && live.next_at>at) || !this.canDeliver(job,at))return false;
+        return !!this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
+      });
+      message=result.message;
+      if(result.seen)this.rows("UPDATE desk_job SET phase='seen',message=?,at=? WHERE kind=? AND subject=? AND phase='wait'",message,Date.now(),job.kind,job.subject);
+      if(result.hold){
+        const until=Date.now()+result.hold;
+        this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
+        await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,slot).run();
+      }
+    }catch(error){
+      if(readLimit(error)){message='D1の読み取り枠更新後に確認';retry=(day+1)*D520+M520-now;this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+retry);}
+    }finally{
+      this.rows("UPDATE desk_job SET message=?,next=?,at=? WHERE kind=? AND subject=? AND phase='wait'",message,Date.now()+retry,Date.now(),job.kind,job.subject);
+      if(lease)await release(env,lease);
+    }
+  }
   async ensureRecommendation(now) {
     const state=this.one('SELECT * FROM desk_recommend WHERE id=1');
     if(state.done || state.due>now)return;
@@ -1997,6 +2342,7 @@ class Desk520 {
     await Promise.all([this.tickRecords(),this.automaticDirectory(now),this.catalogue(now),this.observeArchive(now),
       this.ensureRecommendation(now),this.frontPageBackup(now)]);
     this.planArchive(Date.now());
+    await this.dispatch(Date.now());
   }
   async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
@@ -2343,6 +2689,12 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+  if(s.delivery){
+    lines.push('【自動公開・共同誌への追加　'+(s.deliveryOn?'ON':'休止中')+'】');
+    if(s.mags)lines.push('無料・共同運営と募集条件を確認済みの候補誌　'+s.mags.length+'誌');
+    if(!s.delivery.length)lines.push('操作記録はまだありません。公開時刻が来た登録稿と、掲載条件・編集権限を確認できた作品が対象です。');
+    for(const item of s.delivery)lines.push((item.kind==='publish'?'公開':'共同誌')+' ／ '+item.label+' ／ '+item.message+' ／ '+tm(item.at));
+  }
   if(s.recommendation)lines.push('記事下の相互おすすめ　'+s.recommendation.message+(s.recommendation.checked?' ／ '+tm(s.recommendation.checked):''));
   if(s.backlist){const b=s.backlist;lines.push('既刊（公開30日以上）のスキ　'+(b.sampled?
     '比較できた'+b.sampled+'本のうち増加'+b.rising+'本 ／ 合計増減 '+b.net:'約1週間隔の計測が2回そろうのを待っています。')+'　直近7日に取得した比較。流入元は未計測。');}
@@ -2353,8 +2705,8 @@ function deskRecordText(s) {
   const displayed=[...s.works.filter(priority),...s.works.filter(w=>!priority(w))];
   for(const w of displayed) {
     lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
-      w.pub?'公開確認 '+tm(w.pub):'RSSでの公開確認待ち',
-      w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
+      w.pub?'公開確認 '+tm(w.pub):!w.locked && (w.t||w.suggested) && Date.now()>Date.parse(w.d+'T'+(w.t||w.suggested)+':00+09:00')+5*M520?'自動公開の時間枠終了・公開結果は確認待ち':'RSSでの公開確認待ち',
+      w.magazine?'条件に合う1誌 '+w.magazine+' ／ 誌面での掲載は確認待ち':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
     for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
     for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
     lines.push('');
@@ -2388,12 +2740,13 @@ function deskPage(records=null,message='',status=200) {
   const catalogue=archive?archive.message+' ／ 確認できた作品 '+archive.total+'本（固定記事を除く）':'';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.3</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.3</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<title>520 作品管理 v16.4</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.4</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p>
-<p>新作はいつもどおりnoteで公開してください。新作と既刊の記録、520の記事下のおすすめ設定の確認は自動です。「記録を開く」で結果が見られます。</p>
+<p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
+<details><summary>自動公開・共同誌への追加を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
@@ -2498,6 +2851,8 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   function external(parent,label,url) {
     const a=document.createElement('a');a.href=url;a.textContent=label;a.target='_blank';a.rel='noopener noreferrer';parent.append(' ',a);
   }
+  if($('autopause'))$('autopause').onclick=wrap(()=>send('delivery_switch',{enable:false}));
+  if($('autoresume'))$('autoresume').onclick=wrap(()=>send('delivery_switch',{enable:true}));
   $('sourcemag').onclick=wrap(()=>send('mag_source',{url:$('oneurl').value.trim()}));
   $('readform').onsubmit=event=>{
     if(event.submitter===$('basic'))return;
