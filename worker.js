@@ -1,4 +1,4 @@
-const VERSION = 'v16.0';
+const VERSION = 'v16.2';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -873,9 +873,9 @@ function xmlValue520(raw) {
   });
 }
 // Only direct RSS item children. CDATA descriptions may themselves contain markup.
-function rss520(xml) {
+function rss520(xml,channelOnly=false) {
   if (!/<rss[\s>]/i.test(xml) || !/<\/rss\s*>/i.test(xml) || /<!DOCTYPE/i.test(xml)) throw Error('RSS');
-  const rows=[], stack=[];
+  const rows=[], stack=[],header={title:'',link:'',description:''};
   let row=null,channel=false;
   const tokens=xml.matchAll(/<!\[CDATA\[([\s\S]*?)\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<\/?([\w:.-]+)(?:\s+(?:"[^"]*"|'[^']*'|[^>'"])*)?\s*\/?>|([^<]+)/g);
   for(const m of tokens) {
@@ -889,12 +889,14 @@ function rss520(xml) {
         if(stack.length===2 && stack[0]==='rss' && name==='channel') channel=true;
         if(stack.join('/')==='rss/channel/item') row={title:'',link:'',pubdate:''};
       }
+    } else if(stack.length===3 && stack[0]==='rss' && stack[1]==='channel' && Object.hasOwn(header,stack[2])) {
+      header[stack[2]]+=m[1]??xmlValue520(m[3]??'');
     } else if(row && stack.length===4 && Object.hasOwn(row,stack[3])) {
       row[stack[3]]+=m[1]??xmlValue520(m[3]??'');
     }
   }
   if(stack.length || !channel) throw Error('RSS incomplete');
-  return rows;
+  return channelOnly==='issue'?{header,entries:rows}:channelOnly?header:rows;
 }
 function publicKey520(link) {
   return /^https:\/\/note\.com\/43__\/n\/(n[a-z0-9]+)\/?$/.exec(link.trim())?.[1] || '';
@@ -933,6 +935,9 @@ class Desk520 {
     if(this.ready) return;
     if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_photo'"))
       this.storage.transactionSync(()=>{ for(const q of schema520) this.rows(q); });
+    if(!this.one("SELECT name FROM sqlite_master WHERE type='index' AND name='desk_import_due'"))
+      this.storage.transactionSync(()=>{for(const q of importSchema161)this.rows(q);});
+    if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_growth'"))this.initGrowth(Date.now());
     this.ready=true;
   }
   async admin(req) {
@@ -942,6 +947,10 @@ class Desk520 {
       const now=Date.now();
       switch(input.action) {
         case 'status': break;
+        case 'archive': {
+          need520(Number.isSafeInteger(input.offset) && input.offset>=0,'ページ番号を確認してください。');
+          return deskJson(this.archivePage(input.offset,now));
+        }
         case 'setup': {
           need520(['未確認','通常（予約なし）','予約ボタンを確認済み'].includes(input.plan),'予約機能の確認結果を選んでください。');
           this.rows('UPDATE desk_cfg SET enabled=1,plan=?,started=COALESCE(started,?),weekly_at=COALESCE(weekly_at,?) WHERE id=1',input.plan,now,monday520(now));
@@ -952,10 +961,22 @@ class Desk520 {
           this.storage.transactionSync(()=>{ for(const w of input.works) this.addWork(w); this.planTimes(now); this.match(now); });
           break;
         }
-        case 'mag': this.saveMag(input); this.match(now); break;
+        case 'find_mags': await this.discoverMagazines(now,true); break;
+        case 'mag_source': {
+          const link=noteLink161(input.url);
+          need520(link,'公開マガジンのURLを確認してください。');
+          this.rememberMagazine(link,'');break;
+        }
         case 'revoke': this.storage.transactionSync(()=>{
-          this.rows('UPDATE desk_mag SET active=0 WHERE url=?',input.url);
-          this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',input.url);
+          const link=noteLink161(input.url);
+          need520(link,'マガジンURLを確認してください。');
+          const saved=this.existingMagazine(link);
+          const id=link.id, storedUrl=saved?.url||link.url;
+          this.rows("INSERT INTO desk_member(id,mode,reason) VALUES(?,'excluded','手動で除外') ON CONFLICT(id) DO UPDATE SET mode='excluded',ticket='',reason=excluded.reason",id);
+          if(id)this.rows("UPDATE desk_import SET allowed=0,token='',due=0,state='許可解除',reason='',summary='' WHERE id=?",id);
+          this.rows('UPDATE desk_mag SET active=0 WHERE url=?',storedUrl);
+          this.rows('UPDATE desk_pick_meta SET rev=rev+1 WHERE id=1');
+          this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',storedUrl);
         }); break;
         case 'photo': await this.savePhoto(input,now); break;
         case 'shared':
@@ -986,43 +1007,47 @@ class Desk520 {
     need520(!this.one("SELECT seq FROM desk_work WHERE (seq<? AND (d>? OR (d=? AND t<>'' AND ?<>'' AND t>?))) OR (seq>? AND (d<? OR (d=? AND t<>'' AND ?<>'' AND t<?))) LIMIT 1",
       w.seq,w.d,w.d,w.t,w.t,w.seq,w.d,w.d,w.t,w.t),'指定した順番と公開日時が逆転しています。');
     this.rows('INSERT INTO desk_work(seq,title,body,d,t,draft,locked,genre,method,chars) VALUES(?,?,?,?,?,?,?,?,?,?)',...keys.map(k=>a[k]),[...w.body.replace(/\r\n|[\r\n]/g,'')].length);
+    this.linkObserved(w);
+    this.rows('UPDATE desk_archive SET pick_due=0 WHERE article=(SELECT article FROM desk_work WHERE seq=?)',w.seq);
     // A new fixed time on this date can constrain a previous tentative time.
     if(w.t) this.rows("UPDATE desk_work SET suggested=NULL WHERE d=? AND pub IS NULL AND locked=0 AND ((seq<? AND suggested>?) OR (seq>? AND suggested<?))",w.d,w.seq,w.t,w.seq,w.t);
   }
   planTimes(now) {
     const works=this.rows("SELECT seq,d,genre FROM desk_work WHERE t='' AND locked=0 AND pub IS NULL AND suggested IS NULL AND d>=? ORDER BY seq",jstDay(now));
+    const deltas=new Map();
     for(const w of works) {
-      const samples=this.rows('SELECT w.pub,s.value FROM desk_work w JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.genre=? AND s.value IS NOT NULL AND w.pub>=? AND w.pub<? ORDER BY w.pub DESC LIMIT 200',w.genre,now-365*D520,now);
-      const bins=new Map(),dow=t=>new Date(t+9*HOUR).getUTCDay(),weekend=t=>[0,6].includes(dow(t));
+      const samples=this.rows('SELECT w.pub,s.value FROM desk_entries w JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.genre=? AND s.value IS NOT NULL AND w.pub>=? AND w.pub<? ORDER BY w.pub DESC LIMIT 200',w.genre,now-365*D520,now);
+      const followers=new Map(), bins=new Map(),dow=t=>new Date(t+9*HOUR).getUTCDay(),weekend=t=>[0,6].includes(dow(t));
       for(const p of samples) {
         if(weekend(p.pub)!==weekend(jstStart(w.d))) continue;
         const h=new Date(p.pub+9*HOUR).getUTCHours();
         if(!bins.has(h)) bins.set(h,[]);
         bins.get(h).push(p.value);
+
       }
       const scores=[...bins].filter(([,v])=>v.length>=3).map(([h,v])=>[h,median520(v)]).sort((a,b)=>b[1]-a[1]||a[0]-b[0]);
       if(scores.length<2 || scores[0][1]===scores[1][1]) continue;
       const winner=bins.get(scores[0][0]);
       if(median520(winner.slice(0,-1))<=scores[1][1]) continue;
+      // A slower follower week can veto a time suggestion only with replicated, comparable observations.
+      const hours=new Set(scores.map(x=>x[0]));
+      for(const p of samples){
+        const h=new Date(p.pub+9*HOUR).getUTCHours();
+        if(!hours.has(h) || weekend(p.pub)!==weekend(jstStart(w.d)))continue;
+        if(!deltas.has(p.pub))deltas.set(p.pub,this.followerWindow(p.pub));
+        const delta=deltas.get(p.pub);
+        if(delta!==null){if(!followers.has(h))followers.set(h,[]);followers.get(h).push(delta);}
+      }
+      const hourlyFollowers=followers.get(scores[0][0])||[];
+      if(hourlyFollowers.length>=3 && scores.slice(1).some(([hour])=>{
+        const other=followers.get(hour)||[];
+        return other.length>=3 && median520(other)>median520(hourlyFollowers);
+      }))continue;
       const t=String(scores[0][0]).padStart(2,'0')+':00';
       if(jstStart(w.d)+scores[0][0]*HOUR<=now) continue;
       if(!this.one("SELECT seq FROM desk_work WHERE d=? AND ((seq<? AND COALESCE(NULLIF(t,''),suggested)>?) OR (seq>? AND COALESCE(NULLIF(t,''),suggested)<?)) LIMIT 1",w.d,w.seq,t,w.seq,t))
         this.rows('UPDATE desk_work SET suggested=? WHERE seq=? AND suggested IS NULL',t,w.seq);
     }
-  }
-  saveMag(m) {
-    need520(m.member===true && m.permit===true && m.literary===true && m.conditions===true,'参加・許可・文芸・募集条件をすべて確認したものだけ登録できます。');
-    need520(typeof m.url==='string' && /^https:\/\/note\.com\/(?:[a-zA-Z0-9_-]+\/)?m\/m[a-z0-9]+$/.test(m.url) && text520(m.name,100),'マガジンのnote URLと名前を確認してください。');
-    let rules;
-    try { rules=new URL(m.rules); } catch {}
-    need520(rules?.origin==='https://note.com' && !rules.username && !rules.password && !rules.search && !rules.hash,'募集条件が載った公開noteのURLを入力してください。');
-    need520(Array.isArray(m.genres) && m.genres.length && m.genres.every(v=>genre520.includes(v)) && Array.isArray(m.methods) && m.methods.length && m.methods.every(v=>method520.includes(v)),'受理されるジャンル・制作方法を選んでください。');
-    need520(Number.isInteger(m.min) && Number.isInteger(m.max) && m.min>=0 && m.min<=m.max && m.max<=1000000,'字数範囲を確認してください。');
-    const policy=JSON.stringify({genres:[...new Set(m.genres)],methods:[...new Set(m.methods)],min:m.min,max:m.max});
-    this.storage.transactionSync(()=>{
-      this.rows('INSERT INTO desk_mag(url,name,rules,policy,active) VALUES(?,?,?,?,1) ON CONFLICT(url) DO UPDATE SET name=excluded.name,rules=excluded.rules,policy=excluded.policy,active=1,last_check=0',m.url,m.name,rules.href,policy);
-      this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',m.url);
-    });
   }
   async savePhoto(p,now) {
     need520(p.allowed===true && text520(p.caption,100) && typeof p.jpeg==='string' && p.jpeg.length<=1500000,'自作・共有可の写真と短い説明を確認してください。');
@@ -1035,25 +1060,39 @@ class Desk520 {
   }
   view() {
     const cfg=this.one('SELECT enabled,plan,rss_ok,rss_msg,tick_at,started,blocked FROM desk_cfg WHERE id=1');
-    return {cfg,probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq'),
+    const eligible=this.eligibleMags(Date.now());
+    const urls=new Set(eligible.map(m=>m.url));
+    return {cfg,archive:this.archivePage(0,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
-      samples:this.rows('SELECT seq,age,due,value,at,state FROM desk_sample ORDER BY seq,age'),
+      samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
       followers:this.rows('SELECT * FROM desk_follower ORDER BY d DESC LIMIT 60'),
       weeks:this.rows('SELECT * FROM desk_week ORDER BY start DESC LIMIT 104'),
-      mags:this.rows('SELECT url,name,rules,active,recent,last_check,rss_state FROM desk_mag WHERE active=1 ORDER BY name'),
-      photos:this.rows('SELECT hash,caption,added,shared FROM desk_photo ORDER BY added DESC')};
+      mags:eligible.map(({url,name,recent})=>({url,name,recent})),
+      photos:this.rows('SELECT hash,caption,added,shared FROM desk_photo ORDER BY added DESC').map(p=>({...p,keywords:photoKeywords162(p.caption)}))};
   }
   publicRead(path,format) {
-    const existing=this.pendingReads.get(path);
+    const pendingKey=format+' '+path;
+    const existing=this.pendingReads.get(pendingKey);
     if(existing) return existing;
-    const task=this.fetchPublic(path,format).finally(()=>this.pendingReads.delete(path));
-    this.pendingReads.set(path,task);
+    const task=this.fetchPublic(path,format).finally(()=>this.pendingReads.delete(pendingKey));
+    this.pendingReads.set(pendingKey,task);
     return task;
   }
   async fetchPublic(path,format) {
     const now=Date.now();
     if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now) throw Error('wait');
-    const res=await fetch(path,{method:'GET',redirect:'error',cache:'no-store',headers:{Accept:format==='json'?'application/json':'application/rss+xml, application/xml, text/xml'},signal:AbortSignal.timeout(7500)});
+    const canRedirect=format==='html' || format==='channel' || format==='issue' || (format==='rss' && !!noteLink161(path.replace(/\/rss$/,'')));
+    let res,target=path;
+    for(let n=0;n<3;n++) {
+      res=await fetch(target,{method:'GET',redirect:canRedirect?'manual':'error',cache:'no-store',headers:{Accept:format==='json'?'application/json':format==='html'?'text/html':'application/rss+xml, application/xml, text/xml'},signal:AbortSignal.timeout(7500)});
+      if(!canRedirect || ![301,302,303,307,308].includes(res.status))break;
+      const location=res.headers.get('Location');
+      const next=location && directoryRedirect161(target,location);
+      await res.body?.cancel();
+      if(!next || next===target || n===2)throw Error('unexpected redirect');
+      target=next;
+    }
     if(!res.ok) {
       const raw=res.headers.get('Retry-After');
       let hold=raw && (/^\d+$/.test(raw)?now+Number(raw)*1000:Date.parse(raw));
@@ -1064,7 +1103,8 @@ class Desk520 {
       await res.body?.cancel(); throw Error('public read unavailable');
     }
     const body=await read520body(res,3000000);
-    return format==='json'?JSON.parse(body):rss520(body);
+    if(format==='html')return body;
+    return format==='json'?JSON.parse(body):rss520(body,format==='issue'?'issue':format==='channel');
   }
   async probe(now) {
     const old=this.one('SELECT * FROM desk_probe WHERE id=1');
@@ -1091,7 +1131,7 @@ class Desk520 {
     this.rows('UPDATE desk_probe SET rss=?,creator=?,article=? WHERE id=1',rss,c,a);
   }
   async feed(now) {
-    if(!this.one('SELECT seq FROM desk_work WHERE pub IS NULL AND d<=? LIMIT 1',jstDay(now))) return;
+    const since=this.one('SELECT started FROM desk_growth WHERE id=1').started;
     const cfg=this.one('SELECT rss_at FROM desk_cfg WHERE id=1');
     if(now<cfg.rss_at) return;
     this.rows('UPDATE desk_cfg SET rss_at=? WHERE id=1',now+16*M520);
@@ -1101,15 +1141,26 @@ class Desk520 {
       const entries=items.map(r=>({title:r.title,key:publicKey520(r.link),pub:Date.parse(r.pubdate)})).filter(i=>i.key && Number.isFinite(i.pub) && i.pub>0 && i.pub<=Date.now() && i.title.trim()!=='521');
       this.storage.transactionSync(()=>{
         const changedWeeks=new Set();
+        for(const e of entries) this.rememberPublic(e.key,e.title,e.pub);
         for(const e of entries) {
           const w=this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
-          if(!w || (!w.draft && entries.some(other=>other.key!==e.key && other.title===e.title && jstDay(other.pub)===jstDay(e.pub)))) continue;
-          if(this.one('SELECT seq FROM desk_work WHERE article=?',e.key)) continue;
-          this.rows('UPDATE desk_work SET article=?,pub=? WHERE seq=? AND pub IS NULL',e.key,e.pub,w.seq);
-          changedWeeks.add(monday520(e.pub));
+          const midnight=jstStart(jstDay(e.pub));
+          const ambiguous=w && !w.draft && this.one('SELECT 1 FROM desk_archive WHERE title=? AND pub>=? AND pub<? AND article<>? LIMIT 1',e.title,midnight,midnight+D520,e.key);
+          const linked=this.one('SELECT seq,pub FROM desk_work WHERE article=?',e.key);
+          if(linked)continue;
+          const planned=w && !ambiguous;
+          let observed=this.one('SELECT id,pub FROM desk_release WHERE article=?',e.key);
+          if(!planned && (observed || e.pub<since))continue;
+          if(planned)this.rows('UPDATE desk_work SET article=?,pub=? WHERE seq=? AND pub IS NULL',e.key,observed?.pub??e.pub,w.seq);
+          else {
+            this.rows('INSERT INTO desk_release(article,title,pub) VALUES(?,?,?)',e.key,e.title,e.pub);
+            observed=this.one('SELECT id,pub FROM desk_release WHERE article=?',e.key);
+          }
+          const seq=observed?-observed.id:w.seq, published=observed?.pub??e.pub;
+          changedWeeks.add(monday520(published));
           for(const n of [1,7]) {
-            const due=e.pub+n*D520;
-            this.rows('INSERT OR IGNORE INTO desk_sample(seq,age,due) VALUES(?,?,?)',w.seq,n,due);
+            const due=published+n*D520;
+            this.rows('INSERT OR IGNORE INTO desk_sample(seq,age,due) VALUES(?,?,?)',seq,n,due);
             if(due<=now && now<due+WINDOW520) newDue=true;
           }
         }
@@ -1141,7 +1192,7 @@ class Desk520 {
   }
   async measure(now) {
     this.rows("UPDATE desk_sample SET state='欠測' WHERE state='待機' AND due<=?",now-WINDOW520);
-    const due=this.rows("SELECT s.seq,s.age,s.due,w.article FROM desk_sample s JOIN desk_work w ON w.seq=s.seq WHERE s.state='待機' AND s.due<=? AND s.last_try<=? ORDER BY s.last_try,s.due,s.seq LIMIT 8",now,now-2*M520);
+    const due=this.rows("SELECT s.seq,s.age,s.due,w.article FROM desk_sample s JOIN desk_entries w ON w.seq=s.seq WHERE s.state='待機' AND s.due<=? AND s.last_try<=? ORDER BY s.last_try,s.due,s.seq LIMIT 8",now,now-2*M520);
     // Independent public reads in small batches; leave capacity for the existing watchdog.
     for(let i=0;i<due.length;i+=4) {
       await Promise.all(due.slice(i,i+4).map(async s=>{
@@ -1149,21 +1200,445 @@ class Desk520 {
         try {
           const data=(await this.publicRead('https://note.com/api/v3/notes/'+s.article,'json'))?.data;
           if(data?.key!==s.article || data?.user?.urlname!=='43__') return;
+          this.magazineHints(data);
           const n=count520(data,['likeCount','like_count']),at=Date.now();
           if(n!==null && at<s.due+WINDOW520) this.rows("UPDATE desk_sample SET value=?,at=?,state='記録済み' WHERE seq=? AND age=? AND state='待機'",n,at,s.seq,s.age);
         } catch {}
       }));
     }
   }
+  initGrowth(now) {
+    this.storage.transactionSync(()=>{
+      for(const q of growthSchema162)this.rows(q);
+      this.rows('INSERT OR IGNORE INTO desk_growth(id,started) VALUES(1,?)',now);
+      this.rows('UPDATE desk_cfg SET enabled=1,started=COALESCE(started,?),weekly_at=COALESCE(weekly_at,?) WHERE id=1',now,monday520(now));
+      this.rows('UPDATE desk_directory SET enabled=1 WHERE id=1');
+      this.rows(`INSERT OR IGNORE INTO desk_member(id,mode,reason) SELECT id,
+        CASE WHEN state='許可解除' THEN 'excluded' WHEN allowed=1 THEN 'legacy' ELSE 'check' END,
+        CASE WHEN state='許可解除' THEN '以前の除外を保持' WHEN allowed=1 THEN '以前の参加確認を保持' ELSE '運営資格を確認待ち' END FROM desk_import`);
+      for(const m of this.rows('SELECT url,active FROM desk_mag')){
+        const link=noteLink161(m.url);
+        if(!link)continue;
+        this.rows('INSERT OR IGNORE INTO desk_member(id,mode,reason) VALUES(?,?,?)',link.id,m.active?'legacy':'excluded',m.active?'以前の登録を保持':'以前の除外を保持');
+        if(!m.active && !this.one('SELECT id FROM desk_import WHERE id=? AND managed=1 AND allowed=1',link.id))
+          this.rows("UPDATE desk_member SET mode='excluded',reason='以前の除外を保持' WHERE id=?",link.id);
+        if(m.active || this.one("SELECT id FROM desk_member WHERE id=? AND mode='legacy'",link.id)){
+          this.rows("INSERT OR IGNORE INTO desk_import(id,url,name) SELECT ?,url,name FROM desk_mag WHERE url=?",link.id,m.url);
+        }
+      }
+      this.rows("UPDATE desk_member SET mode='check',reason='現在の運営資格を確認待ち' WHERE mode='legacy'");
+      this.rows("UPDATE desk_import SET allowed=0,token='',due=0 WHERE id IN (SELECT id FROM desk_member WHERE mode='check')");
+      this.rows("UPDATE desk_work SET magazine=NULL WHERE magazine IS NOT NULL");
+    });
+  }
+  clearAutoMag(row,reason) {
+    this.rows("UPDATE desk_import SET allowed=0,token='',state='自動確認待ち',reason=? WHERE id=?",reason,row.id);
+    const old=this.existingMagazine(noteLink161(row.url));
+    if(old){
+      if(old.active)this.rows('UPDATE desk_pick_meta SET rev=rev+1 WHERE id=1');
+      this.rows('UPDATE desk_mag SET active=0 WHERE url=?',old.url);
+      this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',old.url);
+    }
+  }
+  async checkEditorial(row,now) {
+    const ticket=crypto.randomUUID(),link=noteLink161(row.url);
+    this.rows("UPDATE desk_member SET ticket=?,due=? WHERE id=? AND mode IN ('check','auto')",ticket,now+2*M520,row.id);
+    let evidence;
+    try{
+      const [api,page]=await Promise.allSettled([
+        this.publicRead('https://note.com/api/v1/magazines/'+link.id,'json'),
+        this.publicRead(link.url,'html')
+      ]);
+      evidence=editorialProof162(link,api.value,page.value||'');
+    }catch{evidence={ok:false,reason:'運営資格の読み取りを再試行します'};}
+    this.storage.transactionSync(()=>{
+      if(!this.one("SELECT id FROM desk_member WHERE id=? AND ticket=? AND mode IN ('check','auto')",row.id,ticket))return;
+      this.rows("UPDATE desk_member SET mode=?,due=?,checked=?,reason=?,ticket='' WHERE id=?",evidence.ok?'auto':'check',now+D520,now,evidence.reason,row.id);
+      if(evidence.ok){
+        this.rows("UPDATE desk_import SET allowed=1,state=CASE WHEN allowed=1 THEN state ELSE '募集条件を確認待ち' END,due=CASE WHEN allowed=1 THEN due ELSE 0 END WHERE id=?",row.id);
+      }else this.clearAutoMag(row,evidence.reason);
+    });
+  }
+  async readIssue(url) {
+    const issue=await this.publicRead(url+'/rss','issue');
+    if(noteLink161(issue.header.link)?.id!==noteLink161(url)?.id)throw Error('unverified magazine feed');
+    return issue.entries;
+  }
+  recordReferences(items,link,name,now) {
+    for(const e of items) {
+      if(e.title.trim()==='521')continue;
+      const key=publicKey520(e.link);
+      if(!key)continue;
+      this.rows('INSERT OR IGNORE INTO desk_ref(article,id,name,url,observed) VALUES(?,?,?,?,?)',key,link.id,name||link.id,link.url,now);
+    }
+  }
+  magazineHints(data) {
+    if(!Array.isArray(data.magazines))return;
+    for(const m of data.magazines.slice(0,12)){
+      const link=noteLink161(m?.magazineUrl||m?.magazine_url||m?.url||
+        (/^m[a-z0-9]{1,64}$/.test(m?.key||'')?'https://note.com/m/'+m.key:''));
+      if(link)this.rememberMagazine(link,typeof m?.name==='string'?m.name:'');
+    }
+  }
+  async automaticDirectory(now) {
+    const expired=this.rows("SELECT i.id,i.url,i.managed FROM desk_member m JOIN desk_import i ON i.id=m.id WHERE m.mode='auto' AND m.checked<=?",now-2*D520);
+    if(expired.length)this.storage.transactionSync(()=>{
+      for(const row of expired){
+        this.rows("UPDATE desk_member SET mode='check',ticket='',due=0,reason='運営資格の再確認待ち' WHERE id=?",row.id);
+        this.clearAutoMag(row,'運営資格の再確認待ち');
+      }
+    });
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const cfg=this.one('SELECT enabled,due FROM desk_directory WHERE id=1');
+    if(cfg.enabled && cfg.due<=now){await this.discoverMagazines(now);return;}
+    const inspect=this.one("SELECT i.id,i.url,i.managed,i.name FROM desk_member m JOIN desk_import i ON i.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=? ORDER BY m.due,m.id LIMIT 1",now);
+    const rule=this.one('SELECT id,due FROM desk_import WHERE allowed=1 AND due<=? ORDER BY due,id LIMIT 1',now);
+    // Alternate when both queues are non-empty; large public lists cannot starve rule updates.
+    if(inspect && (!rule || (Math.floor(now/(4*M520))%2)===0)){
+      await this.checkEditorial(inspect,now);
+      // An observed issue is evidence of publication, independently of 520's editorial rights.
+      try{
+        const items=await this.readIssue(inspect.url);
+        this.recordReferences(items,noteLink161(inspect.url),inspect.name,Date.now());
+      }catch{}
+    }else if(rule)await this.reviewMagazine(rule.id,now);
+  }
+  linkObserved(work) {
+    const start=jstStart(work.d);
+    const matches=work.draft?this.rows('SELECT article,pub FROM desk_release WHERE article=? AND title=?',work.draft,work.title):
+      this.rows('SELECT article,pub FROM desk_release WHERE title=? AND pub>=? AND pub<? LIMIT 2',work.title,start,start+D520);
+    if(matches.length!==1 || (!work.draft && this.one('SELECT 1 FROM desk_archive WHERE title=? AND pub>=? AND pub<? AND article<>? LIMIT 1',work.title,start,start+D520,matches[0].article)))return;
+    const e=matches[0];
+    this.rows('UPDATE desk_work SET article=?,pub=? WHERE seq=? AND pub IS NULL AND NOT EXISTS(SELECT 1 FROM desk_work WHERE article=?)',e.article,e.pub,work.seq,e.article);
+  }
+  followerWindow(pub) {
+    const d=jstDay(pub);
+    const first=this.one('SELECT d,at,value FROM desk_follower WHERE d BETWEEN ? AND ? AND at<=? AND value IS NOT NULL ORDER BY d DESC LIMIT 1',jstDay(pub-D520),d,pub);
+    if(!first)return null;
+    const next=this.one('SELECT at,value FROM desk_follower WHERE d=? AND at>? AND value IS NOT NULL',jstDay(jstStart(first.d)+D520),pub);
+    if(!next)return null;
+    const n=this.one('SELECT COUNT(*) n FROM desk_entries WHERE pub>=? AND pub<?',first.at,next.at).n;
+    return n===1?next.value-first.value:null;
+  }
+  strongestMagazine(valid,genre) {
+    if(valid.length<2)return null;
+    const scored=[];
+    for(const m of valid){
+      const id=noteLink161(m.url)?.id;
+      if(!id)continue;
+      const values=this.rows(`SELECT s.value FROM desk_ref r JOIN desk_entries e ON e.article=r.article JOIN desk_sample s ON s.seq=e.seq AND s.age=7
+        WHERE r.id=? AND e.genre=? AND s.value IS NOT NULL AND r.observed<=s.due AND e.pub>=? ORDER BY e.pub DESC LIMIT 40`,id,genre,Date.now()-365*D520).map(r=>r.value);
+      if(values.length<3)return null;
+      const median=median520(values);scored.push({mag:m,median,withoutTop:median520(values.slice(0,-1))});
+    }
+    scored.sort((a,b)=>b.median-a.median);
+    return scored.length>=2 && scored[0].withoutTop>scored[1].median?scored[0].mag:null;
+  }
+  growthView() {
+    const observed=this.rows(`SELECT e.title,e.pub,e.article,a.value d1,b.value d7,a.state state1,b.state state7 FROM desk_entries e
+      LEFT JOIN desk_sample a ON a.seq=e.seq AND a.age=1 LEFT JOIN desk_sample b ON b.seq=e.seq AND b.age=7 ORDER BY e.pub DESC LIMIT 60`);
+    const references=this.rows('SELECT e.title,r.name,r.observed FROM desk_ref r JOIN desk_entries e ON e.article=r.article ORDER BY r.observed DESC LIMIT 40');
+    return {observed,references};
+  }
+
+  existingMagazine(link) {
+    return this.one("SELECT * FROM desk_mag WHERE url=? OR url LIKE ? ORDER BY active DESC LIMIT 1",link.url,'%/m/'+link.id);
+  }
+  rememberPublic(key,title,pub) {
+    if(!/^n[a-z0-9]{1,64}$/.test(key) || !text520(title,300) || title.trim()==='521' || !Number.isFinite(pub) || pub<=0 || pub>Date.now())return false;
+    this.rows('INSERT OR IGNORE INTO desk_archive(article,title,pub) VALUES(?,?,?)',key,title,pub);
+    // Recently published at upgrade: capture a still-open target, never invent a prior count.
+    const now=Date.now();
+    if(pub+7*D520+WINDOW520>now && pub<this.one('SELECT started FROM desk_growth WHERE id=1').started){
+      const linked=this.one('SELECT seq FROM desk_work WHERE article=?',key);
+      if(!linked)this.rows('INSERT OR IGNORE INTO desk_release(article,title,pub) VALUES(?,?,?)',key,title,pub);
+      const release=this.one('SELECT id FROM desk_release WHERE article=?',key);
+      const seq=release?-release.id:linked.seq;
+      for(const age of [1,7]){
+        const due=pub+age*D520;
+        this.rows("INSERT OR IGNORE INTO desk_sample(seq,age,due,state) VALUES(?,?,?,?)",seq,age,due,due+WINDOW520<=now?'欠測':'待機');
+      }
+    }
+    return true;
+  }
+  async catalogue(now) {
+    const cursor=this.one('SELECT * FROM desk_catalog WHERE id=1');
+    if(cursor.due>now || this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const page=cursor.page;
+    try {
+      const data=(await this.publicRead('https://note.com/api/v2/creators/43__/contents?kind=note&page='+page,'json'))?.data;
+      const items=data?.contents;
+      if(!Array.isArray(items) || items.length>100)throw Error('unrecognized page');
+      const knownPage=data.page??data.currentPage;
+      if(knownPage!=null && Number(knownPage)!==page)throw Error('page mismatch');
+      const rawLast=data.isLastPage??data.is_last_page;
+      const keys=items.map(n=>n?.key).filter(k=>typeof k==='string');
+      const signature=keys.join(',');
+      if(page>1 && signature && signature===cursor.signature)throw Error('same page');
+      let partial=false;
+      this.storage.transactionSync(()=>{
+        for(const n of items){
+          if(!n || (n.user?.urlname ? n.user.urlname!=='43__' : publicKey520(String(n.noteUrl||n.note_url||''))!==n.key)){partial=true;continue;}
+          if(n.status && n.status!=='published')continue;
+          if(n.type && n.type!=='TextNote' && n.type!=='text')continue;
+          if(n.name?.trim()==='521')continue;
+          if(!this.rememberPublic(n.key,n.name,Date.parse(n.publishAt||n.publish_at||n.publishedAt)))partial=true;
+          else this.magazineHints(n);
+        }
+        const incomplete=!!(page>1 && cursor.partial) || partial;
+        const more=rawLast===false && keys.length>0;
+        const confirmed=rawLast===true && !incomplete;
+        const message=more?page+'ページまで確認・次のページを自動取得':confirmed?'公開一覧の最終ページまで確認':'一部のみ確認・全件か未確認';
+        this.rows('UPDATE desk_catalog SET page=?,due=?,signature=?,partial=?,message=? WHERE id=1',more?page+1:1,now+(more?4*M520:confirmed?7*D520:D520),more?signature:'',more?Number(incomplete):0,message);
+      });
+      if(partial || typeof rawLast!=='boolean')await this.archiveLinks(now);
+    } catch {
+      this.rows("UPDATE desk_catalog SET due=?,message=? WHERE id=1",now+HOUR,page+'ページ目を取得できません。RSSと公開ページで確認できる作品を引き続き収集します。');
+      await this.archiveLinks(now);
+    }
+  }
+  async archiveLinks(now){
+    const c=this.one('SELECT page,due FROM desk_public_pages WHERE id=1');
+    if(c.due>now)return;
+    const profile='https://note.com/43__',url=profile+(c.page===1?'':'?page='+c.page);
+    try{
+      const html=await this.publicRead(url,'html');
+      if(!/<html[\s>]/i.test(html))return;
+      const links=anchors161(html),next=profile+'?page='+(c.page+1);
+      let more=false;
+      this.storage.transactionSync(()=>{
+        for(const a of links){
+          const l=noteLink161(a.href,url,'note');
+          if(l?.owner==='43__')this.rows('INSERT OR IGNORE INTO desk_archive_hint(article) SELECT ? WHERE NOT EXISTS(SELECT 1 FROM desk_archive WHERE article=?)',l.id,l.id);
+          try{if(new URL(a.href,url).href===next)more=true;}catch{}
+        }
+        this.rows('UPDATE desk_public_pages SET page=?,due=? WHERE id=1',more?c.page+1:1,now+(more?HOUR:D520));
+      });
+    }catch{}
+  }
+  async observeArchive(now) {
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const hint=this.one('SELECT article FROM desk_archive_hint WHERE due<=? ORDER BY due,article LIMIT 1',now);
+    if(hint && (!this.one('SELECT article FROM desk_archive WHERE due<=? LIMIT 1',now) || Math.floor(now/(4*M520))%2===0)){
+      try {
+        const n=(await this.publicRead('https://note.com/api/v3/notes/'+hint.article,'json'))?.data;
+        if(n?.key!==hint.article || n.user?.urlname!=='43__' || (n.status && n.status!=='published'))throw Error('unverified');
+        if(n.name?.trim()!=='521' && !this.rememberPublic(n.key,n.name,Date.parse(n.publishAt||n.publish_at||n.publishedAt)))throw Error('unverified');
+        this.rows('DELETE FROM desk_archive_hint WHERE article=?',hint.article);
+      }catch{this.rows('UPDATE desk_archive_hint SET due=? WHERE article=?',now+D520,hint.article);}
+      return;
+    }
+    const a=this.one('SELECT article FROM desk_archive WHERE due<=? ORDER BY due,article LIMIT 1',now);
+    if(!a)return;
+    try{
+      const n=(await this.publicRead('https://note.com/api/v3/notes/'+a.article,'json'))?.data;
+      if(n?.user?.urlname!=='43__' || n.key!==a.article || n.name?.trim()==='521' || (n.status && n.status!=='published'))throw Error('not verified');
+      const value=count520(n,['likeCount','like_count']);
+      const tags=Array.isArray(n.hashtags)?n.hashtags.map(t=>String(typeof t==='string'?t:t?.hashtag?.name??t?.name??'').replace(/^#/,'')):[];
+      // Use explicit genre metadata if note publishes it; the title alone is ambiguous.
+      if(typeof n.genre==='string')tags.push(n.genre);
+      const labels=genre520.filter(g=>tags.includes(g) && !(g==='小説' && tags.includes('短編小説')));
+      const genre=labels.length===1?labels[0]:null;
+      // Do not estimate restricted text or infer how a writer produced it.
+      const chars=publishedChars162(n);
+      this.magazineHints(n);
+      this.rows(`UPDATE desk_archive SET pick_due=0,due=?,verified=?,genre=?,chars=?,previous=CASE WHEN ? IS NOT NULL THEN likes ELSE previous END,
+        prior_at=CASE WHEN ? IS NOT NULL THEN at ELSE prior_at END,likes=COALESCE(?,likes),at=CASE WHEN ? IS NULL THEN at ELSE ? END,state=? WHERE article=?`,
+        now+(value===null?D520:7*D520),now,genre,chars,value,value,value,value,now,value===null?'スキ数取得待ち':'取得済み',a.article);
+    }catch{
+      this.rows("UPDATE desk_archive SET due=?,state='詳細取得待ち',verified=0 WHERE article=?",now+D520,a.article);
+    }
+  }
+  archiveFits(article,magazines,now) {
+    if(!article.verified || article.verified<now-8*D520)return [];
+    const genre=article.work_genre??article.genre,chars=article.work_chars??article.chars;
+    return magazines.filter(({p})=>
+      (genre?p.genres.includes(genre):genre520.every(g=>p.genres.includes(g))) &&
+      (article.method?p.methods.includes(article.method):method520.every(m=>p.methods.includes(m))) &&
+      (chars!==null?chars>=p.min && chars<=p.max:p.min===0 && p.max===1000000));
+  }
+  planArchive(now) {
+    const rev=this.one('SELECT rev FROM desk_pick_meta WHERE id=1').rev;
+    const keys=this.rows('SELECT article FROM desk_archive WHERE pick_rev<? ORDER BY pick_rev,article LIMIT 8',rev);
+    if(keys.length<8)keys.push(...this.rows('SELECT article FROM desk_archive WHERE pick_due<=? AND pick_rev=? ORDER BY pick_due,article LIMIT ?',now,rev,8-keys.length));
+    if(!keys.length)return;
+    const mags=this.eligibleMags(now);
+    for(const {article} of keys){
+      const row=this.one(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?`,article);
+      const placed=this.one('SELECT 1 FROM desk_ref WHERE article=? LIMIT 1',article);
+      const fits=placed?[]:this.archiveFits(row,mags,now);
+      const genre=row.work_genre||row.genre;
+      const pick=fits.find(m=>m.url===row.choice) || (genre && this.strongestMagazine(fits,genre)) || fits[0];
+      this.rows('UPDATE desk_archive SET pick_due=?,pick_rev=?,choice=? WHERE article=?',now+D520,rev,pick?.url??null,article);
+    }
+  }
+  archivePage(offset,now) {
+    const magazines=this.eligibleMags(now);
+    const rows=this.rows(`SELECT a.*,w.genre work_genre,w.method,w.chars work_chars FROM desk_archive a
+      LEFT JOIN desk_work w ON w.article=a.article ORDER BY a.pub DESC,a.article LIMIT 31 OFFSET ?`,offset);
+    const more=rows.length===31;
+    const items=rows.slice(0,30).map(a=>{
+      const seen=this.rows('SELECT name,observed FROM desk_ref WHERE article=? ORDER BY observed',a.article);
+      const choice=seen.length?null:this.archiveFits(a,magazines,now).find(m=>m.url===a.choice);
+      return {article:a.article,title:a.title,pub:a.pub,state:a.state,likes:a.likes,at:a.at,prior_at:a.prior_at,
+        change:a.likes!==null && a.previous!==null?a.likes-a.previous:null,seen,choice:choice?.name??null,
+        waiting:!magazines.length?'参加・無料・募集条件・最近の活動を確認できた誌がまだありません':
+          !a.verified?'公開作品の詳細を確認待ち':!choice?'確認できた字数・ジャンル・制作条件で該当する誌を確認待ち':''};
+    });
+    return {message:this.one('SELECT message FROM desk_catalog WHERE id=1').message,total:this.one('SELECT COUNT(*) n FROM desk_archive').n,items,offset,more};
+  }
+  eligibleMags(now) {
+    return this.rows(`SELECT m.url,m.name,m.policy,m.recent FROM desk_mag m JOIN desk_import i ON
+      (m.url=i.url OR m.url LIKE '%/m/'||i.id) JOIN desk_member role ON role.id=i.id
+      WHERE m.active=1 AND m.recent>=? AND i.allowed=1 AND i.managed=1 AND i.state='利用中'
+      AND role.mode='auto' AND role.checked>? ORDER BY m.url`,now-60*D520,now-2*D520)
+      .map(m=>({...m,p:JSON.parse(m.policy)})).sort((a,b)=>a.p.genres.length-b.p.genres.length ||
+        (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
+  }
+
+  rememberMagazine(link,label) {
+    const existing=this.existingMagazine(link);
+    if(existing?.active && !this.one('SELECT id FROM desk_import WHERE id=?',link.id)) return false;
+    this.rows('INSERT OR IGNORE INTO desk_member(id) VALUES(?)',link.id);
+    const name=(label||'').trim().slice(0,100);
+    this.rows("INSERT INTO desk_import(id,url,name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=CASE WHEN desk_import.name=desk_import.id AND excluded.name<>excluded.id THEN excluded.name ELSE desk_import.name END",
+      link.id,link.url,name||link.id);
+    return true;
+  }
+  async discoverMagazines(now,manual=false) {
+    const cfg=this.one('SELECT * FROM desk_directory WHERE id=1');
+    if((cfg.token && cfg.due>now) || (!manual && (!cfg.enabled || cfg.due>now))) return;
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now) {
+      this.rows("UPDATE desk_directory SET enabled=1,message='note指定の待機中。終了後に自動で確認します。' WHERE id=1");
+      return;
+    }
+    const token=crypto.randomUUID();
+    this.rows("UPDATE desk_directory SET enabled=1,token=?,due=?,message='公開一覧を確認中' WHERE id=1",token,now+2*M520);
+    const found=new Map();
+    const profile='https://note.com/43__';
+    let readable=0,partial=false;
+    const collect=async url=>{
+      const html=await this.publicRead(url,'html');
+      if(!/<html[\s>]|<!doctype\s+html/i.test(html)) throw Error('not a public page');
+      const canonical=meta161(html,'og:url');
+      if(canonical && !/^https:\/\/note\.com\/43__(?:\/magazines)?\/?(?:\?.*)?$/.test(canonical)) throw Error('unexpected creator page');
+      readable++;
+      const links=anchors161(html);
+      for(const a of links) {
+        const v=noteLink161(a.href,url);
+        if(v && (found.has(v.id) || found.size<100)) {
+          if(!found.get(v.id)?.name) found.set(v.id,{...v,name:a.label.replace(/\n[\s\S]*$/,'').trim()});
+        } else if(v) partial=true;
+      }
+      return links;
+    };
+    // Follow only pagination actually exposed by the public creator page.
+    const results=await Promise.allSettled([collect(profile+'/magazines'),collect(profile)]);
+    let links=results[0].status==='fulfilled'?results[0].value:[];
+    for(let page=2;page<=3;page++) {
+      const next=profile+'/magazines?page='+page;
+      if(!links.some(a=>{try{return new URL(a.href,profile+'/magazines').href===next;}catch{return false;}})) break;
+      try { links=await collect(next); } catch {partial=true;break;}
+      if(page===3 && links.some(a=>a.href.includes('page=4'))) partial=true;
+    }
+    this.storage.transactionSync(()=>{
+      if(this.one('SELECT token FROM desk_directory WHERE id=1').token!==token)return;
+      for(const link of found.values()) this.rememberMagazine(link,link.name);
+      let message=readable?(found.size?'公開ページにあるマガジン '+found.size+'誌。':'読めた公開ページ内にマガジンのリンクが見つかりません。'):'520の公開一覧を取得できませんでした。';
+      if(partial || readable===1) message+=' 公開一覧の一部だけを確認しました。';
+      this.rows("UPDATE desk_directory SET due=?,token='',message=? WHERE id=1",now+(readable && found.size?7*D520:D520),message);
+    });
+  }
+  async sourceForMagazine(row) {
+    let link=noteLink161(row.url),title='',description='',page='',feed=null;
+    // Publisher's channel description and labelled rules may contain the guidelines themselves.
+    const sources=await Promise.allSettled([this.publicRead(link.url+'/rss','channel'),this.publicRead(link.url,'html')]);
+    if(sources[0].status==='fulfilled') feed=sources[0].value;
+    if(sources[1].status==='fulfilled') page=sources[1].value;
+    if(!feed && !page) throw Error('unavailable');
+    const pageCanonical=meta161(page,'og:url');
+    const canon=noteLink161(pageCanonical||feed?.link||'',link.url);
+    if(canon && canon.id!==link.id) throw Error('wrong magazine');
+    if(canon?.owner)link=canon;
+    const feedCanonical=feed?.link && noteLink161(feed.link,link.url);
+    if(feedCanonical && feedCanonical.id!==link.id) throw Error('wrong feed');
+    title=(feed?.title||meta161(page,'og:title')||row.name).replace(/\s*[|｜]\s*note\s*$/i,'').trim().slice(0,100);
+    description=feed?.description||'';
+    const teaser=meta161(page,'og:description')||meta161(page,'description');
+    // Treat links in editorial descriptions as authoritative, never links from random RSS items.
+    let candidates=ruleLinks161(description+'\n'+teaser,link.url);
+    if(!candidates.length && link.owner) {
+      const sameOwner=anchors161(page).filter(a=>ruleLabel161.test(a.label)).map(a=>noteLink161(a.href,link.url,'article'))
+        .filter(v=>v && v.owner===link.owner);
+      candidates=[...new Map(sameOwner.map(v=>[v.id,v])).values()];
+    }
+    const supplied=row.supplied && noteLink161(row.supplied,link.url,'article');
+    const rule=supplied || (candidates.length===1?candidates[0]:null);
+    const hold=(reason,rules='')=>({title,rules,state:'保留',reason,summary:'',policy:null});
+    if(candidates.length>1 && !supplied)return hold('募集記事のリンクを1つに特定できません');
+    if(!rule) {
+      if(!description || /(?:…|\.\.\.)\s*$/.test(words161(description))) {
+        const partial=magazinePolicy161(description||teaser);
+        return {...hold('募集要項の全文を確認できません',link.url),draft:partial.draft,summary:partial.summary};
+      }
+      const parsed=magazinePolicy161(description,teaser);
+      return {title,rules:link.url,...parsed};
+    }
+    let data;
+    try {data=(await this.publicRead('https://note.com/api/v3/notes/'+rule.id,'json'))?.data;}
+    catch {return hold('募集記事を取得できません。自動で再確認します',rule.url);}
+    if(data?.key!==rule.id || data?.user?.urlname!==rule.owner || typeof data.body!=='string' || !data.body.trim()
+        || data.is_limited===true || data.is_paid===true || Number(data.price)>0) return hold('公開の募集記事全文を確認できません',rule.url);
+    // Outside a magazine's explicit description links, require a verifiable connection in the rule article.
+    const linked=ruleLinks161(description+'\n'+teaser,link.url).some(v=>v.id===rule.id);
+    const backlink=anchors161(data.body).some(a=>noteLink161(a.href,rule.url)?.id===link.id)
+      || (words161(data.body).match(/https:\/\/note\.com\/(?:[\w-]+\/)?m\/m[a-z0-9]+/g)||[]).some(u=>noteLink161(u)?.id===link.id);
+    if(!linked && !backlink && !supplied)return hold('募集記事とこの誌の関係を確定できません',rule.url);
+    if(!linked && !backlink && supplied && rule.owner!==link.owner)return hold('別の運営者の記事とこの誌の関係を確認できません',rule.url);
+    const parsed=magazinePolicy161(data.body,description+'\n'+teaser);
+    return {title,rules:rule.url,...parsed};
+  }
+  async reviewMagazine(id,now) {
+    const row=this.one('SELECT * FROM desk_import WHERE id=? AND allowed=1 AND due<=?',id,now);
+    if(!row)return;
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const token=crypto.randomUUID();
+    this.rows("UPDATE desk_import SET token=?,due=? WHERE id=?",token,now+2*M520,id);
+    let result,interval=D520;
+    try { result=await this.sourceForMagazine(row); }
+    catch { result={title:row.name,rules:row.rules,state:'保留',reason:'公開ページを取得できません。自動で再確認します。',summary:'',policy:null};interval=HOUR; }
+    this.storage.transactionSync(()=>{
+      const current=this.one('SELECT * FROM desk_import WHERE id=? AND allowed=1 AND token=?',id,token);
+      if(!current)return;
+      const old=this.existingMagazine(noteLink161(row.url));
+      const dest=old?.url||row.url;
+      this.rows("UPDATE desk_import SET name=?,rules=?,state=?,reason=?,summary=?,draft=?,due=?,token='' WHERE id=?",
+        result.title||row.name,result.rules||'',result.state,result.reason,result.summary,JSON.stringify(result.draft||{}),now+interval,id);
+      if(result.policy) {
+        this.rows('INSERT INTO desk_mag(url,name,rules,policy,active) VALUES(?,?,?,?,1) ON CONFLICT(url) DO UPDATE SET name=excluded.name,rules=excluded.rules,policy=excluded.policy,active=1',
+          dest,result.title||row.name,result.rules,JSON.stringify(result.policy));
+        this.rows('UPDATE desk_import SET managed=1 WHERE id=?',id);
+      } else if(old) {
+        this.rows('UPDATE desk_mag SET active=0 WHERE url=?',dest);
+        this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',dest);
+      }
+      if((!!result.policy)!==!!old?.active || (result.policy && JSON.stringify(result.policy)!==old?.policy))
+        this.rows('UPDATE desk_pick_meta SET rev=rev+1 WHERE id=1');
+      this.match(now);
+    });
+  }
   async magazines(now) {
     const m=this.one('SELECT url FROM desk_mag WHERE active=1 AND last_check<? ORDER BY last_check,url LIMIT 1',now-D520);
     if(!m) return;
     this.rows('UPDATE desk_mag SET last_check=? WHERE url=?',now,m.url);
     try {
-      const entries=await this.publicRead(m.url+'/rss','rss');
+      const entries=await this.readIssue(m.url);
       const dates=entries.filter(e=>/^https:\/\/note\.com\/[\w-]+\/n\/n[a-z0-9]+\/?$/.test(e.link.trim())).map(e=>Date.parse(e.pubdate)).filter(t=>t>0 && t<=now);
       this.storage.transactionSync(()=>{
+        const oldRecent=this.one('SELECT recent FROM desk_mag WHERE url=?',m.url)?.recent||0;
+        if(oldRecent<now-60*D520 && dates.some(t=>t>=now-60*D520))this.rows('UPDATE desk_pick_meta SET rev=rev+1 WHERE id=1');
         this.rows("UPDATE desk_mag SET recent=?,rss_state='取得済み' WHERE url=? AND active=1",dates.length?Math.max(...dates):0,m.url);
+        this.recordReferences(entries,noteLink161(m.url),this.one('SELECT name FROM desk_mag WHERE url=?',m.url)?.name,now);
         for(const item of entries) {
           const key=publicKey520(item.link);
           if(key) this.rows('INSERT OR IGNORE INTO desk_placement(seq,url,name,observed) SELECT w.seq,m.url,m.name,? FROM desk_work w,desk_mag m WHERE w.article=? AND m.url=? AND m.active=1',now,key,m.url);
@@ -1175,13 +1650,13 @@ class Desk520 {
     }
   }
   match(now) {
-    const mags=this.rows('SELECT url,policy,recent FROM desk_mag WHERE active=1 AND recent>=? ORDER BY url',now-60*D520)
-      .map(m=>({...m,p:JSON.parse(m.policy)}));
+    const mags=this.eligibleMags(now);
     for(const w of this.rows('SELECT seq,chars,genre,method,magazine FROM desk_work WHERE (pub IS NULL OR pub>=?)',now-30*D520)) {
       const valid=mags.filter(({p})=>p.genres.includes(w.genre) && p.methods.includes(w.method) && w.chars>=p.min && w.chars<=p.max);
       if(valid.some(m=>m.url===w.magazine)) continue;
       valid.sort((a,b)=>a.p.genres.length-b.p.genres.length || (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
-      const url=valid[0]?.url??null;
+      const picked=this.strongestMagazine(valid,w.genre);
+      const url=picked?.url??valid[0]?.url??null;
       if(url!==w.magazine) this.rows('UPDATE desk_work SET magazine=? WHERE seq=?',url,w.seq);
     }
   }
@@ -1189,7 +1664,7 @@ class Desk520 {
     const end=start+7*D520;
     const a=this.one('SELECT value FROM desk_follower WHERE d=?',jstDay(start))?.value;
     const b=this.one('SELECT value FROM desk_follower WHERE d=?',jstDay(end))?.value;
-    const row=this.one('SELECT COUNT(w.seq) AS eligible,COUNT(s.value) AS measured,AVG(s.value) AS avg7 FROM desk_work w LEFT JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.pub>=? AND w.pub<?',start,end);
+    const row=this.one('SELECT COUNT(w.seq) AS eligible,COUNT(s.value) AS measured,AVG(s.value) AS avg7 FROM desk_entries w LEFT JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.pub>=? AND w.pub<?',start,end);
     const final=Number(now>=end+7*D520+WINDOW520);
     this.rows('INSERT OR REPLACE INTO desk_week(start,delta,avg7,eligible,measured,final) VALUES(?,?,?,?,?,?)',jstDay(start),Number.isInteger(a)&&Number.isInteger(b)?b-a:null,row.avg7,row.eligible,row.measured,final);
     return final;
@@ -1208,6 +1683,11 @@ class Desk520 {
   }
   async tick() {
     this.init();
+    const now=Date.now();
+    await Promise.all([this.tickRecords(),this.automaticDirectory(now),this.catalogue(now),this.observeArchive(now)]);
+    this.planArchive(Date.now());
+  }
+  async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
     if(!cfg.enabled || now-cfg.tick_at<2*M520) return;
     this.rows('UPDATE desk_cfg SET tick_at=? WHERE id=1',now);
@@ -1269,15 +1749,290 @@ function cleanJpeg520(bytes) {
   }
   bad();
 }
+// Public note links are used as identifiers. Never forward cookies, fragments or share parameters.
+function noteLink161(input,base='https://note.com',kind='mag') {
+  if(typeof input!=='string'||!input.trim()) return null;
+  try {
+    const u=new URL(xmlValue520(input.trim()),base);
+    if(u.origin!=='https://note.com'||u.username||u.password) return null;
+    const re=kind==='mag'?/^\/(?:(\w[\w-]{0,79})\/)?m\/(m[a-z0-9]{1,64})\/?$/:/^\/(\w[\w-]{0,79})\/n\/(n[a-z0-9]{1,64})\/?$/;
+    const m=re.exec(u.pathname);
+    if(m) return {url:u.origin+u.pathname.replace(/\/$/,''),owner:m[1]||'',id:m[2]};
+  } catch {}
+  return null;
+}
+function cleanHtml161(s) {
+  return s.replace(/<!--[\s\S]*?-->|<(script|style|template|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi,'');
+}
+function words161(s) {
+  return xmlValue520(cleanHtml161(s).replace(/<(?:br\b[^>]*|\/(?:li|p|div|h[1-6]|tr|section))>/gi,'\n')
+    .replace(/<[^>]+>/g,'')).replace(/&nbsp;|\u00a0/gi,' ').trim();
+}
+function attr161(tag,name) {
+  const m=new RegExp('(?:^|\\s)'+name+'\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))','i').exec(tag);
+  return m?xmlValue520(m[1]??m[2]??m[3]):'';
+}
+function anchors161(html) {
+  return Array.from(cleanHtml161(html).matchAll(/<a\b((?:[^>"']|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/a\s*>/gi),m=>({href:attr161(m[1],'href'),label:(attr161(m[1],'aria-label')||words161(m[2])).trim().slice(0,180)}));
+}
+function meta161(html,field) {
+  for(const [tag] of cleanHtml161(html).matchAll(/<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi))
+    if((attr161(tag,'property')||attr161(tag,'name')).toLowerCase()===field) return attr161(tag,'content');
+  return '';
+}
+const ruleLabel161=/(?:募集(?:要項|条件|規定|ルール|記事)|投稿(?:要項|条件|規定|ルール|ガイド)|参加(?:要項|方法|条件|規約|ルール)|掲載(?:条件|基準|規定)|運営(?:方針|ルール)|ガイドライン|応募要項)/;
+function ruleLinks161(description,base) {
+  const found=new Map();
+  for(const a of anchors161(description)){
+    const v=noteLink161(a.href,base,'article');
+    if(v && ruleLabel161.test(a.label))found.set(v.id,v);
+  }
+  const lines=words161(description).split(/[。\n]+/);
+  for(let i=0;i<lines.length;i++) {
+    if(!ruleLabel161.test(lines[i]) && !(i>0 && ruleLabel161.test(lines[i-1]) && /^\s*https:/.test(lines[i])))continue;
+    for(const m of lines[i].matchAll(/https:\/\/note\.com\/[\w-]+\/n\/n[a-z0-9]+/g)){
+      const v=noteLink161(m[0],base,'article');if(v)found.set(v.id,v);
+    }
+  }
+  return [...found.values()];
+}
+function clauses161(input) {
+  return words161(input).normalize('NFKC').replace(/(\d),(?=\d{3}(?:\D|$))/g,'$1')
+    .split(/[。；;\n]+/).map(s=>s.trim().replace(/^[\s・●○■※◆▶▷*-]+/,'').replace(/\s+/g,'')).filter(Boolean);
+}
+// Parse explicit permitted sets only. An unknown restriction keeps the item out of matching.
+function magazinePolicy161(source,context='') {
+  const clauses=clauses161(source);
+  const groups={genres:new Set(),methods:new Set()};
+  const denied={genres:new Set(),methods:new Set()};
+  const only={},bounds=[],seen={previous:false,tags:false,intro:false};
+  const missing=[],unknown=[],excluded=[];
+  const methods={本人執筆:'本人執筆',人間執筆:'本人執筆',人力執筆:'本人執筆',AI補助:'AI補助',AI支援:'AI補助',AI生成:'AI生成',生成AIによる執筆:'AI生成'};
+  const genres=Object.fromEntries(genre520.map(v=>[v,v]));
+  function tokens(line,kind) {
+    const dict=kind==='genres'?genres:methods;
+    const split=line.split(/[・、,／/と]+/);
+    if(!split.length || split.some(v=>!Object.hasOwn(dict,v))) return [];
+    return split.map(v=>dict[v]);
+  }
+  const optional=/^((?:ハッシュタグ|タグ|自己紹介(?:記事)?)(?:(?:・|、|と|および|や|も)(?:ハッシュタグ|タグ|自己紹介(?:記事)?))?)(?:の(?:記入|追加|提出|設定|指定|投稿)|付け)?(?:も|は|が|:)?(?:不要|任意|自由|なし|不要です|任意です|必要ありません|ありません|必須ではありません)$/;
+  function prohibition(s) {
+    if(optional.test(s))return '';
+    if(/(?:ハッシュタグ|タグ|自己紹介)/.test(s) && /必須|必ず|義務|をつけてください|を付けてください|をお願いします|が必要|してください/.test(s)) return 'タグか自己紹介を求める記載';
+    if(/未発表(?:の作品)?(?:に限|のみ|限定)|(?:既発表|再掲|過去記事)(?:作品)?(?:は|が)?(?:不可|禁止|NG|お断り)/i.test(s)) return '既発表作品の制限';
+    return '';
+  }
+  for(const s of [...clauses,...clauses161(context)]) {
+    const why=prohibition(s); if(why) excluded.push(why);
+  }
+  for(const line of clauses161(context)){
+    if(prohibition(line))continue;
+    if(/(必須|に限[るり]|のみ|投稿数|[0-9]+(?:字|文字)|1日.{0,8}(?:本|回)|曜日指定|限定|対象外|要審査|事前承認|休止中|受付停止|不可|禁止|NG|をお願いします|にしてください|をしてください)/i.test(line) && !clauses.includes(line))unknown.push(line);
+  }
+  for(let line of clauses) {
+    if(/^(?:こんにちは|はじめまして|いつも(?:当マガジンを)?(?:お読み|ご覧)いただきありがとうございます|ご参加ありがとうございます|よろしくお願いいたします|以上です|このマガジンの(?:投稿|募集|掲載)条件(?:をご案内します|は以下のとおりです)|https:\/\/note\.com\/(?:[\w-]+\/)?m\/m[a-z0-9]+)[!！]?$/.test(line))continue;
+    line=line.replace(/^投稿(?:時|の際)(?:には|に|は)?[、,]?/,'')
+      .replace(/^(?:本文|原稿|作品)の(?:長さ|字数|文字数)(?:は|:)/,'字数:')
+      .replace(/^(?:過去に公開した|すでに公開した|すでに発表した)(?:作品|記事)(?:も|は)/,'既発表作品も')
+      .replace(/(?:を募集しています|を募集します|が対象です|も受け付けています)$/,'を募集します')
+      .replace(/^(既発表作品も)(?:掲載できます|投稿できます|受け付けています|受け付けます)$/,'$1可');
+    if(/^(?:【?(?:募集要項|投稿ルール|募集条件|掲載条件|応募要項|参加条件|マガジンについて|投稿規定)】?[:：]?|(?:その他の)?条件(?:は)?(?:なし|ありません)|文芸(?:系)?(?:の)?共同運営マガジン(?:です)?|以下の(?:通り|とおり)です)$/.test(line)) continue;
+    line=line.replace(/^[【\[]([^】\]]+)[】\]]/,'$1:');
+    let s=line.replace(/^(?:(?:作品の)?(?:文字数|字数|長さ))[:は]/,'');
+    let m;
+    if(/^(?:文字数|字数)?(?:の)?(?:制限|指定)(?:は)?(?:なし|無し|ありません)$|^(?:不問|自由|上限なし|制限なし)$/.test(s) && (s!==line || /字数|文字数/.test(line))) {bounds.push([0,1000000]);continue;}
+    if(/^(?:文字数|字数)(?:は不問です|は問いません|を問いません|制限はありません)$/.test(line)) {bounds.push([0,1000000]);continue;}
+    if((m=/^(\d+)(?:文字|字)?(?:[~〜～−–-]|以上)(\d+)(?:文字|字)(?:以内|以下|まで)?$/.exec(s))) {bounds.push([+m[1],+m[2]]);continue;}
+    if((m=/^(\d+)(?:文字|字)(以内|以下|まで|以上)$/.exec(s))) {bounds.push(m[2]==='以上'?[+m[1],1000000]:[0,+m[1]]);continue;}
+    if(/^(?:既発表(?:の)?(?:作品|記事)?|公開済み(?:の)?(?:作品|記事)?|過去(?:作品|記事)|再掲)(?:の掲載|の投稿)?(?:も|は|で)?(?:可|OK|歓迎|可能|可です|可能です)$/.test(line)) {seen.previous=true;continue;}
+    if((m=optional.exec(line))) {
+      if(/タグ/.test(m[1]))seen.tags=true;
+      if(/自己紹介/.test(m[1]))seen.intro=true;
+      continue;
+    }
+    let recognized=false;
+    for(const kind of ['genres','methods']) {
+      const heading=kind==='genres'?/^(?:対象ジャンル|募集ジャンル|応募ジャンル|ジャンル|募集作品|対象作品)[:は]/:/^(?:制作方法|執筆方法|制作手法|対象の制作方法)[:は]/;
+      const raw=line.replace(heading,'');
+      const suffix=/(?:の作品)?(?:の投稿)?(?:を|は|も)?(のみ(?:可)?|可|OK|歓迎|を募集します|募集します|不可|禁止|NG)$/i.exec(raw);
+      const terms=tokens(suffix?raw.slice(0,suffix.index):raw,kind);
+      if(!terms.length || (!suffix && line===raw))continue;
+      const target=suffix && /不可|禁止|NG/i.test(suffix[1])?denied[kind]:groups[kind];
+      if(suffix?.[1].startsWith('のみ')) {
+        const allowed=new Set(terms);
+        if(kind==='genres' && allowed.has('小説')) allowed.add('短編小説');
+        (only[kind] ||= []).push(allowed);
+      }
+      for(const term of terms){target.add(term);if(kind==='genres' && term==='小説')target.add('短編小説');}
+      recognized=true;break;
+    }
+    if(!recognized && !prohibition(line)) unknown.push(line);
+  }
+  const lowers=[...new Set(bounds.map(b=>b[0]).filter(n=>n>0))];
+  const uppers=[...new Set(bounds.map(b=>b[1]).filter(n=>n<1000000))];
+  const range=bounds.length && lowers.length<=1 && uppers.length<=1?[lowers[0]??0,uppers[0]??1000000]:null;
+  if(!range || range[1]<range[0] || range[1]>1000000) missing.push('字数');
+  const result={};
+  for(const [kind,label] of [['genres','ジャンル'],['methods','制作方法']]) {
+    const overlap=[...groups[kind]].some(v=>denied[kind].has(v));
+    result[kind]=[...groups[kind]].filter(v=>!denied[kind].has(v));
+    if(!result[kind].length || overlap || only[kind]?.some(set=>result[kind].some(v=>!set.has(v))))missing.push(label);
+  }
+  if(!seen.previous)missing.push('既発表可否');
+  if(!seen.tags)missing.push('タグの要否');
+  if(!seen.intro)missing.push('自己紹介の要否');
+  if(!/(?:文学|文芸|小説|エッセイ|詩|散文)/.test(source+context))missing.push('文芸分野');
+  if(unknown.length)missing.push('読み切れない文・追加条件');
+  const summary=[range?'字数 '+(range[0]||0)+'〜'+(range[1]===1000000?'上限なし':range[1]):'',result.genres.join('・'),result.methods.join('・')].filter(Boolean).join(' ／ ');
+  const state=excluded.length?'対象外':missing.length?'保留':'利用中';
+  const reason=excluded.length?[...new Set(excluded)].join('・'):missing.join('・');
+  return {state,reason,summary,draft:{min:range?.[0]??null,max:range?.[1]??null,...result},policy:state==='利用中'?{min:range[0],max:range[1],...result}:null};
+}
+const importSchema161=[
+  "CREATE TABLE IF NOT EXISTS desk_directory(id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, due INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '未検索')",
+  "INSERT OR IGNORE INTO desk_directory(id) VALUES(1)",
+  "CREATE TABLE IF NOT EXISTS desk_import(id TEXT PRIMARY KEY, url TEXT NOT NULL, name TEXT NOT NULL, allowed INTEGER NOT NULL DEFAULT 0, managed INTEGER NOT NULL DEFAULT 0, supplied TEXT NOT NULL DEFAULT '', rules TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '許可前', reason TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', draft TEXT NOT NULL DEFAULT '{}', due INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL DEFAULT '')",
+  "CREATE INDEX IF NOT EXISTS desk_import_due ON desk_import(allowed,due)"
+];
+function directoryRedirect161(from,to) {
+  let a,b;
+  try {a=new URL(from);b=new URL(to,a);} catch {return null;}
+  if(b.origin!=='https://note.com' || b.username || b.password) return null;
+  const isFeed=a.pathname.endsWith('/rss');
+  const mag=noteLink161(a.origin+a.pathname.replace(/\/rss$/,''));
+  if(mag) {
+    const dest=noteLink161(b.origin+b.pathname.replace(/\/rss$/,''));
+    if(dest?.id!==mag.id || isFeed!==b.pathname.endsWith('/rss'))return null;
+    return dest.url+(isFeed?'/rss':'');
+  }
+  if(!/^\/43__(?:\/magazines)?\/?$/.test(a.pathname) || !/^\/43__(?:\/magazines)?\/?$/.test(b.pathname))return null;
+  if(b.search && !/^\?page=\d+$/.test(b.search))return null;
+  return b.origin+b.pathname+b.search;
+}
+const growthSchema162=[
+  "CREATE TABLE IF NOT EXISTS desk_catalog(id INTEGER PRIMARY KEY,page INTEGER DEFAULT 1,due INTEGER DEFAULT 0,signature TEXT DEFAULT '',partial INTEGER DEFAULT 0,message TEXT DEFAULT '公開一覧を確認待ち')",
+  'INSERT OR IGNORE INTO desk_catalog(id) VALUES(1)',
+  "CREATE TABLE IF NOT EXISTS desk_archive(article TEXT PRIMARY KEY,title TEXT NOT NULL,pub INTEGER NOT NULL,genre TEXT,chars INTEGER,likes INTEGER,at INTEGER,previous INTEGER,prior_at INTEGER,due INTEGER DEFAULT 0,verified INTEGER DEFAULT 0,pick_due INTEGER DEFAULT 0,pick_rev INTEGER DEFAULT 0,choice TEXT,state TEXT DEFAULT '詳細取得待ち')",
+  'CREATE TABLE IF NOT EXISTS desk_archive_hint(article TEXT PRIMARY KEY,due INTEGER DEFAULT 0)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_hint_due ON desk_archive_hint(due,article)',
+  'CREATE TABLE IF NOT EXISTS desk_public_pages(id INTEGER PRIMARY KEY,page INTEGER DEFAULT 1,due INTEGER DEFAULT 0)',
+  'INSERT OR IGNORE INTO desk_public_pages(id) VALUES(1)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_title ON desk_archive(title,pub)',
+  'CREATE TABLE IF NOT EXISTS desk_pick_meta(id INTEGER PRIMARY KEY,rev INTEGER NOT NULL DEFAULT 1)',
+  'INSERT OR IGNORE INTO desk_pick_meta(id) VALUES(1)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_pick_due ON desk_archive(pick_due,article)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_pick_rev ON desk_archive(pick_rev,article)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_due ON desk_archive(due,article)',
+  'CREATE INDEX IF NOT EXISTS desk_archive_pub ON desk_archive(pub DESC,article)',
+  'CREATE INDEX IF NOT EXISTS desk_measured_pub ON desk_sample(age,seq) WHERE value IS NOT NULL',
+  'CREATE TABLE IF NOT EXISTS desk_release(id INTEGER PRIMARY KEY,article TEXT NOT NULL UNIQUE,title TEXT NOT NULL,pub INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS desk_release_pub ON desk_release(pub)',
+  'CREATE INDEX IF NOT EXISTS desk_release_title ON desk_release(title,pub)',
+  "CREATE TABLE IF NOT EXISTS desk_member(id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'check', due INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0, ticket TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '運営資格を確認待ち')",
+  'CREATE INDEX IF NOT EXISTS desk_member_due ON desk_member(mode,due)',
+  'CREATE TABLE IF NOT EXISTS desk_ref(article TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,observed INTEGER NOT NULL,PRIMARY KEY(article,id))',
+  'CREATE INDEX IF NOT EXISTS desk_ref_by_mag ON desk_ref(id,observed)',
+  'CREATE TABLE IF NOT EXISTS desk_growth(id INTEGER PRIMARY KEY,started INTEGER NOT NULL)',
+  `CREATE VIEW IF NOT EXISTS desk_entries AS
+    SELECT COALESCE(-r.id,w.seq) seq,w.seq workseq,w.article,w.title,w.pub,w.genre FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article WHERE w.pub IS NOT NULL
+    UNION ALL SELECT -r.id,NULL,r.article,r.title,r.pub,a.genre FROM desk_release r LEFT JOIN desk_archive a ON a.article=r.article WHERE NOT EXISTS(SELECT 1 FROM desk_work w WHERE w.article=r.article)`
+];
+function magHeader162(html,link) {
+  const canonical=noteLink161(meta161(html,'og:url'));
+  const output={member:false,joint:false,free:false,paid:false};
+  if(canonical?.id!==link.id)return output;
+  const stack=[],ids=new Set();
+  // Only native magazine-header/member containers. Descriptions and article lists may quote any account.
+  const clean=cleanHtml161(html);
+  for(const m of clean.matchAll(/<(\/?)([\w:-]+)\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>|([^<]+)/g)){
+    if(m[4]!==undefined){
+      const node=stack.at(-1);
+      if(!node?.head || node.ignore)continue;
+      const t=xmlValue520(m[4]).trim();
+      if(node.price){
+        if(/^無料(?:マガジン)?$/.test(t))output.free=true;
+        if(/有料|定期購読|[¥￥]|\d[\d,]*円/.test(t))output.paid=true;
+      }
+      if(node.group && /^(?:運営しているクリエイター|共同運営メンバー|運営メンバー)$/.test(t))node.group.label=true;
+      continue;
+    }
+    const tag=m[2].toLowerCase();
+    if(m[1]){
+      let i=stack.length-1;while(i>=0 && stack[i].tag!==tag)i--;
+      if(i>=0)stack.length=i;
+      continue;
+    }
+    const parent=stack.at(-1),cl=attr161(m[3],'class').toLowerCase();
+    const head=parent?.head || /magazine[-_]?header|magazine[-_]?(?:editor|operator|member|creator)(?:s|list)/.test(cl);
+    const ignore=parent?.ignore || tag==='article'||/description|articlelist|noteitem|bio(?:graphy)?/.test(cl);
+    let group=parent?.group;
+    if(!group && head && !ignore && /(?:editor|operator|manageuser|member|creator)(?:s|list|area|block)|magazineheader__(?:creator|member)/.test(cl))group={label:false,urls:new Set()};
+    if(head && !ignore && group && tag==='a'){
+      let path;
+      try{const u=new URL(attr161(m[3],'href'),link.url);if(u.origin==='https://note.com')path=u.pathname;}catch{}
+      if(path && /^\/[\w-]+\/?$/.test(path))group.urls.add(path.replaceAll('/',''));
+    }
+    if(group)ids.add(group);
+    if(!/^(?:meta|link|img|input|br|hr|path|source|area|wbr|embed|param|track|col|base)$/.test(tag) && !m[3].endsWith('/'))
+      stack.push({tag,head,ignore,group,price:head && (parent?.price || /price|pricelabel/.test(cl))});
+  }
+  for(const group of ids){
+    if(group.label && group.urls.has('43__')){output.member=true;if(group.urls.size>=2)output.joint=true;}
+  }
+  return output;
+}
+function editorialProof162(link,payload,html){
+  const h=magHeader162(html,link),data=payload?.data?.magazine??payload?.data;
+  const d=data?.key===link.id?data:null;
+  const canonical=d && (d.magazineUrl||d.magazine_url||d.url);
+  if(canonical && noteLink161(canonical)?.id!==link.id)return {ok:false,reason:'誌面IDを確認できません'};
+  const users=new Set();
+  const add=u=>{const id=u?.urlname??u?.user?.urlname;if(typeof id==='string')users.add(id);};
+  if(d){
+    for(const field of ['editors','operators','manageUsers','manage_users','editorialMembers']){
+      if(Array.isArray(d[field]))d[field].forEach(add);
+    }
+    if(Array.isArray(d.members))d.members.filter(x=>['owner','editor','operator','admin'].includes(x?.role)).forEach(add);
+    if(d.owner)add(d.owner);
+  }
+  const joint=h.joint || users.size>=2 || d?.isJoint===true || d?.is_joint===true;
+  const owner=d?.owner?.urlname==='43__';
+  const member=h.member || owner || users.has('43__');
+  if(!member || !joint)return {ok:false,reason:'共同運営者としての43__を公開情報で確認できません'};
+  const paid=h.paid || d?.isPaid===true || d?.is_paid===true || Number(d?.price)>0 ||
+    /^(paid|subscription|membership)$/i.test(d?.magazineType??d?.type??'');
+  const free=h.free || d?.price===0 || d?.isFree===true || d?.magazineType==='free';
+  if(paid||!free)return {ok:false,reason:paid?'有料の誌面は対象外':'無料の誌面か確認できません'};
+  return {ok:true,reason:'無料・共同運営者43__を公開情報で確認'};
+}
+function publishedChars162(note) {
+  const declared=count520(note,['characterCount','character_count']);
+  if(declared!==null)return declared;
+  if(note.price!==0 || typeof note.body!=='string' || !note.body || note.isLimited===true ||
+     note.isPaid===true || note.hasPaywall===true || note.isPreview===true || note.hasAvailableCirclePlans===true)return null;
+  // Only simple free text; teasers, embeds and complex markup do not establish a count.
+  if(!/<p[\s>]/i.test(note.body) || /<(?!\/?(?:p|br|strong|em|b|i|a|span|h[1-6])(?:\s|\/?\s*>))/.test(note.body))return null;
+  const plain=note.body.replace(/<[^>]*>/g,'').replace(/&nbsp;/gi,' ').replace(/[\r\n]/g,'');
+  if(/&(?!amp;|lt;|gt;|quot;|apos;|#(?:x[0-9a-f]+|[0-9]+);)[a-z0-9]+;/i.test(plain))return null;
+  return [...xmlValue520(plain)].length;
+}
+function photoKeywords162(caption) {
+  const terms=[],parts=String(caption).split('。').filter(Boolean);
+  if(parts.length>=2 && parts[0].length<=40)terms.push(parts[0]);
+  for(const [pattern,word] of [[/青み/,'青'],[/赤み/,'赤'],[/緑み/,'緑'],[/明るめ/,'明るい'],[/暗め/,'暗め'],[/横長/,'横長'],[/縦長/,'縦長'],[/正方形/,'正方形']]){
+    if(pattern.test(parts.at(-1)||''))terms.push(word);
+  }
+  return [...new Set(terms)].join('、');
+}
+
 function deskPage() {
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<title>520 作品管理 v16.2</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
 <a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <label>管理用の鍵<input id="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></label><button id="load">記録を開く</button><p id="msg" role="status"></p>
-<details open><summary>初回設定</summary><p>520でnoteにログインし、下書きの「公開設定」→「予約投稿」→「日時を設定」が使えるか確認してください。予約済みの作品は開き直す必要はありません。</p>
-<label>520で確認した予約機能<select id="plan"><option>未確認</option><option>通常（予約なし）</option><option>予約ボタンを確認済み</option></select></label><button id="setup">自動記録を開始・設定を保存</button></details>
-<details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。新規予約はnote側の「公開設定」で行います。合う1誌が表示された場合は、その画面の「記事の追加」で同時掲載を指定できます。予約済みにチェックした作品の時刻は補いません。</p>
+<p>新作の公開確認・計測・マガジンの確認は、更新後の定期起動から自動で始まります。管理用の鍵は記録を見るときに入力します。</p>
+<details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
 <label>公開日<input id="d" type="date"></label><label>指定済みの時刻（任意）<input id="t" type="time"></label>
@@ -1287,19 +2042,16 @@ function deskPage() {
 <label>制作方法<select id="method"><option value="">選択してください</option>${method520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
 <button id="add">完成稿を登録</button>
 <details><summary>複数の完成稿を1回で登録（JSON）</summary><p>配列の各行に seq（順番）, title, body, d（YYYY-MM-DD）, t（HH:MM または空文字）, locked（予約済み true / false）, draft（記事IDまたは空文字）, genre, method を入れます。どれか1本に誤りがあれば一括登録全体を戻します。</p><label>JSONファイル<input id="batch" type="file" accept=".json,application/json"></label><button id="import">一括登録</button></details></details>
-<details><summary>参加済みマガジンを許可</summary><p>投稿済みの作品を受け入れる文芸系の共同運営マガジンだけが対象です。字数は改行を除く本文の文字数です。異なる数え方など、ここに表せない必須条件がある場合は登録を見送ってください。</p>
-<label>マガジン名<input id="magname"></label><label>マガジンのURL<input id="magurl" type="url"></label><label>募集条件が載ったnoteのURL<input id="rules" type="url"></label>
-<label>最少字数<input type="number" id="min" value="0"></label><label>最大字数（上限なしなら1000000）<input type="number" id="max" value="1000000"></label>
-<fieldset><legend>受け入れるジャンル</legend>${genre520.map(v=>'<label><input type="checkbox" name="genres" value="'+v+'">'+v+'</label>').join('')}</fieldset>
-<fieldset><legend>受け入れる制作方法</legend>${method520.map(v=>'<label><input type="checkbox" name="methods" value="'+v+'">'+v+'</label>').join('')}</fieldset>
-<label><input type="checkbox" id="member"> 520で参加済み・記事を追加する権限あり</label>
-<label><input type="checkbox" id="literary"> 文芸作品を扱う共同運営マガジン</label>
-<label><input type="checkbox" id="conditions"> 規約を確認。既発表可・作品タグや自己紹介は不要。その他の必須条件も満たす</label>
-<label><input type="checkbox" id="permit"> この掲載先を許可する</label><button id="mag">条件を登録・更新</button><div id="mags"></div></details>
+<details id="magsection"><summary>マガジンの自動確認</summary>
+<p>520の公開ページなどから誌面を探し、無料・共同運営者・募集条件を確認します。以前の除外は保持します。</p>
+<p id="directory"></p><div id="imports"></div><div id="mags"></div>
+<details><summary>公開一覧にない誌のURLを補う（任意）</summary><label>マガジンURL<input id="oneurl" type="url"></label><button id="sourcemag">次回の確認に追加</button></details></details>
 <details><summary>共有可の写真を準備</summary><p>「共有可」に入れた自分の写真をまとめて選べます。画素からJPEGと短い説明を作ります。被写体を一言添えることもできます。画面に保存されるのは加工したJPEGです。実際の共有は、noteアプリの「アカウント」→「アップロードした画像」で加工済みの画像を選び、「共有」を押します。</p>
-<label>写真<input id="photo" type="file" multiple accept="image/*"></label><label>被写体（任意・場所や氏名は不要）<input id="subject" maxlength="40"></label>
-<label><input id="allow" type="checkbox"> 自作で共有可に入れた写真です。作品のサムネの転用ではありません</label>
-<button id="prep">位置情報を除いた写真を準備</button><div id="photos"></div></details>
+<label>被写体（任意・場所や氏名は不要）<input id="subject" maxlength="40"></label>
+<label>共有可に入れる自作写真を選ぶ（複数可・作品のサムネを除く）<input id="photo" type="file" multiple accept="image/*"></label>
+<button id="prep">選んだ写真の準備を再試行</button><div id="photos"></div></details>
+<details open><summary>既刊と新作の掲載先</summary><p id="catalogue"></p><div id="archive"></div>
+<button id="prevarchive">前の30本</button><button id="nextarchive">次の30本</button></details>
 <h2>作品と計測</h2><pre id="result">管理用の鍵を入力し「記録を開く」を押してください。</pre>
 <script nonce="${nonce}">(${deskBrowser.toString()})();</script></body></html>`;
   return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}});
@@ -1314,6 +2066,7 @@ function deskBrowser() {
     if(r.ok && action==='download') return r.blob();
     const s=await r.json();
     if(!r.ok) throw Error(s.error || '操作を確認できません。');
+    if(action==='archive'){showArchive(s);return;}
     show(s);
   }
   let busy=false;
@@ -1328,8 +2081,24 @@ function deskBrowser() {
     const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=wrap(fn);parent.append(b);
   }
   function line(parent,s){const p=document.createElement('p');p.textContent=s;parent.append(p);return p;}
+  let archiveOffset=0;
+  function showArchive(a) {
+    archiveOffset=a.offset;
+    $('catalogue').textContent=a.message+' ／ 確認できた作品 '+a.total+'本（固定記事を除く）';
+    $('archive').replaceChildren();
+    for(const w of a.items){
+      const where=w.seen.length?'誌面で掲載を確認：'+w.seen.map(x=>x.name).join('、'):w.choice?'条件に合う1誌：'+w.choice+'（掲載未確認）':w.waiting;
+      const el=line($('archive'),w.title+' ／ '+where+' ／ '+w.state+(w.at?' ／ '+tm(w.at)+'時点 '+w.likes+'スキ':'')+
+        (w.change!==null?' ／ '+tm(w.prior_at)+'からの増減 '+w.change:''));
+      external(el,'作品を開く','https://note.com/43__/n/'+w.article);
+    }
+    $('prevarchive').disabled=a.offset===0;$('nextarchive').disabled=!a.more;
+  }
+  $('prevarchive').onclick=wrap(()=>send('archive',{offset:Math.max(0,archiveOffset-30)}));
+  $('nextarchive').onclick=wrap(()=>send('archive',{offset:archiveOffset+30}));
   function show(s){
-    $('plan').value=s.cfg.plan;
+    showArchive(s.archive);
+
     if(!$('seq').value) $('seq').value=(s.works.at(-1)?.seq??0)+1;
     const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
       '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
@@ -1341,24 +2110,34 @@ function deskBrowser() {
     for(const w of displayed) {
       lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
         w.pub?'公開確認 '+tm(w.pub):'RSSでの公開確認待ち',
-        w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'許可済みの掲載先なし');
+        w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
       for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
       for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
       lines.push('');
     }
     lines.push('【週次・日本時間の月〜日公開分】','フォロワーは月曜正午から翌月曜正午。平均は公開7日後に測れた作品だけ。');
     for(const w of s.weeks) lines.push(w.start+'週　純増 '+val(w.delta)+' ／ 平均スキ '+(w.avg7===null?'欠測':w.avg7.toFixed(1))+' ／ 計測 '+w.measured+'本・対象 '+w.eligible+'本　'+(w.final?'確定':'7日後の計測中'));
+    lines.push('','【520の新作・同じ経過時間で比較】');
+    for(const w of s.growth.observed)lines.push(w.title+'　24時間 '+(w.d1??w.state1??'未計測')+' ／ 7日 '+(w.d7??w.state7??'未計測')+' ／ その間の増減 '+(w.d1!==null && w.d7!==null?w.d7-w.d1:'—'));
+    lines.push('','【誌面RSSで掲載を確認した作品】');
+    for(const r of s.growth.references)lines.push(r.title+'　'+r.name+' ／ 初回確認 '+tm(r.observed));
     lines.push('','【フォロワー数・毎日12:00から15分以内】');
     for(const f of s.followers) lines.push(f.d+'　'+(f.value===null?f.state:f.value+'人　'+tm(f.at)));
     $('result').textContent=lines.join('\n');
-    $('mags').replaceChildren();
-    for(const m of s.mags){
-      const p=line($('mags'),m.name+' ／ RSS '+m.rss_state+' ／ 確認した最新作品 '+tm(m.recent));
-      button(p,'この誌の許可を解除',async()=>{await send('revoke',{url:m.url});return '許可を解除しました。';});
+    $('directory').textContent=s.directory.message;
+    $('imports').replaceChildren();$('mags').replaceChildren();
+    for(const m of s.imports){
+      const label=m.mode==='excluded'?'除外済み':m.allowed?m.state:(m.memberReason||'運営資格を確認待ち');
+      const p=line($('imports'),m.name+' ／ '+label+(m.allowed && m.reason?'　'+m.reason:''));
+      external(p,'誌面',m.url);if(m.rules)external(p,'募集条件',m.rules);
+      if(m.mode!=='excluded')button(p,'この誌を除外',()=>send('revoke',{url:m.url}));
+    }
+    for(const m of s.mags.filter(x=>!s.imports.some(i=>i.id===x.url.split('/').at(-1)))){
+      const p=line($('mags'),m.name+' ／ 登録済み');button(p,'この誌を除外',()=>send('revoke',{url:m.url}));
     }
     $('photos').replaceChildren();
     for(const p of s.photos){
-      const el=line($('photos'),p.caption+' ／ '+(p.shared?'共有済み（本人確認 '+tm(p.shared)+'）':'準備済み・未共有'));
+      const el=line($('photos'),p.caption+' 検索キーワード：'+p.keywords+' ／ '+(p.shared?'共有済み（本人確認 '+tm(p.shared)+'）':'準備済み・未共有'));
       button(el,'JPEGを保存',async()=>{
         const blob=await send('download',{hash:p.hash}),u=URL.createObjectURL(blob);
         const a=document.createElement('a');a.href=u;a.download='520-'+p.hash.slice(0,12)+'.jpg';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000);
@@ -1370,8 +2149,11 @@ function deskBrowser() {
       });
     }
   }
+  function external(parent,label,url) {
+    const a=document.createElement('a');a.href=url;a.textContent=label;a.target='_blank';a.rel='noopener noreferrer';parent.append(' ',a);
+  }
+  $('sourcemag').onclick=wrap(()=>send('mag_source',{url:$('oneurl').value.trim()}));
   $('load').onclick=wrap(()=>send('status'));
-  $('setup').onclick=wrap(async()=>{await send('setup',{plan:$('plan').value});return '自動記録を開始しました。';});
   $('add').onclick=wrap(async()=>{
     const f=$('manuscript').files[0];
     if(f && $('body').value) throw Error('本文とファイルのどちらか1つを入力してください。');
@@ -1391,14 +2173,7 @@ function deskBrowser() {
     const works=JSON.parse((await fileText(f)).replace(/^\uFEFF/,''));
     await send('works',{works});return '一括登録しました。';
   });
-  const picks=name=>[...document.querySelectorAll('input[name="'+name+'"]:checked')].map(o=>o.value);
-  $('mag').onclick=wrap(async()=>{
-    const m={url:$('magurl').value.trim().replace(/\/$/,''),name:$('magname').value,rules:$('rules').value,min:$('min').valueAsNumber,max:$('max').valueAsNumber,genres:picks('genres'),methods:picks('methods')};
-    for(const k of ['member','literary','conditions','permit']) m[k]=$(k).checked;
-    await send('mag',m);return 'この誌の条件を保存しました。';
-  });
-  $('prep').onclick=wrap(async()=>{
-    if(!$('allow').checked) throw Error('自作・共有可のチェックが必要です。');
+  $('photo').onchange=$('prep').onclick=wrap(async()=>{
     const files=Array.from($('photo').files);
     if(!files.length) throw Error('共有可の写真を選んでください。');
     if(files.length>1 && $('subject').value.trim()) throw Error('複数の写真では被写体欄を空にしてください。各写真の色と明るさから説明を作ります。');
@@ -1407,7 +2182,7 @@ function deskBrowser() {
       try {await prepareImage(f);done++;}
       catch(e){throw Error(done+'枚準備済み。'+e.message);}
     }
-    $('photo').value='';$('allow').checked=false;$('subject').value='';
+    $('photo').value='';$('subject').value='';
     return done+'枚を準備しました。写真欄からJPEGを保存できます。';
   });
   async function prepareImage(f) {
