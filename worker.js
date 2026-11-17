@@ -1,4 +1,4 @@
-const VERSION = 'v16.5.1';
+const VERSION = 'v16.5.2';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -894,6 +894,8 @@ async function deskRoute(request,env) {
           article:raw?sharedDraftKey(raw):match?match[1]:sharedDraftKey(''),d:form.get('link_date'),t:form.get('link_time')};
         if(match){input.original=match[1];input.expected=Number(match[2]);}
         if(match && action==='cancel_link' && input.article!==match[1])throw new Input520('取り消す予約と共有リンクが一致しません。');
+      }else if(form.get('work_action')==='scout'){
+        input={action:'scout'};
       }else if(form.get('work_action')==='clear_reserved'){
         input={action:'clear_reserved',seqs:form.getAll('reserved_seq').map(Number)};
       }else{
@@ -1480,8 +1482,10 @@ function isPublishedBy520(n){
 const scoutSeeds=[
   ['https://note.com/kakitsubataayame/m/m32620a9cd50d','共同運営マガジン・note文芸部'],
   ['https://note.com/kknk41/m/md3fff28070f2','えんぴつくるくる'],
-  ['https://note.com/mitsuruamano/m/m4d9023d7133b','創作の森 エンターテイナー・ストリート']
+  ['https://note.com/mitsuruamano/m/m4d9023d7133b','創作の森 エンターテイナー・ストリート'],
+  ['https://note.com/wise_rat6355/m/md3a807653baf','綴り灯']
 ];
+const scoutProfiles=['https://note.com/azoworks','https://note.com/studio_yoizuki','https://note.com/shitosatashimaya'];
 class Desk520 {
   constructor(storage,env) { this.env=env; this.storage=storage; this.ready=false; this.pendingReads=new Map(); }
   rows(q,...a) { return this.storage.sql.exec(q,...a).toArray(); }
@@ -1548,6 +1552,19 @@ class Desk520 {
         this.rows('UPDATE desk_link_plan SET title_due=0 WHERE pub IS NULL AND title IS NULL');
       });
     }
+    if(!this.one("SELECT 1 FROM sqlite_master WHERE name='desk_scout_budget'")){
+      this.storage.transactionSync(()=>{
+        this.rows("CREATE TABLE desk_scout_budget(id INTEGER PRIMARY KEY, day TEXT NOT NULL DEFAULT '', used INTEGER NOT NULL DEFAULT 0, seeded INTEGER NOT NULL DEFAULT 0)");
+        this.rows('INSERT INTO desk_scout_budget(id) VALUES(1)');
+        this.rows('CREATE TABLE desk_owner_source(id TEXT PRIMARY KEY)');
+        for(const [url] of scoutSeeds){
+          this.rows("INSERT OR IGNORE INTO desk_scout(url,kind,due) SELECT ?,'feed',0 WHERE (SELECT COUNT(*) FROM desk_scout WHERE kind='feed')<32",url);
+        }
+        for(const url of scoutProfiles)this.rows("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'profile',0)",url);
+        this.rows('UPDATE desk_scout_state SET due=0 WHERE id=1');
+        this.rows("UPDATE desk_directory SET due=0 WHERE id=1 AND enabled=1 AND token=''");
+      });
+    }
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -1610,6 +1627,7 @@ class Desk520 {
           break;
         }
         case 'find_mags': await this.discoverMagazines(now,true); break;
+        case 'scout': correctionMessage=await this.scoutLiterary(now); break;
         case 'mag_source': {
           const link=noteLink161(input.url);
           need520(link,'公開マガジンのURLを確認してください。');
@@ -1780,7 +1798,8 @@ class Desk520 {
       SUM(likes-previous) net FROM desk_archive WHERE prior_at IS NOT NULL AND at>=? AND at<=?
       AND at-prior_at BETWEEN ? AND ? AND pub<=prior_at-? AND likes IS NOT NULL AND previous IS NOT NULL`,
       now-7*D520,now,6*D520,8*D520,30*D520);
-    return {cfg,backlist,scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
+    return {cfg,backlist,scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -1991,7 +2010,8 @@ class Desk520 {
     }catch{evidence={ok:false,reason:'運営資格の読み取りを再試行します'};}
     this.storage.transactionSync(()=>{
       if(!this.one("SELECT id FROM desk_member WHERE id=? AND ticket=? AND mode IN ('check','auto')",row.id,ticket))return;
-      this.rows("UPDATE desk_member SET mode=?,due=?,checked=?,reason=?,ticket='' WHERE id=?",evidence.ok?'auto':'check',now+(!evidence.ok && this.one('SELECT id FROM desk_scout_mag WHERE id=?',row.id)?14*D520:D520),now,evidence.reason,row.id);
+      const publicLead=!evidence.ok && this.one('SELECT id FROM desk_scout_mag WHERE id=? AND NOT EXISTS (SELECT 1 FROM desk_owner_source WHERE id=?)',row.id,row.id);
+      this.rows("UPDATE desk_member SET mode=?,due=?,checked=?,reason=?,ticket='' WHERE id=?",evidence.ok?'auto':'check',now+(publicLead?14*D520:D520),now,evidence.reason,row.id);
       if(evidence.ok){
         this.rows("UPDATE desk_import SET allowed=1,state=CASE WHEN allowed=1 THEN state ELSE '募集条件を確認待ち' END,due=CASE WHEN allowed=1 THEN due ELSE 0 END WHERE id=?",row.id);
       }else this.clearAutoMag(row,evidence.reason);
@@ -2030,7 +2050,10 @@ class Desk520 {
     if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
     const cfg=this.one('SELECT enabled,due FROM desk_directory WHERE id=1');
     if(cfg.enabled && cfg.due<=now){await this.discoverMagazines(now);return;}
-    const inspect=this.one("SELECT i.id,i.url,i.managed,i.name,sc.id AS scouted FROM desk_member m JOIN desk_import i ON i.id=m.id LEFT JOIN desk_scout_mag sc ON sc.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=? ORDER BY (m.mode='auto') DESC,(sc.id IS NOT NULL),m.due,m.id LIMIT 1",now);
+    const inspect=this.one(`SELECT i.id,i.url,i.managed,i.name,CASE WHEN o.id IS NULL THEN sc.id END AS scouted
+      FROM desk_member m JOIN desk_import i ON i.id=m.id LEFT JOIN desk_scout_mag sc ON sc.id=m.id
+      LEFT JOIN desk_owner_source o ON o.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=?
+      ORDER BY (m.mode='auto') DESC,(o.id IS NULL),(sc.id IS NOT NULL),m.due,m.id LIMIT 1`,now);
     const rule=this.one('SELECT id,due FROM desk_import WHERE allowed=1 AND due<=? ORDER BY due,id LIMIT 1',now);
     // Alternate when both queues are non-empty; large public lists cannot starve rule updates.
     if(inspect && (!rule || (!inspect.scouted && (Math.floor(now/(4*M520))%2)===0))){
@@ -2250,30 +2273,45 @@ class Desk520 {
   }
   async scoutLiterary(now){
     const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled AS directory FROM desk_cfg c JOIN desk_directory d ON d.id=c.id WHERE c.id=1');
-    if(!cfg.enabled || !cfg.directory || cfg.blocked>now || this.one('SELECT due FROM desk_scout_state WHERE id=1').due>now)return;
+    if(!cfg.enabled || !cfg.directory)return '探索は休止中です。';
+    if(cfg.blocked>now)return 'noteの待機期限 '+time(cfg.blocked)+' 以降に自動で続けます。';
+    const day=jstDay(now),budget=this.one('SELECT day,used,seeded FROM desk_scout_budget WHERE id=1');
+    const used=budget.day===day?budget.used:0;
+    if(used>=64)return '本日の探索は64か所に達しました。翌日に自動で続けます。';
+    const due=this.one('SELECT due FROM desk_scout_state WHERE id=1').due;
+    if(due>now)return '次の探索は '+time(due)+' 以降です。自動で続けます。';
     const next=this.one('SELECT url,kind FROM desk_scout WHERE due<=? ORDER BY due,url LIMIT 1',now);
-    if(!next)return;
-    this.rows('UPDATE desk_scout_state SET due=? WHERE id=1',now+30*M520);
-    this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+D520,next.url);
-    try{
-      for(const [url,label] of scoutSeeds){
-        const seed=noteLink161(url);
-        if(!this.one('SELECT id FROM desk_import WHERE id=?',seed.id) && this.rememberMagazine(seed,label))
-          this.rows('INSERT OR IGNORE INTO desk_scout_mag(id) VALUES(?)',seed.id);
+    if(!next)return '探索予定のページは確認済みです。次の更新を自動で確認します。';
+    // Count attempts before fetching, including failures, repeated button taps and restarts.
+    this.storage.transactionSync(()=>{
+      if(!budget.seeded){
+        for(const [url,label] of scoutSeeds){
+          const link=noteLink161(url);
+          if(!this.one('SELECT id FROM desk_import WHERE id=?',link.id) && this.one('SELECT COUNT(*) n FROM desk_scout_mag').n<800 && this.rememberMagazine(link,label))
+            this.rows('INSERT OR IGNORE INTO desk_scout_mag(id) VALUES(?)',link.id);
+        }
       }
+      this.rows('UPDATE desk_scout_budget SET day=?,used=?,seeded=1 WHERE id=1',day,used+1);
+      this.rows('UPDATE desk_scout_state SET due=? WHERE id=1',now+(used+1<32?4:30)*M520);
+      this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+D520,next.url);
+    });
+    try{
       const source=next.url;
       const found=new Map();
       let writers=[];
       if(next.kind==='feed'){
         const edition=await this.readIssue(source);
         const mag=noteLink161(source);
-        found.set(mag.id,{link:mag,label:scoutSeeds.find(([url])=>url===source)?.[1]||mag.id});
+        const label=this.one('SELECT name FROM desk_import WHERE id=?',mag.id)?.name||mag.id;
+        this.storage.transactionSync(()=>this.recordReferences(edition,mag,label,now));
+        found.set(mag.id,{link:mag,label});
         writers=[...new Set(edition.map(e=>noteLink161(e.link,source,'article')?.owner).filter(v=>v && v!=='43__'))].slice(0,24);
       }else{
         const html=await this.publicRead(source,'html');
         if(!/<html[\s>]/i.test(html))throw Error();
         const canonical=meta161(html,'og:url');
-        if(canonical && canonical.replace(/\/?$/,'')!==source && canonical.replace(/\/?$/,'')!==source.replace(/\/magazines$/,''))throw Error();
+        const ownerPage=url=>url.replace(/\/$/,'').replace(/\/magazines$/,'');
+        if(canonical && ownerPage(canonical)!==ownerPage(source))throw Error();
         for(const a of anchors161(html)){
           const link=noteLink161(a.href,source);
           if(link && link.owner!=='43__' && /小説|文芸|文学|詩|エッセイ|散文|掌編|創作|物語|短歌|共同運営/.test(a.label))found.set(link.id,{link,label:a.label.split('\n')[0]});
@@ -2296,7 +2334,7 @@ class Desk520 {
             added++;room--;
           }
         }
-        if(next.kind==='author'){
+        if(next.kind!=='feed'){
           let capacity=Math.min(2,32-this.one("SELECT COUNT(*) n FROM desk_scout WHERE kind='feed'").n);
           for(const {link} of found.values()){
             if(capacity<=0)break;
@@ -2308,6 +2346,7 @@ class Desk520 {
         this.rows('UPDATE desk_scout_state SET message=? WHERE id=1','直近の探索で新たに'+added+'誌を登録');
       });
     }catch{this.rows("UPDATE desk_scout_state SET message='公開ページの読み取りを再確認待ち' WHERE id=1");}
+    return this.one('SELECT message FROM desk_scout_state WHERE id=1').message;
   }
   async discoverMagazines(now,manual=false) {
     const cfg=this.one('SELECT * FROM desk_directory WHERE id=1');
@@ -2347,10 +2386,14 @@ class Desk520 {
     }
     this.storage.transactionSync(()=>{
       if(this.one('SELECT token FROM desk_directory WHERE id=1').token!==token)return;
-      for(const link of found.values()) this.rememberMagazine(link,link.name);
+      for(const link of found.values()){
+        this.rememberMagazine(link,link.name);
+        const fresh=this.one('INSERT OR IGNORE INTO desk_owner_source(id) VALUES(?) RETURNING id',link.id);
+        if(fresh)this.rows("UPDATE desk_member SET due=0 WHERE id=? AND mode='check' AND ticket=''",link.id);
+      }
       let message=readable?(found.size?'公開ページにあるマガジン '+found.size+'誌。':'読めた公開ページ内にマガジンのリンクが見つかりません。'):'520の公開一覧を取得できませんでした。';
       if(partial || readable===1) message+=' 公開一覧の一部だけを確認しました。';
-      this.rows("UPDATE desk_directory SET due=?,token='',message=? WHERE id=1",now+(readable && found.size?7*D520:D520),message);
+      this.rows("UPDATE desk_directory SET due=?,token='',message=? WHERE id=1",now+D520,message);
     });
   }
   async sourceForMagazine(row) {
@@ -3096,7 +3139,9 @@ function directoryRedirect161(from,to) {
     if(dest?.id!==mag.id || isFeed!==b.pathname.endsWith('/rss'))return null;
     return dest.url+(isFeed?'/rss':'');
   }
-  if(!/^\/43__(?:\/magazines)?\/?$/.test(a.pathname) || !/^\/43__(?:\/magazines)?\/?$/.test(b.pathname))return null;
+  const owner=/^\/(\w[\w-]{0,79})(?:\/magazines)?\/?$/;
+  const fromOwner=owner.exec(a.pathname)?.[1];
+  if(!fromOwner || owner.exec(b.pathname)?.[1]!==fromOwner)return null;
   if(b.search && !/^\?page=\d+$/.test(b.search))return null;
   return b.origin+b.pathname+b.search;
 }
@@ -3221,7 +3266,7 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
-  if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ '+s.scout.message);
+  if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ 本日探索を試みたページ '+s.scout.used+'か所（最大64） ／ '+s.scout.message);
   const checkedPlans=(s.linkPlans||[]).filter(p=>p.result || p.message);
   if(checkedPlans.length){
     lines.push('【予約作品の確認記録】');
@@ -3353,7 +3398,8 @@ function deskPage(records=null,message='',status=200,editing='') {
 <button id="add">完成稿を登録</button>
 <details><summary>複数の完成稿を1回で登録（JSON）</summary><p>配列の各行に seq（順番）, title, body, d（YYYY-MM-DD）, t（HH:MM または空文字）, locked（予約済み true / false）, draft（記事IDまたは空文字）, genre, method を入れます。どれか1本に誤りがあれば一括登録全体を戻します。</p><label>JSONファイル<input id="batch" type="file" accept=".json,application/json"></label><button id="import">一括登録</button></details></details>
 <details id="magsection"><summary>マガジンの自動確認</summary>
-<p>520の公開ページなどから誌面を探し、無料・共同運営者・募集条件を確認します。以前の除外は保持します。</p>
+<p>520の公開一覧にある誌の編集権限を優先して確認します。ほかの作者の公開ページと文芸誌の最新号からも自動で探します。</p>
+<button type="submit" form="readform" name="work_action" value="scout">掲載先を今探す</button>
 <p id="directory">${esc(records?.directory?.message)}</p><div id="imports">${deskMagazineList(records)}</div><div id="mags"></div>
 <details><summary>公開一覧にない誌のURLを補う（任意）</summary><label>マガジンURL<input id="oneurl" type="url"></label><button id="sourcemag">次回の確認に追加</button></details></details>
 <details><summary>共有可の写真を準備</summary><p>「共有可」に入れた自分の写真をまとめて選べます。画素からJPEGと短い説明を作ります。被写体を一言添えることもできます。画面に保存されるのは加工したJPEGです。実際の共有は、noteアプリの「アカウント」→「アップロードした画像」で加工済みの画像を選び、「共有」を押します。</p>
@@ -3383,7 +3429,7 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
       if(!r.ok) throw Error(s.error || '操作を確認できません。');
       if(action==='archive'){showArchive(s);return;}
       if(action==='plans'){showPlans(s);return;}
-      show(s);if(['reserve_link','replace_link','cancel_link','preview_link'].includes(action))return s;
+      show(s);if(['reserve_link','replace_link','cancel_link','preview_link','scout'].includes(action))return s;
     }catch(error){
       if(controller?.signal.aborted)throw Error('20秒以内に応答がありませんでした。「簡易表示で開く」を押してください。');
       if(error instanceof TypeError)throw Error('作品管理に接続できませんでした。通信を確認して、もう一度開いてください。');
@@ -3507,6 +3553,10 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   $('readform').onsubmit=event=>{
     if(event.submitter===$('basic'))return;
     const action=event.submitter?.value;
+    if(action==='scout'){
+      event.preventDefault();
+      return wrap(async()=>(await send('scout')).correctionMessage)();
+    }
     if(['reserve_link','cancel_link','preview_link'].includes(action)){
       event.preventDefault();
       return wrap(async()=>{
