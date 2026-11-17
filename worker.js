@@ -1,4 +1,4 @@
-const VERSION = 'v16.4.2';
+const VERSION = 'v16.5';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1308,7 +1308,12 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
 }
 `;
 // Runs inside the authenticated note.com tab. Return only the data needed for comparison.
-async function readDraftCover(key,accountId) {
+async function draftBodyHash(body){
+  if(typeof body!=='string' || !body.trim() || body.length>2500000)return null;
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(body));
+  return Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('');
+}
+async function readDraftCover(key,accountId,hashBody) {
   if(location.origin!=='https://note.com' || !/^n[a-z0-9]{1,64}$/.test(key))return null;
   try {
     const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});
@@ -1317,8 +1322,9 @@ async function readDraftCover(key,accountId) {
     if(!n || n.key!==key)return null;
     if(n.user?.urlname && n.user.urlname!=='43__' || n.user?.id && String(n.user.id)!==accountId || ['published','reserved','scheduled'].includes(n.status) ||
        [n.scheduledPublishAt,n.scheduled_publish_at,n.publishAt,n.publish_at].some(t=>t && Date.parse(t)>Date.now()))return {unsafe:true};
-    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId || !Object.hasOwn(n,'eyecatch'))return null;
-    return {name:n.name,cover:n.eyecatch};
+    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId)return null;
+    const full=n.is_limited!==true && n.is_paid!==true && !(Number(n.price)>0);
+    return {name:n.name,hash:full?await hashBody(n.body):null,...(Object.hasOwn(n,'eyecatch')?{cover:n.eyecatch}:{})};
   }catch{return null;}
 }
 async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
@@ -1335,7 +1341,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     };
     const state=(step,arg,values)=>poll(()=>frame(step,arg),v=>values.includes(v));
     const arg={key:job.key,title:job.title,byLink:!!job.link};
-    let cover=null;
+    let cover=null,hash=null;
     const page=job.kind==='publish'?'https://note.com/notes':'https://note.com/43__/n/'+job.key;
     await navigate(page);
     const identity=await poll(()=>evaluate(noteIdentityJS),v=>!!v);
@@ -1366,7 +1372,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       if(!/^n[a-z0-9]{1,64}$/.test(draft.key) || !['https://editor.note.com','https://note.com'].includes(editor.origin) ||
           editor.pathname.replace(/\/$/,'')!=='/notes/'+draft.key+'/edit')return {message:'本人の編集ページを確認待ち'};
       // Read the existing draft's explicit cover field while still on note.com's own domain.
-      const metadata=await evaluate('('+readDraftCover.toString()+')('+JSON.stringify(draft.key)+','+JSON.stringify(accountId)+')');
+      const metadata=await evaluate('('+readDraftCover.toString()+')('+JSON.stringify(draft.key)+','+JSON.stringify(accountId)+',('+draftBodyHash.toString()+'))');
       if(blocked())return blockedResult();
       if(metadata?.unsafe)return {message:'公開済み・予約済みまたは所有者の不一致を確認・公開保留'};
       await navigate(editor.href);
@@ -1385,7 +1391,9 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       // Only an explicit field in the saved draft can confirm there is no header.
       cover=dataCover??(domCover || null);
       if(cover===null)return {message:'下書きの見出し画像を確認できず・公開保留'};
-      if(job.preview)return {message:'「'+arg.title+'」 ／ '+(cover?'設定済みの見出し画像を確認しました。':'見出し画像は未設定です。')};
+      hash=metadata?.hash;
+      if(!/^[0-9a-f]{64}$/.test(hash||''))return {message:'保存済みの本文全体を取得できず・公開保留'};
+      if(job.preview)return {message:'「'+arg.title+'」 ／ '+(cover?'設定済みの見出し画像を確認しました。':'見出し画像は未設定です。')+' 保存済み本文を照合できます。'};
       if(blocked() || await frame('settings',arg)!=='clicked')return blocked()?blockedResult():{message:'公開設定を確認待ち'};
       // Text is no longer needed in the browser commands for the publish screen.
       delete arg.body;
@@ -1402,7 +1410,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     }
     if(blocked())return blockedResult();
     if(Date.now()>=end)return {message:'確認時間を超過・操作保留'};
-    const gate=await markAttempt(arg.key,job.kind==='publish'?{title:arg.title,cover}:null);
+    const gate=await markAttempt(arg.key,job.kind==='publish'?{title:arg.title,cover,hash}:null);
     if(gate!==true)return {message:typeof gate==='string'?gate:'予定・待機・掲載条件を再確認待ち'};
     if(!blocked()){
       await frame(finalStep,arg);
@@ -1416,6 +1424,11 @@ function isPublishedBy520(n){
   return n && (n.user?.urlname==='43__' || (!n.user?.urlname && publicKey520(String(n.noteUrl||n.note_url||''))===n.key)) &&
     n.status==='published' && (!n.type || n.type==='TextNote' || n.type==='text');
 }
+const scoutSeeds=[
+  ['https://note.com/kakitsubataayame/m/m32620a9cd50d','共同運営マガジン・note文芸部'],
+  ['https://note.com/kknk41/m/md3fff28070f2','えんぴつくるくる'],
+  ['https://note.com/mitsuruamano/m/m4d9023d7133b','創作の森 エンターテイナー・ストリート']
+];
 class Desk520 {
   constructor(storage,env) { this.env=env; this.storage=storage; this.ready=false; this.pendingReads=new Map(); }
   rows(q,...a) { return this.storage.sql.exec(q,...a).toArray(); }
@@ -1449,6 +1462,24 @@ class Desk520 {
       this.storage.transactionSync(()=>{
         this.rows('CREATE TABLE desk_work_cover(seq INTEGER PRIMARY KEY, article TEXT UNIQUE NOT NULL, scheduled INTEGER NOT NULL, cover TEXT NOT NULL, check_at INTEGER, result TEXT NOT NULL)');
         this.rows('CREATE INDEX desk_work_cover_due ON desk_work_cover(check_at) WHERE check_at IS NOT NULL');
+      });
+    }
+    if(!this.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='desk_snapshot'")){
+      this.storage.transactionSync(()=>{
+        this.rows('CREATE TABLE desk_snapshot(article TEXT PRIMARY KEY,title TEXT NOT NULL,body_hash TEXT NOT NULL,confirmed INTEGER)');
+        this.rows('ALTER TABLE desk_link_plan ADD COLUMN title_due INTEGER NOT NULL DEFAULT 0');
+        this.rows('CREATE INDEX desk_title_missing ON desk_link_plan(title_due,scheduled) WHERE title IS NULL AND pub IS NULL');
+        this.rows('CREATE TABLE desk_scout(url TEXT PRIMARY KEY,kind TEXT NOT NULL,due INTEGER NOT NULL)');
+        this.rows('CREATE INDEX desk_scout_due ON desk_scout(due,url)');
+        this.rows("CREATE TABLE desk_scout_state(id INTEGER PRIMARY KEY,due INTEGER DEFAULT 0,title_due INTEGER DEFAULT 0,older INTEGER DEFAULT 1,message TEXT DEFAULT '文芸誌を確認待ち')");
+        this.rows('INSERT INTO desk_scout_state(id) VALUES(1)');
+        this.rows('CREATE TABLE desk_scout_mag(id TEXT PRIMARY KEY)');
+        this.rows('CREATE INDEX desk_member_mode_due ON desk_member(mode,due,id)');
+        for(const [url] of scoutSeeds){
+          const link=noteLink161(url);
+          this.rows("INSERT INTO desk_scout(url,kind,due) VALUES(?,'feed',0)",url);
+          this.rows("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'author',1)",'https://note.com/'+link.owner+'/magazines');
+        }
       });
     }
     this.ready=true;
@@ -1533,7 +1564,7 @@ class Desk520 {
         default: throw new Input520('操作を選んでください。');
       }
       const records=this.view(input.action==='status' && Number.isSafeInteger(input.offset) && input.offset>=0?input.offset:0);
-      return deskJson({...records,correctionMessage,recordText:deskRecordText(records)});
+      return deskJson({...records,publicationLinks:publicationLinks(records),correctionMessage,recordText:deskRecordText(records)});
     } catch(e) {
       return deskJson({error:e instanceof Input520?e.message:'保存・読み出しを確認できません。管理画面を開き直してください。'},e instanceof Input520?400:503);
     }
@@ -1635,8 +1666,9 @@ class Desk520 {
       SUM(likes-previous) net FROM desk_archive WHERE prior_at IS NOT NULL AND at>=? AND at<=?
       AND at-prior_at BETWEEN ? AND ? AND pub<=prior_at-? AND likes IS NOT NULL AND previous IS NOT NULL`,
       now-7*D520,now,6*D520,8*D520,30*D520);
-    return {cfg,backlist,linkPlans:this.rows("SELECT l.article,l.title,l.scheduled,l.pub,l.result,j.phase,j.message FROM desk_link_plan l LEFT JOIN desk_job j ON j.kind='publish' AND j.subject=l.article ORDER BY l.scheduled"),deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
-      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.article,w.pub,c.result AS coverResult,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
+    return {cfg,backlist,scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:this.rows("SELECT l.article,COALESCE(l.title,(SELECT title FROM desk_work WHERE draft=l.article AND draft<>'')) title,l.scheduled,l.pub,l.result,p.confirmed,j.phase,j.message FROM desk_link_plan l LEFT JOIN desk_snapshot p ON p.article=l.article LEFT JOIN desk_job j ON j.kind='publish' AND j.subject=l.article ORDER BY l.scheduled"),deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
+        OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.draft,w.article,w.pub,c.article AS attemptedArticle,c.result AS coverResult,p.confirmed,m.url magurl,m.name AS magazine FROM desk_work w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_snapshot p ON p.article=c.article LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq').map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
       samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
       followers:this.rows('SELECT * FROM desk_follower ORDER BY d DESC LIMIT 60'),
@@ -1722,7 +1754,8 @@ class Desk520 {
     for(const e of entries) {
       this.rows("UPDATE desk_link_plan SET pub=COALESCE(pub,?),title=? WHERE article=? AND (pub IS NULL OR title<>?)",e.pub,e.title,e.key,e.title);
       this.rows("UPDATE desk_job SET phase='confirmed',at=?,message='520の公開記事を確認済み' WHERE kind='publish' AND target=? AND label=? AND phase='sent'",now,e.key,e.title);
-      const w=this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
+      const w=this.one('SELECT w.seq,w.draft FROM desk_work_cover c JOIN desk_work w ON w.seq=c.seq WHERE c.article=? AND w.pub IS NULL',e.key) ||
+        this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
       const midnight=jstStart(jstDay(e.pub));
       const ambiguous=w && !w.draft && this.one('SELECT 1 FROM desk_archive WHERE title=? AND pub>=? AND pub<? AND article<>? LIMIT 1',e.title,midnight,midnight+D520,e.key);
       const linked=this.one('SELECT seq,pub FROM desk_work WHERE article=?',e.key);
@@ -1844,7 +1877,7 @@ class Desk520 {
     }catch{evidence={ok:false,reason:'運営資格の読み取りを再試行します'};}
     this.storage.transactionSync(()=>{
       if(!this.one("SELECT id FROM desk_member WHERE id=? AND ticket=? AND mode IN ('check','auto')",row.id,ticket))return;
-      this.rows("UPDATE desk_member SET mode=?,due=?,checked=?,reason=?,ticket='' WHERE id=?",evidence.ok?'auto':'check',now+D520,now,evidence.reason,row.id);
+      this.rows("UPDATE desk_member SET mode=?,due=?,checked=?,reason=?,ticket='' WHERE id=?",evidence.ok?'auto':'check',now+(!evidence.ok && this.one('SELECT id FROM desk_scout_mag WHERE id=?',row.id)?14*D520:D520),now,evidence.reason,row.id);
       if(evidence.ok){
         this.rows("UPDATE desk_import SET allowed=1,state=CASE WHEN allowed=1 THEN state ELSE '募集条件を確認待ち' END,due=CASE WHEN allowed=1 THEN due ELSE 0 END WHERE id=?",row.id);
       }else this.clearAutoMag(row,evidence.reason);
@@ -1883,10 +1916,10 @@ class Desk520 {
     if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
     const cfg=this.one('SELECT enabled,due FROM desk_directory WHERE id=1');
     if(cfg.enabled && cfg.due<=now){await this.discoverMagazines(now);return;}
-    const inspect=this.one("SELECT i.id,i.url,i.managed,i.name FROM desk_member m JOIN desk_import i ON i.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=? ORDER BY m.due,m.id LIMIT 1",now);
+    const inspect=this.one("SELECT i.id,i.url,i.managed,i.name,sc.id AS scouted FROM desk_member m JOIN desk_import i ON i.id=m.id LEFT JOIN desk_scout_mag sc ON sc.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=? ORDER BY (m.mode='auto') DESC,(sc.id IS NOT NULL),m.due,m.id LIMIT 1",now);
     const rule=this.one('SELECT id,due FROM desk_import WHERE allowed=1 AND due<=? ORDER BY due,id LIMIT 1',now);
     // Alternate when both queues are non-empty; large public lists cannot starve rule updates.
-    if(inspect && (!rule || (Math.floor(now/(4*M520))%2)===0)){
+    if(inspect && (!rule || (!inspect.scouted && (Math.floor(now/(4*M520))%2)===0))){
       await this.checkEditorial(inspect,now);
       // An observed issue is evidence of publication, independently of 520's editorial rights.
       try{
@@ -2100,6 +2133,67 @@ class Desk520 {
     this.rows("INSERT INTO desk_import(id,url,name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=CASE WHEN desk_import.name=desk_import.id AND excluded.name<>excluded.id THEN excluded.name ELSE desk_import.name END",
       link.id,link.url,name||link.id);
     return true;
+  }
+  async scoutLiterary(now){
+    const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled AS directory FROM desk_cfg c JOIN desk_directory d ON d.id=c.id WHERE c.id=1');
+    if(!cfg.enabled || !cfg.directory || cfg.blocked>now || this.one('SELECT due FROM desk_scout_state WHERE id=1').due>now)return;
+    const next=this.one('SELECT url,kind FROM desk_scout WHERE due<=? ORDER BY due,url LIMIT 1',now);
+    if(!next)return;
+    this.rows('UPDATE desk_scout_state SET due=? WHERE id=1',now+30*M520);
+    this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+D520,next.url);
+    try{
+      for(const [url,label] of scoutSeeds){
+        const seed=noteLink161(url);
+        if(!this.one('SELECT id FROM desk_import WHERE id=?',seed.id) && this.rememberMagazine(seed,label))
+          this.rows('INSERT OR IGNORE INTO desk_scout_mag(id) VALUES(?)',seed.id);
+      }
+      const source=next.url;
+      const found=new Map();
+      let writers=[];
+      if(next.kind==='feed'){
+        const edition=await this.readIssue(source);
+        const mag=noteLink161(source);
+        found.set(mag.id,{link:mag,label:scoutSeeds.find(([url])=>url===source)?.[1]||mag.id});
+        writers=[...new Set(edition.map(e=>noteLink161(e.link,source,'article')?.owner).filter(v=>v && v!=='43__'))].slice(0,24);
+      }else{
+        const html=await this.publicRead(source,'html');
+        if(!/<html[\s>]/i.test(html))throw Error();
+        const canonical=meta161(html,'og:url');
+        if(canonical && canonical.replace(/\/?$/,'')!==source && canonical.replace(/\/?$/,'')!==source.replace(/\/magazines$/,''))throw Error();
+        for(const a of anchors161(html)){
+          const link=noteLink161(a.href,source);
+          if(link && link.owner!=='43__' && /小説|文芸|文学|詩|エッセイ|散文|掌編|創作|物語|短歌|共同運営/.test(a.label))found.set(link.id,{link,label:a.label.split('\n')[0]});
+          if(found.size>=50)break;
+        }
+      }
+      this.storage.transactionSync(()=>{
+        // Reserve room for independent literary feeds so prolific writers cannot fill the whole directory.
+        let spaces=224-this.one("SELECT COUNT(*) n FROM desk_scout WHERE kind='author'").n;
+        for(const writer of writers){
+          if(spaces<1)break;
+          if(this.one("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'author',?) RETURNING url",'https://note.com/'+writer+'/magazines',now))spaces--;
+        }
+        let room=800-this.one('SELECT COUNT(*) n FROM desk_scout_mag').n,added=0;
+        for(const {link,label} of found.values()){
+          if(room<=0)break;
+          if(this.one('SELECT id FROM desk_import WHERE id=?',link.id))continue;
+          if(this.rememberMagazine(link,label)){
+            this.rows('INSERT OR IGNORE INTO desk_scout_mag(id) VALUES(?)',link.id);
+            added++;room--;
+          }
+        }
+        if(next.kind==='author'){
+          let capacity=Math.min(2,32-this.one("SELECT COUNT(*) n FROM desk_scout WHERE kind='feed'").n);
+          for(const {link} of found.values()){
+            if(capacity<=0)break;
+            if(!this.one('SELECT 1 FROM desk_import WHERE id=?',link.id))continue;
+            if(this.one("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'feed',?) RETURNING url",link.url,now))capacity--;
+          }
+        }
+        this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+(next.kind==='feed'?D520:7*D520),source);
+        this.rows('UPDATE desk_scout_state SET message=? WHERE id=1','直近の探索で新たに'+added+'誌を登録');
+      });
+    }catch{this.rows("UPDATE desk_scout_state SET message='公開ページの読み取りを再確認待ち' WHERE id=1");}
   }
   async discoverMagazines(now,manual=false) {
     const cfg=this.one('SELECT * FROM desk_directory WHERE id=1');
@@ -2321,9 +2415,12 @@ class Desk520 {
     return {kind:'mag',key,subject:key,target:link.id,url:link.url,title:a.title,name:mag.name,old:a.pub<=now-30*D520};
   }
   nextPlacement(now,oldFirst){
+    const oldest=this.one('SELECT older FROM desk_scout_state WHERE id=1').older;
     for(const old of [oldFirst,!oldFirst]){
+      const order=!old?'a.pub DESC':oldest?'a.pub ASC':
+        'CASE WHEN a.at>=? AND a.at-a.prior_at BETWEEN ? AND ? AND a.likes>a.previous THEN a.likes-a.previous ELSE 0 END DESC,a.pub ASC';
       const keys=this.rows('SELECT a.article FROM desk_archive a WHERE a.choice IS NOT NULL AND a.pub '+(old?'<=?':'>?')+
-        " AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='mag' AND j.subject=a.article AND (j.phase<>'wait' OR j.next>?)) AND NOT EXISTS(SELECT 1 FROM desk_ref r WHERE r.article=a.article) ORDER BY a.pub DESC,a.article LIMIT 4",now-30*D520,now);
+        " AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='mag' AND j.subject=a.article AND (j.phase<>'wait' OR j.next>?)) AND NOT EXISTS(SELECT 1 FROM desk_ref r WHERE r.article=a.article) ORDER BY "+order+",a.article LIMIT 4",now-30*D520,now,...(old && !oldest?[now-7*D520,6*D520,8*D520]:[]));
       for(const {article} of keys){
         const job=this.eligiblePlacement(article,now);
         if(job)return job;
@@ -2354,7 +2451,40 @@ class Desk520 {
     const matches=SLOTS.filter((_,i)=>rows[i].results.length===1);
     if(matches.length!==1)return null;
     const slot=matches[0],gate=rows[SLOTS.indexOf(slot)].results[0];
-    return {id,slot,until:Math.max(gate.lease,gate.hold_until,gate.kind?gate.next_at:0)};
+    const hold=Math.max(gate.hold_until,gate.kind?gate.next_at:0);
+    return {id,slot,hold,until:Math.max(gate.lease,hold)};
+  }
+  async lookupDraftTitle(now){
+    const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
+    if(!cfg.enabled || cfg.blocked>now || this.one('SELECT title_due FROM desk_scout_state WHERE id=1').title_due>now)return;
+    const p=this.one('SELECT article FROM desk_link_plan WHERE title IS NULL AND pub IS NULL AND scheduled>? AND title_due<=? ORDER BY title_due,scheduled LIMIT 1',now,now);
+    if(!p)return;
+    this.rows('UPDATE desk_scout_state SET title_due=? WHERE id=1',now+12*M520);
+    this.rows('UPDATE desk_link_plan SET title_due=? WHERE article=?',now+D520,p.article);
+    let slot;
+    try{
+      const a=await this.deliveryAccount();
+      if(!a)return;
+      if(a.until>now){
+        this.rows('UPDATE desk_link_plan SET title_due=? WHERE article=?',Math.max(a.until,now+12*M520),p.article);
+        return;
+      }
+      slot=a.slot;
+      const env=await loadCookie(scoped(this.env,slot),a.id);
+      if(await account(env)!==a.id)return;
+      const n=await api(env,'/api/v3/notes/'+p.article);
+      if(n.key===p.article && n.status==='draft' && n.user?.urlname==='43__' && String(n.user.id)===a.id && text520(n.name,300))
+        this.rows('UPDATE desk_link_plan SET title=? WHERE article=? AND title IS NULL AND pub IS NULL',n.name,p.article);
+    }catch(error){
+      if(slot && error instanceof Trouble && (error.retry || [401,403,429].includes(error.code))){
+        const until=now+Math.max(error.retry||0,2*HOUR);
+        this.rows('UPDATE desk_scout_state SET title_due=MAX(title_due,?) WHERE id=1',until);
+        if(error.retry || error.code===429){
+          this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
+          await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,slot).run();
+        }
+      }
+    }
   }
   async previewDraft(key,now){
     need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
@@ -2396,7 +2526,11 @@ class Desk520 {
     try{
       const account=await this.deliveryAccount();
       if(!account){message='520の登録を確認待ち';return;}
-      if(account.until>Date.now()){retry=account.until-Date.now()+1000;message='520の処理・note指定の待機終了を確認待ち';return;}
+      if(account.until>Date.now()){
+        const at=Date.now();
+        retry=job.kind==='publish' && account.hold<=at?M520:account.until-at+1000;
+        message='520の処理・note指定の待機終了を確認待ち';return;
+      }
       slot=account.slot;env=scoped(this.env,slot);
       if(job.kind==='mag'){
         const entry=this.one('SELECT * FROM desk_import WHERE id=?',job.target);
@@ -2418,7 +2552,7 @@ class Desk520 {
         }
       }
       lease=await acquire(env,false);
-      if(!lease){message='別の処理が終了するのを待機中';retry=5*M520;return;}
+      if(!lease){message='別の処理が終了するのを待機中';retry=job.kind==='publish'?M520:5*M520;return;}
       const credential=await loadCookie(env,account.id);
       const cookie=cleanCookie(credential.NOTE_SESSION);
       if(!this.canDeliver(job,Date.now()))return;
@@ -2436,7 +2570,9 @@ class Desk520 {
           if(job.kind==='publish' && (!info || info.cover===null || !info.title || this.publicationSent(key) || this.one('SELECT 1 FROM desk_archive WHERE article=?',key)))return false;
           const marked=this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
           if(!marked)return false;
-          const pending='公開後の見出し画像を確認待ち';
+          if(job.kind==='mag' && job.old)this.rows('UPDATE desk_scout_state SET older=1-older WHERE id=1');
+          const pending='操作済み ／ noteの公開状態とタイトル・本文・見出し画像を確認待ち';
+          if(job.kind==='publish')this.rows('INSERT INTO desk_snapshot(article,title,body_hash) VALUES(?,?,?)',key,info.title,info.hash);
           if(job.link){
             this.rows('UPDATE desk_link_plan SET cover=?,title=?,check_at=?,result=? WHERE article=?',info.cover,info.title,at+5*M520,pending,key);
             this.rows("UPDATE desk_job SET label=? WHERE kind='publish' AND subject=?",info.title,key);
@@ -2537,29 +2673,43 @@ class Desk520 {
     if(!p)return;
     const expired=now>p.scheduled+7*D520;
     const table=p.link?'desk_link_plan':'desk_work_cover';
-    this.rows('UPDATE '+table+' SET check_at=?,result=? WHERE article=?',expired?null:now+HOUR,'公開後の見出し画像は未確認',p.article);
+    this.rows("UPDATE "+table+" SET check_at=?,result=CASE WHEN result LIKE '同じ記事IDでnote公開中%' THEN result ELSE '公開後の状態・本文・見出し画像は未確認' END WHERE article=?",expired?null:now+HOUR,p.article);
     try {
       const n=(await this.publicRead('https://note.com/api/v3/notes/'+p.article,'json'))?.data;
       const pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt);
-      if(n?.key!==p.article || n.user?.urlname!=='43__' || !text520(n.name,300) || n.name.trim()==='521' || !Number.isFinite(pub) || pub<=0 || pub>now ||
-        (n.status ? n.status!=='published' : !this.one('SELECT pub FROM desk_archive WHERE article=?',p.article)))return;
-      this.storage.transactionSync(()=>this.registerEntries([{key:p.article,pub,title:n.name}],now));
-      if(!Object.hasOwn(n,'eyecatch'))return;
-      const after=coverId(n.eyecatch);
-      if(after===null)return;
-      const result=p.cover!==after?'公開前後で見出し画像が異なります。noteの記事で確認してください。':
+      if(n?.key!==p.article || n.user?.urlname!=='43__' || !text520(n.name,300) || n.name.trim()==='521' ||
+        n.status!=='published' || !Number.isFinite(pub) || pub<=0 || pub>now)return;
+      const proof=this.one('SELECT title,body_hash FROM desk_snapshot WHERE article=?',p.article);
+      const full=n.is_limited!==true && n.is_paid!==true && !(Number(n.price)>0);
+      const actualHash=proof && full?await draftBodyHash(n.body):null;
+      const after=Object.hasOwn(n,'eyecatch')?coverId(n.eyecatch):null;
+      const title=proof?(proof.title===n.name?'一致':'相違'):'旧版・公開前の記録なし';
+      const body=proof?(actualHash?(actualHash===proof.body_hash?'一致':'公開前後のHTMLに差分あり'):'未確認'):'旧版・公開前の記録なし';
+      const image=after===null?'公開後の見出し画像は未確認':p.cover!==after?'公開前後で見出し画像が異なります。':
         after?'公開前後で見出し画像の参照先が一致':'公開前後とも見出し画像なし（自動サムネイルの見た目は未確認）';
-      this.rows('UPDATE '+table+' SET result=?,check_at=NULL WHERE article=?',result,p.article);
+      const result='同じ記事IDでnote公開中 ／ タイトル '+title+' ／ 本文 '+body+' ／ '+image;
+      this.storage.transactionSync(()=>{
+        this.registerEntries([{key:p.article,pub,title:n.name}],now);
+        this.rows('UPDATE desk_snapshot SET confirmed=COALESCE(confirmed,?) WHERE article=?',now,p.article);
+        this.rows("UPDATE desk_job SET phase='confirmed',message='同じ記事IDでnote公開中を確認',at=? WHERE kind='publish' AND target=? AND phase='sent'",now,p.article);
+        if(!p.link)this.rows('UPDATE desk_work SET article=?,pub=COALESCE(pub,?) WHERE seq=(SELECT seq FROM desk_work_cover WHERE article=?) AND (article IS NULL OR article=?)',p.article,pub,p.article,p.article);
+        this.rows('UPDATE '+table+' SET result=?,check_at=? WHERE article=?',result,!expired && (after===null || (proof && !actualHash))?now+HOUR:null,p.article);
+      });
     }catch{ /* A failed read leaves the result unknown; it never queues another publication. */ }
   }
   async tick() {
     this.init();
     const now=Date.now();
+    // A publication with a five-minute window gets the first use of this tick.
+    const publication=this.duePublication(now);
+    if(publication)await this.dispatch(now);
     await Promise.all([this.tickRecords(),this.automaticDirectory(now),this.catalogue(now),this.observeArchive(now),
       this.ensureRecommendation(now),this.frontPageBackup(now)]);
     this.planArchive(Date.now());
-    await this.dispatch(Date.now());
+    if(!publication)await this.dispatch(Date.now());
     await this.verifyLinkCover(Date.now());
+    await this.lookupDraftTitle(Date.now());
+    await this.scoutLiterary(Date.now());
   }
   async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
@@ -2906,12 +3056,11 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
-  if(s.linkPlans?.length){
-    lines.push('【共有リンクの公開予定】');
-    for(const p of s.linkPlans){
-      const status=p.pub?'公開確認済み':p.phase==='sent'?'公開操作済み・結果確認待ち':Date.now()>p.scheduled+5*M520?'時間枠終了・自動公開は保留':'予定あり';
-      lines.push(tm(p.scheduled)+'　'+(p.title||p.article)+'　'+status+(p.message?' ／ '+p.message:'')+(p.result?' ／ '+p.result:''));
-    }
+  if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ '+s.scout.message);
+  const checkedPlans=(s.linkPlans||[]).filter(p=>p.result || p.message);
+  if(checkedPlans.length){
+    lines.push('【予約作品の確認記録】');
+    for(const p of checkedPlans)lines.push(tm(p.scheduled)+'　'+(p.title||'登録した下書き')+' ／ '+(p.result||p.message));
   }
   if(s.delivery){
     lines.push('【自動公開・共同誌への追加　'+(s.deliveryOn?'ON':'休止中')+'】');
@@ -2946,6 +3095,23 @@ function deskRecordText(s) {
   for(const f of s.followers) lines.push(f.d+'　'+(f.value===null?f.state:f.value+'人　'+tm(f.at)));
   return lines.join('\n');
 }
+function publicationLinks(records){
+  if(!records)return [];
+  const rows=[];
+  const add=(key,title,when,published,state,detail)=>{
+    const safe=typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key);
+    rows.push({when:when.display,order:when.order,label:title || 'タイトル取得待ち',state,detail:detail||'',url:safe?(published?'https://note.com/43__/n/'+key:'https://editor.note.com/notes/'+key+'/edit/'):null});
+  };
+  for(const p of records.linkPlans||[]){
+    const state=p.confirmed?'noteで公開中を確認':p.pub?'公開一覧で確認':p.phase==='sent'?'公開操作済み・確認中':Date.now()>p.scheduled+5*M520?'時間枠終了・保留':'公開予定';
+    add(p.article,p.title,{display:time(p.scheduled),order:p.scheduled},!!p.pub,state,p.result||p.message);
+  }
+  for(const w of records.works||[]){
+    const state=w.confirmed?'noteで公開中を確認':w.pub?'公開一覧で確認':w.locked?'note予約済み（登録時の指定）':w.attemptedArticle?'公開操作済み・確認中':'登録済み';
+    add(w.article||w.draft||w.attemptedArticle,w.title,{display:w.d+' '+(w.t||w.suggested||'時刻未定'),order:Date.parse(w.d+'T'+(w.t||w.suggested||'00:00')+':00+09:00')},!!w.pub,state,w.coverResult);
+  }
+  return rows.sort((a,b)=>a.order-b.order);
+}
 function deskMagazineList(records) {
   if(!records)return '';
   const lines=records.imports.map(m=>m.name+' ／ '+(m.mode==='excluded'?'除外済み':m.allowed?m.state:m.memberReason||'運営資格を確認待ち'));
@@ -2968,8 +3134,8 @@ function deskPage(records=null,message='',status=200) {
     reserved?'「予約済み」の未公開作品はありません。':'上の「記録を開く」を押してください。';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.4.2</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.4.2</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<title>520 作品管理 v16.5</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.5</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
 <details><summary>下書きの共有リンクで予約</summary>
@@ -2986,7 +3152,7 @@ function deskPage(records=null,message='',status=200) {
 <div id="reservedlist">${reservedList}</div>
 <button id="unreserve" type="submit" name="work_action" value="clear_reserved"${reserved?.length?'':' disabled'}>選んだ作品の「予約済み」を外す</button>
 </details></form>
-<p id="msg" role="status" aria-live="polite">${esc(message)}</p>
+<p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#schedules">予約した作品を見る</a></p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
 <details><summary>自動公開・共同誌への追加を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
@@ -3009,7 +3175,7 @@ function deskPage(records=null,message='',status=200) {
 <button id="prep">選んだ写真の準備を再試行</button><div id="photos"></div></details>
 <details open><summary>既刊と新作の掲載先</summary><p id="catalogue">${esc(catalogue)}</p><div id="archive">${deskArchiveList(archive)}</div>
 <button id="prevarchive" form="readform" type="submit" name="offset" value="${Math.max(0,(archive?.offset||0)-30)}"${archive?.offset?'':' disabled'}>前の30本</button><button id="nextarchive" form="readform" type="submit" name="offset" value="${(archive?.offset||0)+30}"${archive?.more?'':' disabled'}>次の30本</button></details>
-<h2>作品と計測</h2><pre id="result">${esc(records?.recordText??'管理用の鍵を入力し「記録を開く」を押してください。')}</pre>
+<h2 id="schedules">予約した作品</h2><div id="planlinks">${records?publicationLinks(records).map(p=>'<p>'+esc(p.when+' ／ '+p.state)+'<br>'+(p.url?'<a href="'+esc(p.url)+'" target="_blank" rel="noopener noreferrer">'+esc(p.label==='タイトル取得待ち'?'下書きを開く':p.label)+'</a>':esc(p.label))+(p.detail?'<small>'+esc(p.detail)+'</small>':'')+'</p>').join('')||'登録された予定はありません。':'「記録を開く」を押してください。'}</div><h2>作品と計測</h2><pre id="result">${esc(records?.recordText??'管理用の鍵を入力し「記録を開く」を押してください。')}</pre>
 <script nonce="${nonce}">${DESK_BROWSER_SCRIPT}</script></body></html>`;
   return new Response(html,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'same-origin','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}});
 }
@@ -3062,6 +3228,17 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   }
   function show(s){
     showArchive(s.archive);
+    const plans=$('planlinks');
+    if(plans){
+      plans.replaceChildren();
+      for(const p of s.publicationLinks||[]){
+        const el=line(plans,p.when+' ／ '+p.state);
+        if(p.url)external(el,p.label==='タイトル取得待ち'?'下書きを開く':p.label,p.url);
+        else el.append(' '+p.label);
+        if(p.detail){const detail=document.createElement('small');detail.textContent=p.detail;el.append(detail);}
+      }
+      if(!s.publicationLinks?.length)plans.textContent='登録された予定はありません。';
+    }
     const reserved=s.works.filter(w=>w.locked && w.pub==null && w.article==null);
     const list=$('reservedlist');
     list.replaceChildren();
