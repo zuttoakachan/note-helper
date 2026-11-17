@@ -1,4 +1,4 @@
-const VERSION = 'v15.3';
+const VERSION = 'v16.0';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -27,7 +27,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
-<h1>note-helper ${VERSION}</h1>
+<h1>note-helper ${VERSION}</h1><p><a href="/520">520の作品管理・記録</a></p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <pre>${esc(message)}</pre>
@@ -683,6 +683,7 @@ async function dashboard(original, settings, prefix = '') {
 export default {
   async fetch(request, original) {
     const url = new URL(request.url);
+    if (url.pathname === '/520') return deskRoute(request,original);
     if (url.pathname === '/' && request.method === 'GET') return page(undefined,url.searchParams.get('account') === '2' ? '2' : '1');
     if (url.pathname !== '/control' || request.method !== 'POST') return reply('Not found',false,404);
     if (request.headers.get('Origin') !== url.origin) return reply('操作画面を開き直してください。',false,403);
@@ -740,6 +741,7 @@ export default {
   async scheduled(event, original, ctx) {
     // Cronは予約の復旧専用。
     ctx.waitUntil(wakeScheduler(original));
+    ctx.waitUntil(deskTick(original));
   }
 };
 async function wakeScheduler(env) {
@@ -750,7 +752,19 @@ async function wakeScheduler(env) {
 }
 export class NoteScheduler {
   constructor(ctx, env) { this.ctx = ctx; this.env = env; this.busy = false; }
-  async fetch() {
+  async fetch(request) {
+    if (request) {
+      const path = new URL(typeof request === 'string' ? request : request.url).pathname;
+      if (path === '/desk/tick' || path === '/desk/admin') {
+        this.desk ||= new Desk520(this.ctx.storage);
+        if (path === '/desk/admin') return this.desk.admin(request);
+        if (!this.deskTicking) {
+          this.deskTicking = this.desk.tick().finally(() => { this.deskTicking = null; });
+        }
+        await this.deskTicking;
+        return new Response('OK');
+      }
+    }
     if (!this.busy) {
       const at = await this.ctx.storage.getAlarm();
       if (at === null || at < Date.now() - 300000) {
@@ -793,5 +807,631 @@ export class NoteScheduler {
       await this.ctx.storage.setAlarm(nextReset + 5000);
       console.warn('note-helper: D1 daily row read limit; alarm deferred to UTC reset');
     } finally { this.busy = false; }
+  }
+}
+// 「520」専用。既存のDOのSQLiteを使用。D1・Cookie・スキ送信処理には接続しない。
+const D520 = 86400000, M520 = 60000, WINDOW520 = 15*M520;
+const jstDay = t => new Date(t+9*HOUR).toISOString().slice(0,10);
+const jstStart = d => Date.parse(d+'T00:00:00+09:00');
+const monday520 = t => {
+  const midnight = jstStart(jstDay(t));
+  return midnight - ((new Date(midnight+9*HOUR).getUTCDay()+6)%7)*D520;
+};
+const genre520 = ['短編小説','小説','エッセイ','詩','散文','その他'];
+const method520 = ['本人執筆','AI補助','AI生成'];
+class Input520 extends Error {}
+function need520(condition,msg) { if (!condition) throw new Input520(msg); }
+function text520(v,max) { return typeof v==='string' && v.trim()!=='' && v.length<=max; }
+function date520(s) {
+  return typeof s==='string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(jstStart(s)) && jstDay(jstStart(s))===s;
+}
+function same520(a,b,fields) { return fields.every(k=>a[k]===b[k]); }
+function stub520(env) {
+  return env.SCHEDULER.get(env.SCHEDULER.idFromName('note-helper-210-seconds'));
+}
+async function deskTick(env) {
+  const r=await stub520(env).fetch('https://scheduler.internal/desk/tick');
+  if (!r.ok) throw Error('520 tick unavailable');
+}
+async function read520body(res, limit) {
+  if (Number(res.headers.get('content-length'))>limit) throw new Input520('データが大きすぎます。');
+  const reader=res.body?.getReader();
+  if (!reader) throw new Input520('データが空です。');
+  const decoder=new TextDecoder('utf-8',{fatal:true});
+  let size=0, result='';
+  try {
+    for (;;) {
+      const {value,done}=await reader.read();
+      if (done) break;
+      size+=value.byteLength;
+      if (size>limit) { await reader.cancel(); throw new Input520('1回の登録量を減らしてください。'); }
+      result+=decoder.decode(value,{stream:true});
+    }
+    return result+decoder.decode();
+  } finally { reader.releaseLock(); }
+}
+function deskJson(data,status=200) {
+  return Response.json(data,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+}
+async function deskRoute(request,env) {
+  if (request.method==='GET') return deskPage();
+  if (request.method!=='POST') return deskJson({error:'操作方法を確認してください。'},405);
+  if (request.headers.get('Origin')!==new URL(request.url).origin || !env.ADMIN_KEY || request.headers.get('Authorization')!=='Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)))
+    return deskJson({error:'管理用の鍵・操作元を確認してください。'},403);
+  try {
+    const input=JSON.parse(await read520body(request,2000000));
+    return await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
+  } catch(e) {
+    return deskJson({error:e instanceof Input520?e.message:e instanceof SyntaxError?'入力形式を確認してください。':'作品管理の保存先に接続できません。'},e instanceof Input520 || e instanceof SyntaxError?400:503);
+  }
+}
+function xmlValue520(raw) {
+  return raw.replace(/&(#x[\da-f]+|#\d+|amp|apos|gt|lt|quot);/gi,(_,k)=>{
+    if (k[0]!=='#') return ({amp:'&',apos:"'",gt:'>',lt:'<',quot:'"'})[k]??_;
+    const n=k[1]==='x'?parseInt(k.slice(2),16):Number(k.slice(1));
+    return n>=0 && n<=0x10ffff ? String.fromCodePoint(n) : _;
+  });
+}
+// Only direct RSS item children. CDATA descriptions may themselves contain markup.
+function rss520(xml) {
+  if (!/<rss[\s>]/i.test(xml) || !/<\/rss\s*>/i.test(xml) || /<!DOCTYPE/i.test(xml)) throw Error('RSS');
+  const rows=[], stack=[];
+  let row=null,channel=false;
+  const tokens=xml.matchAll(/<!\[CDATA\[([\s\S]*?)\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<\/?([\w:.-]+)(?:\s+(?:"[^"]*"|'[^']*'|[^>'"])*)?\s*\/?>|([^<]+)/g);
+  for(const m of tokens) {
+    const name=m[2]?.toLowerCase();
+    if(name) {
+      if(m[0].startsWith('</')) {
+        if(stack.pop()!==name) throw Error('RSS nesting');
+        if(name==='item' && row && stack.join('/')==='rss/channel') { rows.push(row); row=null; }
+      } else if(!m[0].endsWith('/>')) {
+        stack.push(name);
+        if(stack.length===2 && stack[0]==='rss' && name==='channel') channel=true;
+        if(stack.join('/')==='rss/channel/item') row={title:'',link:'',pubdate:''};
+      }
+    } else if(row && stack.length===4 && Object.hasOwn(row,stack[3])) {
+      row[stack[3]]+=m[1]??xmlValue520(m[3]??'');
+    }
+  }
+  if(stack.length || !channel) throw Error('RSS incomplete');
+  return rows;
+}
+function publicKey520(link) {
+  return /^https:\/\/note\.com\/43__\/n\/(n[a-z0-9]+)\/?$/.exec(link.trim())?.[1] || '';
+}
+function count520(obj,fields) {
+  for(const f of fields) if(Number.isSafeInteger(obj?.[f]) && obj[f]>=0) return obj[f];
+  return null;
+}
+function median520(a) {
+  a.sort((x,y)=>x-y);
+  const mid=Math.floor(a.length/2);
+  return a.length%2?a[mid]:(a[mid-1]+a[mid])/2;
+}
+const schema520 = [
+  'CREATE TABLE IF NOT EXISTS desk_cfg (id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 0, plan TEXT DEFAULT \'未確認\', started INTEGER, weekly_at INTEGER, rss_at INTEGER DEFAULT 0, rss_ok INTEGER DEFAULT 0, rss_msg TEXT DEFAULT \'未取得\', blocked INTEGER DEFAULT 0, tick_at INTEGER DEFAULT 0)',
+  'INSERT OR IGNORE INTO desk_cfg(id) VALUES(1)',
+  'CREATE TABLE IF NOT EXISTS desk_work (seq INTEGER PRIMARY KEY,title TEXT NOT NULL, body TEXT NOT NULL, d TEXT NOT NULL,t TEXT NOT NULL, locked INTEGER NOT NULL,draft TEXT NOT NULL, genre TEXT NOT NULL, method TEXT NOT NULL, chars INTEGER NOT NULL, suggested TEXT, article TEXT UNIQUE,pub INTEGER, magazine TEXT, UNIQUE(d,title))',
+  'CREATE UNIQUE INDEX IF NOT EXISTS desk_draft ON desk_work(draft) WHERE draft<>\'\'',
+  'CREATE INDEX IF NOT EXISTS desk_plan ON desk_work(d,seq)',
+  'CREATE INDEX IF NOT EXISTS desk_pub ON desk_work(pub)',
+  'CREATE TABLE IF NOT EXISTS desk_sample(seq INTEGER, age INTEGER, due INTEGER NOT NULL, value INTEGER, at INTEGER, state TEXT DEFAULT \'待機\',last_try INTEGER DEFAULT 0,PRIMARY KEY(seq,age))',
+  'CREATE INDEX IF NOT EXISTS desk_due ON desk_sample(due) WHERE state=\'待機\'',
+  'CREATE TABLE IF NOT EXISTS desk_follower(d TEXT PRIMARY KEY,value INTEGER,at INTEGER,state TEXT)',
+  'CREATE TABLE IF NOT EXISTS desk_week(start TEXT PRIMARY KEY, delta INTEGER, avg7 REAL, eligible INTEGER, measured INTEGER, final INTEGER)',
+  'CREATE TABLE IF NOT EXISTS desk_mag(url TEXT PRIMARY KEY, name TEXT NOT NULL, rules TEXT NOT NULL, policy TEXT NOT NULL, active INTEGER DEFAULT 0, last_check INTEGER DEFAULT 0, recent INTEGER DEFAULT 0, rss_state TEXT DEFAULT \'未取得\')',
+  'CREATE TABLE IF NOT EXISTS desk_placement(seq INTEGER, url TEXT, name TEXT, observed INTEGER, PRIMARY KEY(seq,url))',
+  'CREATE TABLE IF NOT EXISTS desk_probe(id INTEGER PRIMARY KEY, at INTEGER DEFAULT 0, rss TEXT, creator TEXT, article TEXT)',
+  'INSERT OR IGNORE INTO desk_probe(id) VALUES(1)',
+  'CREATE TABLE IF NOT EXISTS desk_photo(hash TEXT PRIMARY KEY, jpeg BLOB NOT NULL, caption TEXT NOT NULL, added INTEGER NOT NULL, shared INTEGER)'
+];
+class Desk520 {
+  constructor(storage) { this.storage=storage; this.ready=false; this.pendingReads=new Map(); }
+  rows(q,...a) { return this.storage.sql.exec(q,...a).toArray(); }
+  one(q,...a) { return this.rows(q,...a)[0]; }
+  init() {
+    if(this.ready) return;
+    if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_photo'"))
+      this.storage.transactionSync(()=>{ for(const q of schema520) this.rows(q); });
+    this.ready=true;
+  }
+  async admin(req) {
+    try {
+      const input=await req.json();
+      this.init();
+      const now=Date.now();
+      switch(input.action) {
+        case 'status': break;
+        case 'setup': {
+          need520(['未確認','通常（予約なし）','予約ボタンを確認済み'].includes(input.plan),'予約機能の確認結果を選んでください。');
+          this.rows('UPDATE desk_cfg SET enabled=1,plan=?,started=COALESCE(started,?),weekly_at=COALESCE(weekly_at,?) WHERE id=1',input.plan,now,monday520(now));
+          break;
+        }
+        case 'works': {
+          need520(Array.isArray(input.works) && input.works.length>0 && input.works.length<=100,'一度に1〜100本の完成稿を指定してください。');
+          this.storage.transactionSync(()=>{ for(const w of input.works) this.addWork(w); this.planTimes(now); this.match(now); });
+          break;
+        }
+        case 'mag': this.saveMag(input); this.match(now); break;
+        case 'revoke': this.storage.transactionSync(()=>{
+          this.rows('UPDATE desk_mag SET active=0 WHERE url=?',input.url);
+          this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',input.url);
+        }); break;
+        case 'photo': await this.savePhoto(input,now); break;
+        case 'shared':
+          need520(input.confirm===true && this.one('SELECT hash FROM desk_photo WHERE hash=?',input.hash),'note側で共有済みを確認してください。');
+          this.rows('UPDATE desk_photo SET shared=COALESCE(shared,?) WHERE hash=?',now,input.hash);
+          break;
+        case 'download': {
+          const p=this.one('SELECT jpeg FROM desk_photo WHERE hash=?',input.hash);
+          need520(p,'画像がありません。');
+          return new Response(p.jpeg,{headers:{'Content-Type':'image/jpeg','Cache-Control':'no-store','Content-Disposition':'attachment; filename="520-gallery.jpg"'}});
+        }
+        default: throw new Input520('操作を選んでください。');
+      }
+      return deskJson(this.view());
+    } catch(e) {
+      return deskJson({error:e instanceof Input520?e.message:'保存・読み出しを確認できません。管理画面を開き直してください。'},e instanceof Input520?400:503);
+    }
+  }
+  addWork(w) {
+    need520(w && Number.isSafeInteger(w.seq) && w.seq>0 && w.seq<=999999 && text520(w.title,300) && w.title.trim()!=='521' && text520(w.body,240000),'順番・タイトル・完成稿を確認してください。固定記事「521」は登録できません。');
+    need520(date520(w.d) && typeof w.t==='string' && (w.t==='' || /^([01]\d|2[0-3]):[0-5]\d$/.test(w.t)),'公開日と日本時間の時刻を確認してください。');
+    need520(typeof w.locked==='boolean' && typeof w.draft==='string' && (!w.draft || /^n[a-z0-9]{1,60}$/.test(w.draft)) && genre520.includes(w.genre) && method520.includes(w.method),'予約済み・記事ID・ジャンル・制作方法を確認してください。');
+    const keys=['seq','title','body','d','t','draft','locked','genre','method'];
+    const a={...w,locked:Number(w.locked)};
+    const old=this.one('SELECT * FROM desk_work WHERE seq=?',w.seq);
+    if(old) { need520(same520(old,a,keys),'その順番に別の登録があります。登録済みの完成稿は保持しました。'); return; }
+    need520(!this.one("SELECT seq FROM desk_work WHERE (d=? AND title=?) OR (draft<>'' AND draft=?) LIMIT 1",w.d,w.title,w.draft),'同じ作品が登録済みです。');
+    need520(!this.one("SELECT seq FROM desk_work WHERE (seq<? AND (d>? OR (d=? AND t<>'' AND ?<>'' AND t>?))) OR (seq>? AND (d<? OR (d=? AND t<>'' AND ?<>'' AND t<?))) LIMIT 1",
+      w.seq,w.d,w.d,w.t,w.t,w.seq,w.d,w.d,w.t,w.t),'指定した順番と公開日時が逆転しています。');
+    this.rows('INSERT INTO desk_work(seq,title,body,d,t,draft,locked,genre,method,chars) VALUES(?,?,?,?,?,?,?,?,?,?)',...keys.map(k=>a[k]),[...w.body.replace(/\r\n|[\r\n]/g,'')].length);
+    // A new fixed time on this date can constrain a previous tentative time.
+    if(w.t) this.rows("UPDATE desk_work SET suggested=NULL WHERE d=? AND pub IS NULL AND locked=0 AND ((seq<? AND suggested>?) OR (seq>? AND suggested<?))",w.d,w.seq,w.t,w.seq,w.t);
+  }
+  planTimes(now) {
+    const works=this.rows("SELECT seq,d,genre FROM desk_work WHERE t='' AND locked=0 AND pub IS NULL AND suggested IS NULL AND d>=? ORDER BY seq",jstDay(now));
+    for(const w of works) {
+      const samples=this.rows('SELECT w.pub,s.value FROM desk_work w JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.genre=? AND s.value IS NOT NULL AND w.pub>=? AND w.pub<? ORDER BY w.pub DESC LIMIT 200',w.genre,now-365*D520,now);
+      const bins=new Map(),dow=t=>new Date(t+9*HOUR).getUTCDay(),weekend=t=>[0,6].includes(dow(t));
+      for(const p of samples) {
+        if(weekend(p.pub)!==weekend(jstStart(w.d))) continue;
+        const h=new Date(p.pub+9*HOUR).getUTCHours();
+        if(!bins.has(h)) bins.set(h,[]);
+        bins.get(h).push(p.value);
+      }
+      const scores=[...bins].filter(([,v])=>v.length>=3).map(([h,v])=>[h,median520(v)]).sort((a,b)=>b[1]-a[1]||a[0]-b[0]);
+      if(scores.length<2 || scores[0][1]===scores[1][1]) continue;
+      const winner=bins.get(scores[0][0]);
+      if(median520(winner.slice(0,-1))<=scores[1][1]) continue;
+      const t=String(scores[0][0]).padStart(2,'0')+':00';
+      if(jstStart(w.d)+scores[0][0]*HOUR<=now) continue;
+      if(!this.one("SELECT seq FROM desk_work WHERE d=? AND ((seq<? AND COALESCE(NULLIF(t,''),suggested)>?) OR (seq>? AND COALESCE(NULLIF(t,''),suggested)<?)) LIMIT 1",w.d,w.seq,t,w.seq,t))
+        this.rows('UPDATE desk_work SET suggested=? WHERE seq=? AND suggested IS NULL',t,w.seq);
+    }
+  }
+  saveMag(m) {
+    need520(m.member===true && m.permit===true && m.literary===true && m.conditions===true,'参加・許可・文芸・募集条件をすべて確認したものだけ登録できます。');
+    need520(typeof m.url==='string' && /^https:\/\/note\.com\/(?:[a-zA-Z0-9_-]+\/)?m\/m[a-z0-9]+$/.test(m.url) && text520(m.name,100),'マガジンのnote URLと名前を確認してください。');
+    let rules;
+    try { rules=new URL(m.rules); } catch {}
+    need520(rules?.origin==='https://note.com' && !rules.username && !rules.password && !rules.search && !rules.hash,'募集条件が載った公開noteのURLを入力してください。');
+    need520(Array.isArray(m.genres) && m.genres.length && m.genres.every(v=>genre520.includes(v)) && Array.isArray(m.methods) && m.methods.length && m.methods.every(v=>method520.includes(v)),'受理されるジャンル・制作方法を選んでください。');
+    need520(Number.isInteger(m.min) && Number.isInteger(m.max) && m.min>=0 && m.min<=m.max && m.max<=1000000,'字数範囲を確認してください。');
+    const policy=JSON.stringify({genres:[...new Set(m.genres)],methods:[...new Set(m.methods)],min:m.min,max:m.max});
+    this.storage.transactionSync(()=>{
+      this.rows('INSERT INTO desk_mag(url,name,rules,policy,active) VALUES(?,?,?,?,1) ON CONFLICT(url) DO UPDATE SET name=excluded.name,rules=excluded.rules,policy=excluded.policy,active=1,last_check=0',m.url,m.name,rules.href,policy);
+      this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',m.url);
+    });
+  }
+  async savePhoto(p,now) {
+    need520(p.allowed===true && text520(p.caption,100) && typeof p.jpeg==='string' && p.jpeg.length<=1500000,'自作・共有可の写真と短い説明を確認してください。');
+    let bytes;
+    try { bytes=Uint8Array.from(atob(p.jpeg),c=>c.charCodeAt(0)); } catch {}
+    need520(bytes && bytes.length>20,'JPEGを読み込めません。');
+    bytes=cleanJpeg520(bytes);
+    const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),x=>x.toString(16).padStart(2,'0')).join('');
+    this.rows('INSERT OR IGNORE INTO desk_photo(hash,jpeg,caption,added) VALUES(?,?,?,?)',digest,bytes.buffer,p.caption,now);
+  }
+  view() {
+    const cfg=this.one('SELECT enabled,plan,rss_ok,rss_msg,tick_at,started,blocked FROM desk_cfg WHERE id=1');
+    return {cfg,probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:this.rows('SELECT seq,title,d,t,locked,genre,chars,suggested,article,pub,m.name AS magazine FROM desk_work w LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY seq'),
+      placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
+      samples:this.rows('SELECT seq,age,due,value,at,state FROM desk_sample ORDER BY seq,age'),
+      followers:this.rows('SELECT * FROM desk_follower ORDER BY d DESC LIMIT 60'),
+      weeks:this.rows('SELECT * FROM desk_week ORDER BY start DESC LIMIT 104'),
+      mags:this.rows('SELECT url,name,rules,active,recent,last_check,rss_state FROM desk_mag WHERE active=1 ORDER BY name'),
+      photos:this.rows('SELECT hash,caption,added,shared FROM desk_photo ORDER BY added DESC')};
+  }
+  publicRead(path,format) {
+    const existing=this.pendingReads.get(path);
+    if(existing) return existing;
+    const task=this.fetchPublic(path,format).finally(()=>this.pendingReads.delete(path));
+    this.pendingReads.set(path,task);
+    return task;
+  }
+  async fetchPublic(path,format) {
+    const now=Date.now();
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now) throw Error('wait');
+    const res=await fetch(path,{method:'GET',redirect:'error',cache:'no-store',headers:{Accept:format==='json'?'application/json':'application/rss+xml, application/xml, text/xml'},signal:AbortSignal.timeout(7500)});
+    if(!res.ok) {
+      const raw=res.headers.get('Retry-After');
+      let hold=raw && (/^\d+$/.test(raw)?now+Number(raw)*1000:Date.parse(raw));
+      if(res.status===429 || hold>now) {
+        if(!Number.isSafeInteger(hold) || hold<=now) hold=now+HOUR;
+        this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',hold);
+      }
+      await res.body?.cancel(); throw Error('public read unavailable');
+    }
+    const body=await read520body(res,3000000);
+    return format==='json'?JSON.parse(body):rss520(body);
+  }
+  async probe(now) {
+    const old=this.one('SELECT * FROM desk_probe WHERE id=1');
+    if(old.at && (now-old.at<D520 || (old.rss==='取得可' && old.creator==='取得可' && old.article==='取得可'))) return;
+    this.rows('UPDATE desk_probe SET at=? WHERE id=1',now);
+    const fail='未確認・公開情報を取得できません';
+    const creator=async()=>{
+      try { const d=(await this.publicRead('https://note.com/api/v2/creators/43__','json'))?.data;
+        return d?.urlname==='43__' && count520(d,['followerCount','follower_count'])!==null?'取得可':fail;
+      } catch { return fail; }
+    };
+    const feed=async()=>{
+      let items;
+      try { items=await this.publicRead('https://note.com/43__/rss','rss'); } catch { return [fail,fail]; }
+      const e=items.find(v=>v.title.trim()!=='521' && publicKey520(v.link));
+      if(!e) return ['取得可','確認用の公開作品なし'];
+      const key=publicKey520(e.link);
+      try {
+        const d=(await this.publicRead('https://note.com/api/v3/notes/'+key,'json'))?.data;
+        return ['取得可',d?.key===key && d?.user?.urlname==='43__' && count520(d,['likeCount','like_count'])!==null?'取得可':fail];
+      } catch { return ['取得可',fail]; }
+    };
+    const [c,[rss,a]]=await Promise.all([creator(),feed()]);
+    this.rows('UPDATE desk_probe SET rss=?,creator=?,article=? WHERE id=1',rss,c,a);
+  }
+  async feed(now) {
+    if(!this.one('SELECT seq FROM desk_work WHERE pub IS NULL AND d<=? LIMIT 1',jstDay(now))) return;
+    const cfg=this.one('SELECT rss_at FROM desk_cfg WHERE id=1');
+    if(now<cfg.rss_at) return;
+    this.rows('UPDATE desk_cfg SET rss_at=? WHERE id=1',now+16*M520);
+    try {
+      let newDue=false;
+      const items=await this.publicRead('https://note.com/43__/rss','rss');
+      const entries=items.map(r=>({title:r.title,key:publicKey520(r.link),pub:Date.parse(r.pubdate)})).filter(i=>i.key && Number.isFinite(i.pub) && i.pub>0 && i.pub<=Date.now() && i.title.trim()!=='521');
+      this.storage.transactionSync(()=>{
+        const changedWeeks=new Set();
+        for(const e of entries) {
+          const w=this.one("SELECT seq,draft FROM desk_work WHERE pub IS NULL AND title=? AND (draft=? OR (draft='' AND d=?)) ORDER BY (draft=?) DESC LIMIT 1",e.title,e.key,jstDay(e.pub),e.key);
+          if(!w || (!w.draft && entries.some(other=>other.key!==e.key && other.title===e.title && jstDay(other.pub)===jstDay(e.pub)))) continue;
+          if(this.one('SELECT seq FROM desk_work WHERE article=?',e.key)) continue;
+          this.rows('UPDATE desk_work SET article=?,pub=? WHERE seq=? AND pub IS NULL',e.key,e.pub,w.seq);
+          changedWeeks.add(monday520(e.pub));
+          for(const n of [1,7]) {
+            const due=e.pub+n*D520;
+            this.rows('INSERT OR IGNORE INTO desk_sample(seq,age,due) VALUES(?,?,?)',w.seq,n,due);
+            if(due<=now && now<due+WINDOW520) newDue=true;
+          }
+        }
+        for(const start of changedWeeks) {
+          if(this.one('SELECT start FROM desk_week WHERE start=?',jstDay(start))) this.writeWeek(start,Date.now());
+        }
+        this.rows("UPDATE desk_cfg SET rss_ok=?,rss_msg='取得済み' WHERE id=1",Date.now());
+      });
+      return newDue;
+    } catch { this.rows("UPDATE desk_cfg SET rss_msg='取得失敗・再確認待ち' WHERE id=1"); }
+  }
+  async followers(now) {
+    const d=jstDay(now), target=jstStart(d)+12*HOUR;
+    if(now<target) return;
+    const row=this.one('SELECT state FROM desk_follower WHERE d=?',d);
+    if(row && row.state!=='再確認待ち') return;
+    let value=null,at=null;
+    if(now<target+WINDOW520) {
+      try {
+        const data=(await this.publicRead('https://note.com/api/v2/creators/43__','json'))?.data;
+        if(data?.urlname==='43__') value=count520(data,['followerCount','follower_count']);
+        at=Date.now();
+      } catch {}
+    }
+    const expired=Date.now()>=target+WINDOW520;
+    if(expired) value=null;
+    const state=value!==null?'記録済み':expired?'欠測':'再確認待ち';
+    this.rows('INSERT INTO desk_follower(d,value,at,state) VALUES(?,?,?,?) ON CONFLICT(d) DO UPDATE SET value=excluded.value,at=excluded.at,state=excluded.state',d,value,value===null?null:at,state);
+  }
+  async measure(now) {
+    this.rows("UPDATE desk_sample SET state='欠測' WHERE state='待機' AND due<=?",now-WINDOW520);
+    const due=this.rows("SELECT s.seq,s.age,s.due,w.article FROM desk_sample s JOIN desk_work w ON w.seq=s.seq WHERE s.state='待機' AND s.due<=? AND s.last_try<=? ORDER BY s.last_try,s.due,s.seq LIMIT 8",now,now-2*M520);
+    // Independent public reads in small batches; leave capacity for the existing watchdog.
+    for(let i=0;i<due.length;i+=4) {
+      await Promise.all(due.slice(i,i+4).map(async s=>{
+        this.rows('UPDATE desk_sample SET last_try=? WHERE seq=? AND age=?',now,s.seq,s.age);
+        try {
+          const data=(await this.publicRead('https://note.com/api/v3/notes/'+s.article,'json'))?.data;
+          if(data?.key!==s.article || data?.user?.urlname!=='43__') return;
+          const n=count520(data,['likeCount','like_count']),at=Date.now();
+          if(n!==null && at<s.due+WINDOW520) this.rows("UPDATE desk_sample SET value=?,at=?,state='記録済み' WHERE seq=? AND age=? AND state='待機'",n,at,s.seq,s.age);
+        } catch {}
+      }));
+    }
+  }
+  async magazines(now) {
+    const m=this.one('SELECT url FROM desk_mag WHERE active=1 AND last_check<? ORDER BY last_check,url LIMIT 1',now-D520);
+    if(!m) return;
+    this.rows('UPDATE desk_mag SET last_check=? WHERE url=?',now,m.url);
+    try {
+      const entries=await this.publicRead(m.url+'/rss','rss');
+      const dates=entries.filter(e=>/^https:\/\/note\.com\/[\w-]+\/n\/n[a-z0-9]+\/?$/.test(e.link.trim())).map(e=>Date.parse(e.pubdate)).filter(t=>t>0 && t<=now);
+      this.storage.transactionSync(()=>{
+        this.rows("UPDATE desk_mag SET recent=?,rss_state='取得済み' WHERE url=? AND active=1",dates.length?Math.max(...dates):0,m.url);
+        for(const item of entries) {
+          const key=publicKey520(item.link);
+          if(key) this.rows('INSERT OR IGNORE INTO desk_placement(seq,url,name,observed) SELECT w.seq,m.url,m.name,? FROM desk_work w,desk_mag m WHERE w.article=? AND m.url=? AND m.active=1',now,key,m.url);
+        }
+      });
+      return true;
+    } catch {
+      this.rows("UPDATE desk_mag SET rss_state='取得失敗・再確認待ち' WHERE url=? AND active=1",m.url);
+    }
+  }
+  match(now) {
+    const mags=this.rows('SELECT url,policy,recent FROM desk_mag WHERE active=1 AND recent>=? ORDER BY url',now-60*D520)
+      .map(m=>({...m,p:JSON.parse(m.policy)}));
+    for(const w of this.rows('SELECT seq,chars,genre,method,magazine FROM desk_work WHERE (pub IS NULL OR pub>=?)',now-30*D520)) {
+      const valid=mags.filter(({p})=>p.genres.includes(w.genre) && p.methods.includes(w.method) && w.chars>=p.min && w.chars<=p.max);
+      if(valid.some(m=>m.url===w.magazine)) continue;
+      valid.sort((a,b)=>a.p.genres.length-b.p.genres.length || (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
+      const url=valid[0]?.url??null;
+      if(url!==w.magazine) this.rows('UPDATE desk_work SET magazine=? WHERE seq=?',url,w.seq);
+    }
+  }
+  writeWeek(start,now) {
+    const end=start+7*D520;
+    const a=this.one('SELECT value FROM desk_follower WHERE d=?',jstDay(start))?.value;
+    const b=this.one('SELECT value FROM desk_follower WHERE d=?',jstDay(end))?.value;
+    const row=this.one('SELECT COUNT(w.seq) AS eligible,COUNT(s.value) AS measured,AVG(s.value) AS avg7 FROM desk_work w LEFT JOIN desk_sample s ON s.seq=w.seq AND s.age=7 WHERE w.pub>=? AND w.pub<?',start,end);
+    const final=Number(now>=end+7*D520+WINDOW520);
+    this.rows('INSERT OR REPLACE INTO desk_week(start,delta,avg7,eligible,measured,final) VALUES(?,?,?,?,?,?)',jstDay(start),Number.isInteger(a)&&Number.isInteger(b)?b-a:null,row.avg7,row.eligible,row.measured,final);
+    return final;
+  }
+  weekly(now) {
+    const cfg=this.one('SELECT weekly_at,started FROM desk_cfg WHERE id=1');
+    for(let start=cfg.weekly_at,n=0;start && start+7*D520+12*HOUR+WINDOW520<=now && n<6;start+=7*D520,n++) {
+      const end=start+7*D520;
+      const final=this.storage.transactionSync(()=>{
+        const final=this.writeWeek(start,now);
+        if(final) this.rows('UPDATE desk_cfg SET weekly_at=? WHERE id=1',end);
+        return final;
+      });
+      if(!final) break;
+    }
+  }
+  async tick() {
+    this.init();
+    const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
+    if(!cfg.enabled || now-cfg.tick_at<2*M520) return;
+    this.rows('UPDATE desk_cfg SET tick_at=? WHERE id=1',now);
+    // Catch up whole missed days without inventing follower values.
+    const previous=cfg.tick_at || cfg.started;
+    const from=Math.max(jstStart(jstDay(previous)),jstStart(jstDay(now))-90*D520);
+    for(let t=from;t<jstStart(jstDay(now));t+=D520) {
+      this.rows("INSERT INTO desk_follower(d,state) VALUES(?,'欠測') ON CONFLICT(d) DO UPDATE SET state='欠測' WHERE value IS NULL",jstDay(t));
+    }
+    const hourly=!cfg.tick_at || Math.floor(cfg.tick_at/HOUR)!==Math.floor(now/HOUR);
+    const [,,newDue,magUpdated]=await Promise.all([this.followers(now),this.measure(now),this.feed(now),this.magazines(now),hourly && this.probe(now)]);
+    if(newDue) await this.measure(Date.now());
+    if(hourly || magUpdated || cfg.rss_at>0 && cfg.rss_at<=now) this.match(now);
+    if(hourly) this.weekly(Date.now());
+    if(!cfg.tick_at || jstDay(cfg.tick_at)!==jstDay(now)) this.planTimes(now);
+  }
+}
+// Keep only JPEG image-coding segments. Drop APP0–APP15, COM and everything after EOI.
+function cleanJpeg520(bytes) {
+  const bad=()=>{throw new Input520('写真をJPEGに変換できません。別の写真を選んでください。');};
+  if(bytes[0]!==255 || bytes[1]!==216) bad();
+  const parts=[bytes.subarray(0,2)]; let at=2,scan=false,frame=false,scans=0;
+  while(at<bytes.length) {
+    if(scan) {
+      const start=at;
+      while(at<bytes.length) {
+        if(bytes[at]!==255){at++;continue;}
+        let next=at+1;
+        while(bytes[next]===255) next++;
+        if(bytes[next]===0 || (bytes[next]>=208 && bytes[next]<=215)){at=next+1;continue;}
+        break;
+      }
+      parts.push(bytes.subarray(start,at)); scan=false;
+    }
+    const start=at;
+    if(bytes[at++]!==255) bad();
+    while(bytes[at]===255) at++;
+    const code=bytes[at++];
+    if(code===217) {
+      if(!frame || !scans) bad();
+      parts.push(Uint8Array.of(255,217));
+      const out=new Uint8Array(parts.reduce((n,p)=>n+p.length,0)); let off=0;
+      for(const part of parts){out.set(part,off);off+=part.length;}
+      return out;
+    }
+    const len=bytes[at]*256+bytes[at+1];
+    if(!Number.isInteger(len) || len<2 || at+len>bytes.length) bad();
+    if(code===192 || code===193 || code===194) {
+      if(len<8) bad();
+      const h=bytes[at+3]*256+bytes[at+4],w=bytes[at+5]*256+bytes[at+6];
+      if(!h||!w||h>2400||w>2400) bad();
+      frame=true;
+    }
+    if(code===218) {scan=true;scans++;}
+    const allowed=[192,193,194,196,218,219,221].includes(code);
+    if(allowed) parts.push(bytes.subarray(start,at+len));
+    else if(!(code>=224 && code<=239) && code!==254) bad();
+    at+=len;
+  }
+  bad();
+}
+function deskPage() {
+  const nonce=crypto.randomUUID().replaceAll('-','');
+  const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>520 作品管理</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<label>管理用の鍵<input id="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></label><button id="load">記録を開く</button><p id="msg" role="status"></p>
+<details open><summary>初回設定</summary><p>520でnoteにログインし、下書きの「公開設定」→「予約投稿」→「日時を設定」が使えるか確認してください。予約済みの作品は開き直す必要はありません。</p>
+<label>520で確認した予約機能<select id="plan"><option>未確認</option><option>通常（予約なし）</option><option>予約ボタンを確認済み</option></select></label><button id="setup">自動記録を開始・設定を保存</button></details>
+<details><summary>完成稿と公開予定を登録</summary><p>11/19〜12/31分から、確定した順番で登録してください。新規予約はnote側の「公開設定」で行います。合う1誌が表示された場合は、その画面の「記事の追加」で同時掲載を指定できます。予約済みにチェックした作品の時刻は補いません。</p>
+<label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
+<label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
+<label>公開日<input id="d" type="date"></label><label>指定済みの時刻（任意）<input id="t" type="time"></label>
+<label><input type="checkbox" id="locked"> note側ですでに予約済み</label>
+<label>記事ID（任意・既存の下書きの n で始まるID）<input id="draft" autocapitalize="none" spellcheck="false"></label>
+<label>ジャンル<select id="genre">${genre520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
+<label>制作方法<select id="method"><option value="">選択してください</option>${method520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
+<button id="add">完成稿を登録</button>
+<details><summary>複数の完成稿を1回で登録（JSON）</summary><p>配列の各行に seq（順番）, title, body, d（YYYY-MM-DD）, t（HH:MM または空文字）, locked（予約済み true / false）, draft（記事IDまたは空文字）, genre, method を入れます。どれか1本に誤りがあれば一括登録全体を戻します。</p><label>JSONファイル<input id="batch" type="file" accept=".json,application/json"></label><button id="import">一括登録</button></details></details>
+<details><summary>参加済みマガジンを許可</summary><p>投稿済みの作品を受け入れる文芸系の共同運営マガジンだけが対象です。字数は改行を除く本文の文字数です。異なる数え方など、ここに表せない必須条件がある場合は登録を見送ってください。</p>
+<label>マガジン名<input id="magname"></label><label>マガジンのURL<input id="magurl" type="url"></label><label>募集条件が載ったnoteのURL<input id="rules" type="url"></label>
+<label>最少字数<input type="number" id="min" value="0"></label><label>最大字数（上限なしなら1000000）<input type="number" id="max" value="1000000"></label>
+<fieldset><legend>受け入れるジャンル</legend>${genre520.map(v=>'<label><input type="checkbox" name="genres" value="'+v+'">'+v+'</label>').join('')}</fieldset>
+<fieldset><legend>受け入れる制作方法</legend>${method520.map(v=>'<label><input type="checkbox" name="methods" value="'+v+'">'+v+'</label>').join('')}</fieldset>
+<label><input type="checkbox" id="member"> 520で参加済み・記事を追加する権限あり</label>
+<label><input type="checkbox" id="literary"> 文芸作品を扱う共同運営マガジン</label>
+<label><input type="checkbox" id="conditions"> 規約を確認。既発表可・作品タグや自己紹介は不要。その他の必須条件も満たす</label>
+<label><input type="checkbox" id="permit"> この掲載先を許可する</label><button id="mag">条件を登録・更新</button><div id="mags"></div></details>
+<details><summary>共有可の写真を準備</summary><p>「共有可」に入れた自分の写真をまとめて選べます。画素からJPEGと短い説明を作ります。被写体を一言添えることもできます。画面に保存されるのは加工したJPEGです。実際の共有は、noteアプリの「アカウント」→「アップロードした画像」で加工済みの画像を選び、「共有」を押します。</p>
+<label>写真<input id="photo" type="file" multiple accept="image/*"></label><label>被写体（任意・場所や氏名は不要）<input id="subject" maxlength="40"></label>
+<label><input id="allow" type="checkbox"> 自作で共有可に入れた写真です。作品のサムネの転用ではありません</label>
+<button id="prep">位置情報を除いた写真を準備</button><div id="photos"></div></details>
+<h2>作品と計測</h2><pre id="result">管理用の鍵を入力し「記録を開く」を押してください。</pre>
+<script nonce="${nonce}">(${deskBrowser.toString()})();</script></body></html>`;
+  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}});
+}
+function deskBrowser() {
+  const $=id=>document.getElementById(id);
+  const tm=t=>t?new Date(t).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}):'未記録';
+  const val=v=>v===null || v===undefined?'欠測':String(v);
+  const msg=s=>{$('msg').textContent=s;};
+  async function send(action,extra={}) {
+    const r=await fetch('/520',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+btoa(Array.from(new TextEncoder().encode($('key').value),x=>String.fromCharCode(x)).join(''))},body:JSON.stringify({action,...extra})});
+    if(r.ok && action==='download') return r.blob();
+    const s=await r.json();
+    if(!r.ok) throw Error(s.error || '操作を確認できません。');
+    show(s);
+  }
+  let busy=false;
+  function wrap(f){return async()=>{
+    if(busy) return;
+    busy=true;msg('処理中…');
+    try {const s=await f();msg(s || '読み込みました。');}
+    catch(e){msg(e.message || '操作を確認できません。');}
+    finally{busy=false;}
+  };}
+  function button(parent,label,fn){
+    const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=wrap(fn);parent.append(b);
+  }
+  function line(parent,s){const p=document.createElement('p');p.textContent=s;parent.append(p);return p;}
+  function show(s){
+    $('plan').value=s.cfg.plan;
+    if(!$('seq').value) $('seq').value=(s.works.at(-1)?.seq??0)+1;
+    const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
+      '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+    if(s.probe.at) lines.push('取得テスト '+tm(s.probe.at)+' ／ RSS '+(s.probe.rss||'確認中')+' ／ フォロワー '+(s.probe.creator||'確認中')+' ／ スキ '+(s.probe.article||'確認中'));
+    if(s.cfg.blocked>Date.now()) lines.push('note指定の待機 '+tm(s.cfg.blocked)+'まで');
+    lines.push('','【登録作品】');
+    const priority=w=>w.d>='2026-11-19' && w.d<='2026-12-31';
+    const displayed=[...s.works.filter(priority),...s.works.filter(w=>!priority(w))];
+    for(const w of displayed) {
+      lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
+        w.pub?'公開確認 '+tm(w.pub):'RSSでの公開確認待ち',
+        w.magazine?'条件に合う1誌 '+w.magazine+' ／ ツールからの掲載なし':s.mags.length?'確認済みの条件で該当する誌なし':'許可済みの掲載先なし');
+      for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
+      for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
+      lines.push('');
+    }
+    lines.push('【週次・日本時間の月〜日公開分】','フォロワーは月曜正午から翌月曜正午。平均は公開7日後に測れた作品だけ。');
+    for(const w of s.weeks) lines.push(w.start+'週　純増 '+val(w.delta)+' ／ 平均スキ '+(w.avg7===null?'欠測':w.avg7.toFixed(1))+' ／ 計測 '+w.measured+'本・対象 '+w.eligible+'本　'+(w.final?'確定':'7日後の計測中'));
+    lines.push('','【フォロワー数・毎日12:00から15分以内】');
+    for(const f of s.followers) lines.push(f.d+'　'+(f.value===null?f.state:f.value+'人　'+tm(f.at)));
+    $('result').textContent=lines.join('\n');
+    $('mags').replaceChildren();
+    for(const m of s.mags){
+      const p=line($('mags'),m.name+' ／ RSS '+m.rss_state+' ／ 確認した最新作品 '+tm(m.recent));
+      button(p,'この誌の許可を解除',async()=>{await send('revoke',{url:m.url});return '許可を解除しました。';});
+    }
+    $('photos').replaceChildren();
+    for(const p of s.photos){
+      const el=line($('photos'),p.caption+' ／ '+(p.shared?'共有済み（本人確認 '+tm(p.shared)+'）':'準備済み・未共有'));
+      button(el,'JPEGを保存',async()=>{
+        const blob=await send('download',{hash:p.hash}),u=URL.createObjectURL(blob);
+        const a=document.createElement('a');a.href=u;a.download='520-'+p.hash.slice(0,12)+'.jpg';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),60000);
+        return 'JPEGを用意しました。';
+      });
+      if(!p.shared) button(el,'noteでの共有済みを記録',async()=>{
+        if(!window.confirm('520のnoteで、この写真の「共有済み」を確認しましたか？')) return '記録を保留しました。';
+        await send('shared',{hash:p.hash,confirm:true});return '本人確認として記録しました。';
+      });
+    }
+  }
+  $('load').onclick=wrap(()=>send('status'));
+  $('setup').onclick=wrap(async()=>{await send('setup',{plan:$('plan').value});return '自動記録を開始しました。';});
+  $('add').onclick=wrap(async()=>{
+    const f=$('manuscript').files[0];
+    if(f && $('body').value) throw Error('本文とファイルのどちらか1つを入力してください。');
+    const w={seq:Number($('seq').value),title:$('title').value,body:f?await fileText(f):$('body').value,d:$('d').value,t:$('t').value,locked:$('locked').checked,
+      draft:$('draft').value.trim(),genre:$('genre').value,method:$('method').value};
+    await send('works',{works:[w]});
+    for(const k of ['body','title','manuscript','draft','d','t','method']) $(k).value='';
+    $('locked').checked=false;$('seq').value=w.seq+1;
+    return '完成稿を登録しました。';
+  });
+  async function fileText(f){
+    if(f.size>1800000) throw Error('ファイルが大きすぎます。分けて登録してください。');
+    return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(await f.arrayBuffer());
+  }
+  $('import').onclick=wrap(async()=>{
+    const f=$('batch').files[0];if(!f) throw Error('JSONを選んでください。');
+    const works=JSON.parse((await fileText(f)).replace(/^\uFEFF/,''));
+    await send('works',{works});return '一括登録しました。';
+  });
+  const picks=name=>[...document.querySelectorAll('input[name="'+name+'"]:checked')].map(o=>o.value);
+  $('mag').onclick=wrap(async()=>{
+    const m={url:$('magurl').value.trim().replace(/\/$/,''),name:$('magname').value,rules:$('rules').value,min:$('min').valueAsNumber,max:$('max').valueAsNumber,genres:picks('genres'),methods:picks('methods')};
+    for(const k of ['member','literary','conditions','permit']) m[k]=$(k).checked;
+    await send('mag',m);return 'この誌の条件を保存しました。';
+  });
+  $('prep').onclick=wrap(async()=>{
+    if(!$('allow').checked) throw Error('自作・共有可のチェックが必要です。');
+    const files=Array.from($('photo').files);
+    if(!files.length) throw Error('共有可の写真を選んでください。');
+    if(files.length>1 && $('subject').value.trim()) throw Error('複数の写真では被写体欄を空にしてください。各写真の色と明るさから説明を作ります。');
+    let done=0;
+    for(const f of files){
+      try {await prepareImage(f);done++;}
+      catch(e){throw Error(done+'枚準備済み。'+e.message);}
+    }
+    $('photo').value='';$('allow').checked=false;$('subject').value='';
+    return done+'枚を準備しました。写真欄からJPEGを保存できます。';
+  });
+  async function prepareImage(f) {
+    if(f.type && !/^image\/(jpeg|png|webp|avif|heic|heif|gif|tiff|bmp)$/i.test(f.type)) throw Error('JPEGまたはPNGの写真を選んでください。');
+    if(f.size>32*1024*1024) throw Error('32MB以内の読み込める写真を選んでください。');
+    const u=URL.createObjectURL(f);
+    try {
+      const im=new Image();im.src=u;
+      try{await im.decode();}catch{throw Error('この端末で開けるJPEGまたはPNGの写真を選んでください。');}
+      const scale=Math.min(1,1600/Math.max(im.naturalWidth,im.naturalHeight));
+      const c=document.createElement('canvas');c.width=Math.max(1,Math.round(im.naturalWidth*scale));c.height=Math.max(1,Math.round(im.naturalHeight*scale));
+      const ctx=c.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,c.width,c.height);ctx.drawImage(im,0,0,c.width,c.height);
+      const sample=document.createElement('canvas');sample.width=24;sample.height=24;
+      const sc=sample.getContext('2d');sc.drawImage(c,0,0,24,24);
+      const px=sc.getImageData(0,0,24,24).data;let r=0,g=0,b=0;
+      for(let i=0;i<px.length;i+=4){r+=px[i];g+=px[i+1];b+=px[i+2];}
+      const N=24*24,lum=(0.2126*r+0.7152*g+0.0722*b)/N;
+      const light=lum<85?'暗め':lum>175?'明るめ':'落ち着いた明るさ';
+      const hue=Math.max(r,g,b)-Math.min(r,g,b)<12*N?'色差の小さい':r===Math.max(r,g,b)?'赤みのある':b===Math.max(r,g,b)?'青みのある':'緑みのある';
+      const subject=$('subject').value.trim();
+      const caption=(subject?subject+'。':'')+light+'で'+hue+(c.width>c.height?'横長':c.width<c.height?'縦長':'正方形')+'の写真。';
+      let jpeg=c.toDataURL('image/jpeg',0.87).split(',')[1];
+      if(jpeg.length>1450000) jpeg=c.toDataURL('image/jpeg',0.65).split(',')[1];
+      await send('photo',{jpeg,caption,allowed:true});
+    }finally{URL.revokeObjectURL(u);}
   }
 }
