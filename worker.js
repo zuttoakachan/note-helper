@@ -1,4 +1,4 @@
-const VERSION = 'v16.2.1';
+const VERSION = 'v16.2.2';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -947,6 +947,11 @@ const schema520 = [
   'INSERT OR IGNORE INTO desk_probe(id) VALUES(1)',
   'CREATE TABLE IF NOT EXISTS desk_photo(hash TEXT PRIMARY KEY, jpeg BLOB NOT NULL, caption TEXT NOT NULL, added INTEGER NOT NULL, shared INTEGER)'
 ];
+// Only fixed, non-sensitive diagnostics are exposed in the private dashboard.
+class PublicReadError extends Error {}
+function publicReadReason(error){
+  return error instanceof PublicReadError?error.message:'内部の読み取り・保存処理を確認できません';
+}
 class Desk520 {
   constructor(storage) { this.storage=storage; this.ready=false; this.pendingReads=new Map(); }
   rows(q,...a) { return this.storage.sql.exec(q,...a).toArray(); }
@@ -1102,16 +1107,21 @@ class Desk520 {
   }
   async fetchPublic(path,format) {
     const now=Date.now();
-    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now) throw Error('wait');
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now) throw new PublicReadError('note指定の待機中');
     const canRedirect=format==='html' || format==='channel' || format==='issue' || (format==='rss' && !!noteLink161(path.replace(/\/rss$/,'')));
     let res,target=path;
     for(let n=0;n<3;n++) {
-      res=await fetch(target,{method:'GET',redirect:canRedirect?'manual':'error',cache:'no-store',headers:{Accept:format==='json'?'application/json':format==='html'?'text/html':'application/rss+xml, application/xml, text/xml'},signal:AbortSignal.timeout(7500)});
-      if(!canRedirect || ![301,302,303,307,308].includes(res.status))break;
+      try {
+        res=await fetch(target,{method:'GET',redirect:'manual',cache:'no-store',headers:{Accept:format==='json'?'application/json':format==='html'?'text/html':'application/rss+xml, application/xml, text/xml'},signal:AbortSignal.timeout(7500)});
+      } catch(error) {
+        const timeout=['AbortError','TimeoutError'].includes(error?.name);
+        throw new PublicReadError(timeout?'noteへの通信がタイムアウト':'noteから応答を受け取れません');
+      }
+      if(![301,302,303,307,308].includes(res.status))break;
       const location=res.headers.get('Location');
-      const next=location && directoryRedirect161(target,location);
+      const next=canRedirect && location && directoryRedirect161(target,location);
       await res.body?.cancel();
-      if(!next || next===target || n===2)throw Error('unexpected redirect');
+      if(!next || next===target || n===2)throw new PublicReadError('転送先を確認できません（HTTP '+res.status+'）');
       target=next;
     }
     if(!res.ok) {
@@ -1121,40 +1131,46 @@ class Desk520 {
         if(!Number.isSafeInteger(hold) || hold<=now) hold=now+HOUR;
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',hold);
       }
-      await res.body?.cancel(); throw Error('public read unavailable');
+      await res.body?.cancel(); throw new PublicReadError('note応答 HTTP '+res.status);
     }
-    const body=await read520body(res,3000000);
+    let body;
+    try {body=await read520body(res,3000000);}
+    catch {throw new PublicReadError('応答本文を読み取れません（空・サイズ・通信を確認）');}
     if(format==='html')return body;
-    return format==='json'?JSON.parse(body):rss520(body,format==='issue'?'issue':format==='channel');
+    try {return format==='json'?JSON.parse(body):rss520(body,format==='issue'?'issue':format==='channel');}
+    catch {throw new PublicReadError(format==='json'?'応答がJSON形式ではありません':'RSSの形式を読み取れません');}
   }
   async probe(now) {
     const old=this.one('SELECT * FROM desk_probe WHERE id=1');
-    if(old.at && (now-old.at<D520 || (old.rss==='取得可' && old.creator==='取得可' && old.article==='取得可'))) return;
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const legacy='未確認・公開情報を取得できません';
+    const verified=[old.rss,old.creator,old.article];
+    if(old.at && (verified.every(x=>x==='取得可') || (!verified.includes(legacy) && now-old.at<HOUR)))return;
     this.rows('UPDATE desk_probe SET at=? WHERE id=1',now);
-    const fail='未確認・公開情報を取得できません';
+    const mismatch='対象アカウントまたは数値の項目を確認できません';
     const creator=async()=>{
       try { const d=(await this.publicRead('https://note.com/api/v2/creators/43__','json'))?.data;
-        return d?.urlname==='43__' && count520(d,['followerCount','follower_count'])!==null?'取得可':fail;
-      } catch { return fail; }
+        return d?.urlname==='43__' && count520(d,['followerCount','follower_count'])!==null?'取得可':mismatch;
+      } catch(error) { return publicReadReason(error); }
     };
     const feed=async()=>{
       let items;
-      try { items=await this.publicRead('https://note.com/43__/rss','rss'); } catch { return [fail,fail]; }
+      try { items=await this.publicRead('https://note.com/43__/rss','rss'); } catch(error) { return [publicReadReason(error),'未実施（RSS取得後に確認）']; }
       const e=items.find(v=>v.title.trim()!=='521' && publicKey520(v.link));
       if(!e) return ['取得可','確認用の公開作品なし'];
       const key=publicKey520(e.link);
       try {
         const d=(await this.publicRead('https://note.com/api/v3/notes/'+key,'json'))?.data;
-        return ['取得可',d?.key===key && d?.user?.urlname==='43__' && count520(d,['likeCount','like_count'])!==null?'取得可':fail];
-      } catch { return ['取得可',fail]; }
+        return ['取得可',d?.key===key && d?.user?.urlname==='43__' && count520(d,['likeCount','like_count'])!==null?'取得可':mismatch];
+      } catch(error) { return ['取得可',publicReadReason(error)]; }
     };
     const [c,[rss,a]]=await Promise.all([creator(),feed()]);
     this.rows('UPDATE desk_probe SET rss=?,creator=?,article=? WHERE id=1',rss,c,a);
   }
   async feed(now) {
     const since=this.one('SELECT started FROM desk_growth WHERE id=1').started;
-    const cfg=this.one('SELECT rss_at FROM desk_cfg WHERE id=1');
-    if(now<cfg.rss_at) return;
+    const cfg=this.one('SELECT rss_at,rss_msg,blocked FROM desk_cfg WHERE id=1');
+    if(cfg.blocked>now || (now<cfg.rss_at && cfg.rss_msg!=='取得失敗・再確認待ち')) return;
     this.rows('UPDATE desk_cfg SET rss_at=? WHERE id=1',now+16*M520);
     try {
       let newDue=false;
@@ -1191,7 +1207,7 @@ class Desk520 {
         this.rows("UPDATE desk_cfg SET rss_ok=?,rss_msg='取得済み' WHERE id=1",Date.now());
       });
       return newDue;
-    } catch { this.rows("UPDATE desk_cfg SET rss_msg='取得失敗・再確認待ち' WHERE id=1"); }
+    } catch(error) { this.rows('UPDATE desk_cfg SET rss_msg=? WHERE id=1','再確認待ち：'+publicReadReason(error)); }
   }
   async followers(now) {
     const d=jstDay(now), target=jstStart(d)+12*HOUR;
@@ -1384,18 +1400,19 @@ class Desk520 {
   }
   async catalogue(now) {
     const cursor=this.one('SELECT * FROM desk_catalog WHERE id=1');
-    if(cursor.due>now || this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    const oldFailure=cursor.message===cursor.page+'ページ目を取得できません。RSSと公開ページで確認できる作品を引き続き収集します。';
+    if((cursor.due>now && !oldFailure) || this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
     const page=cursor.page;
     try {
       const data=(await this.publicRead('https://note.com/api/v2/creators/43__/contents?kind=note&page='+page,'json'))?.data;
       const items=data?.contents;
-      if(!Array.isArray(items) || items.length>100)throw Error('unrecognized page');
+      if(!Array.isArray(items) || items.length>100)throw new PublicReadError('記事一覧の項目を確認できません');
       const knownPage=data.page??data.currentPage;
-      if(knownPage!=null && Number(knownPage)!==page)throw Error('page mismatch');
+      if(knownPage!=null && Number(knownPage)!==page)throw new PublicReadError('記事一覧のページ番号が一致しません');
       const rawLast=data.isLastPage??data.is_last_page;
       const keys=items.map(n=>n?.key).filter(k=>typeof k==='string');
       const signature=keys.join(',');
-      if(page>1 && signature && signature===cursor.signature)throw Error('same page');
+      if(page>1 && signature && signature===cursor.signature)throw new PublicReadError('同じページが繰り返されました');
       let partial=false;
       this.storage.transactionSync(()=>{
         for(const n of items){
@@ -1413,8 +1430,8 @@ class Desk520 {
         this.rows('UPDATE desk_catalog SET page=?,due=?,signature=?,partial=?,message=? WHERE id=1',more?page+1:1,now+(more?4*M520:confirmed?7*D520:D520),more?signature:'',more?Number(incomplete):0,message);
       });
       if(partial || typeof rawLast!=='boolean')await this.archiveLinks(now);
-    } catch {
-      this.rows("UPDATE desk_catalog SET due=?,message=? WHERE id=1",now+HOUR,page+'ページ目を取得できません。RSSと公開ページで確認できる作品を引き続き収集します。');
+    } catch(error) {
+      this.rows('UPDATE desk_catalog SET due=?,message=? WHERE id=1',now+HOUR,page+'ページ目を取得できません（'+publicReadReason(error)+'）。RSSと公開ページでも作品を確認します。');
       await this.archiveLinks(now);
     }
   }
@@ -1719,7 +1736,9 @@ class Desk520 {
       this.rows("INSERT INTO desk_follower(d,state) VALUES(?,'欠測') ON CONFLICT(d) DO UPDATE SET state='欠測' WHERE value IS NULL",jstDay(t));
     }
     const hourly=!cfg.tick_at || Math.floor(cfg.tick_at/HOUR)!==Math.floor(now/HOUR);
-    const [,,newDue,magUpdated]=await Promise.all([this.followers(now),this.measure(now),this.feed(now),this.magazines(now),hourly && this.probe(now)]);
+    const checkProbe=hourly || !this.probeChecked;
+    this.probeChecked=true;
+    const [,,newDue,magUpdated]=await Promise.all([this.followers(now),this.measure(now),this.feed(now),this.magazines(now),checkProbe && this.probe(now)]);
     if(newDue) await this.measure(Date.now());
     if(hourly || magUpdated || cfg.rss_at>0 && cfg.rss_at<=now) this.match(now);
     if(hourly) this.weekly(Date.now());
@@ -2093,8 +2112,8 @@ function deskPage(records=null,message='',status=200) {
   const catalogue=archive?archive.message+' ／ 確認できた作品 '+archive.total+'本（固定記事を除く）':'';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.2.1</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.2.1</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<title>520 作品管理 v16.2.2</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.2.2</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p>
