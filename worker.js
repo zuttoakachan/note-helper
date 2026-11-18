@@ -1,4 +1,4 @@
-const VERSION = 'v16.6';
+const VERSION = 'v16.7';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -681,6 +681,7 @@ async function dashboard(original, settings, prefix = '') {
   return [prefix,...blocks,'今日の件数はv13導入後に成功を確認した分です。過去の送信結果を後から確認した分も、確認した日に計上します。以前の累計は保持します。予約の遅れやCloudflare全体の停止は、このツールから通知できない場合があります。'].filter(Boolean).join('\n\n──────────\n\n');
 }
 export default {
+  async email(message,env) { await receiveNoteInvite520(message,env); },
   async fetch(request, original) {
     const url = new URL(request.url);
     if (url.pathname === '/520') return deskRoute(request,original);
@@ -755,9 +756,15 @@ export class NoteScheduler {
   async fetch(request) {
     if (request) {
       const path = new URL(typeof request === 'string' ? request : request.url).pathname;
-      if (path === '/desk/tick' || path === '/desk/admin') {
+      if (path === '/desk/tick' || path === '/desk/admin' || path === '/desk/invitation') {
         this.desk ||= new Desk520(this.ctx.storage,this.env);
         if (path === '/desk/admin') return this.desk.admin(request,this.ctx);
+        if (path === '/desk/invitation') {
+          const input=await request.json();
+          if(input.id!==JOIN520.id)return deskJson({error:'Unexpected invitation'},400);
+          await this.desk.saveInvitation520(input.url,true);
+          return deskJson({saved:true});
+        }
         if (!this.deskTicking) {
           this.deskTicking = this.desk.tick().finally(() => { this.deskTicking = null; });
         }
@@ -894,6 +901,9 @@ async function deskRoute(request,env) {
           article:raw?sharedDraftKey(raw):match?match[1]:sharedDraftKey(''),d:form.get('link_date'),t:form.get('link_time')};
         if(match){input.original=match[1];input.expected=Number(match[2]);}
         if(match && action==='cancel_link' && input.article!==match[1])throw new Input520('取り消す予約と共有リンクが一致しません。');
+      }else if(['join_on','join_off','join_invite'].includes(form.get('work_action'))){
+        input=form.get('work_action')==='join_invite'?{action:'join_invite',url:(form.get('invite_url')||'').trim()}:
+          {action:'join_switch',enable:form.get('work_action')==='join_on'};
       }else if(form.get('work_action')==='scout'){
         input={action:'scout'};
       }else if(form.get('work_action')==='clear_reserved'){
@@ -913,7 +923,7 @@ async function deskRoute(request,env) {
     if(!isForm)return res;
     const data=await res.json();
     if(!res.ok){
-      if(res.status===400 && ['reserve_link','replace_link','cancel_link','preview_link','clear_reserved'].includes(input.action)){
+      if(res.status===400 && ['reserve_link','replace_link','cancel_link','preview_link','clear_reserved','join_invite','join_switch'].includes(input.action)){
         const overview=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:'status'})}));
         return overview.ok?deskPage(await overview.json(),data.error,400):failure(data.error,400);
       }
@@ -1074,11 +1084,12 @@ const noteIdentityJS=`(async()=>{if(location.origin!=='https://note.com')return 
       const r=await fetch('/api/v2/current_user',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
       if(!r.ok)return null;const j=await r.json(),d=j.data??j,u=d.user??d;return {id:String(u.id),name:u.urlname};})()`;
 async function inNoteBrowser(binding,cookie,allowEditor,action){
-  const session=await binding.acquire({keepAlive:15000,recording:false,
-    guardrails:{allowedDomains:['note.com','assets.st-note.com','*.st-note.com','*.note.com']}});
-  let socket;
+  let session, socket, stage='ブラウザーの起動';
   let retry=0, denied=0;
   try {
+    session=await binding.acquire({keepAlive:15000,recording:false,
+      guardrails:{allowedDomains:['note.com','assets.st-note.com','*.st-note.com','*.note.com']}});
+    stage='ブラウザーへの接続';
     const target=await binding.devtools.newTarget(session.sessionId);
     const link=await binding.connectSession(session.sessionId,{targetId:target.id});
     const upgrade=await link.webSocket.fetch('https://browser-binding.invalid',{headers:{Upgrade:'websocket'}});
@@ -1114,12 +1125,13 @@ async function inNoteBrowser(binding,cookie,allowEditor,action){
       const installed=await command('Network.setCookie',{url:'https://editor.note.com/',name:'_note_session_v5',value:cookie,secure:true,httpOnly:true,sameSite:'Lax'});
       if(installed.success===false)throw Error('editor session');
     }
+    stage='noteの画面との通信';
     return await action({command,evaluate,blocked,blockedResult});
   } catch {
-    return denied || retry>0?{message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:'noteの画面との通信を再確認待ち'};
+    return denied || retry>0?{message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:stage+'を完了できず・再確認待ち'};
   } finally {
     try {socket?.close();} catch {}
-    await binding.closeSession(session.sessionId).catch(()=>{});
+    if(session?.sessionId)await binding.closeSession(session.sessionId).catch(()=>{});
   }
 }
 
@@ -1592,7 +1604,11 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     const gate=await markAttempt(arg.key,job.kind==='publish'?{title:arg.title,cover,hash}:null);
     if(gate!==true)return {message:typeof gate==='string'?gate:'予定・待機・掲載条件を再確認待ち'};
     if(!blocked()){
-      await frame(finalStep,arg);
+      const result=await frame(finalStep,arg);
+      if(job.kind==='mag' && result==='already')return {seen:true,message:'noteの画面で追加済み・誌面での確認待ち'};
+      if(['missing','unsafe','mismatch','wrong'].includes(result))return {
+        notClicked:true,message:'操作直前に画面または条件が変わりました。ボタンは押していません。次回に確認します'};
+      if(result!=='clicked')return {message:'操作結果を確認できず・自動再送なし'};
       await pause520(1000);
     }
     return blocked()?blockedResult():{message:'操作記録済み・公開情報で結果を確認待ち'};
@@ -1699,6 +1715,13 @@ class Desk520 {
         this.rows('UPDATE desk_cfg SET rss_at=0 WHERE id=1');
       });
     }
+    if(!this.one("SELECT 1 FROM sqlite_master WHERE name='desk_task_health'")) {
+      this.storage.transactionSync(()=>{
+        this.rows("CREATE TABLE desk_task_health(task TEXT PRIMARY KEY,at INTEGER NOT NULL,failed INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '')");
+        this.rows("UPDATE desk_import SET due=0 WHERE allowed=1 AND state='保留' AND token=''");
+      });
+    }
+    this.initJoin520();
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -1760,6 +1783,14 @@ class Desk520 {
           this.rows('UPDATE desk_delivery SET enabled=? WHERE id=1',Number(input.enable));
           break;
         }
+        case 'join_switch':
+          need520(typeof input.enable==='boolean','自動申請の指定を確認してください。');
+          this.rows('UPDATE desk_join_cfg SET enabled=?,due=0 WHERE id=1',+input.enable);
+          correctionMessage=input.enable?'参加申請と招待の自動確認を再開しました。':'参加申請と招待の自動確認を休止しました。';
+          break;
+        case 'join_invite':
+          correctionMessage=await this.saveInvitation520(input.url);
+          break;
         case 'find_mags': await this.discoverMagazines(now,true); break;
         case 'scout': correctionMessage=await this.scoutLiterary(now); break;
         case 'mag_source': {
@@ -1774,6 +1805,7 @@ class Desk520 {
           const id=link.id, storedUrl=saved?.url||link.url;
           this.rows("INSERT INTO desk_member(id,mode,reason) VALUES(?,'excluded','手動で除外') ON CONFLICT(id) DO UPDATE SET mode='excluded',ticket='',reason=excluded.reason",id);
           if(id)this.rows("UPDATE desk_import SET allowed=0,token='',due=0,state='許可解除',reason='',summary='' WHERE id=?",id);
+          this.rows("UPDATE desk_invite SET phase='excluded',iv='',ciphertext='' WHERE id=? AND phase IN ('wait','opened')",id);
           this.rows('UPDATE desk_mag SET active=0 WHERE url=?',storedUrl);
           this.rows('UPDATE desk_pick_meta SET rev=rev+1 WHERE id=1');
           this.rows('UPDATE desk_work SET magazine=NULL WHERE magazine=?',storedUrl);
@@ -1922,6 +1954,26 @@ class Desk520 {
     return {linkPlans:this.rows("SELECT l.article,COALESCE(l.title,(SELECT title FROM desk_work WHERE draft=l.article AND draft<>'')) title,l.scheduled,l.pub,l.result,p.confirmed,j.phase,j.message FROM desk_link_plan l LEFT JOIN desk_snapshot p ON p.article=l.article LEFT JOIN desk_job j ON j.kind='publish' AND j.subject=l.article ORDER BY l.scheduled"),
       works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.key AS draft,w.paused,w.link_at,w.article,w.pub,c.article AS attemptedArticle,c.result AS coverResult,p.confirmed,m.url magurl,m.name AS magazine FROM desk_work_schedule w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_snapshot p ON p.article=c.article LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq')};
   }
+  magazineProgress(now,eligible) {
+    const counts=this.one(`SELECT COUNT(*) found,
+      SUM(CASE WHEN m.mode='excluded' THEN 1 ELSE 0 END) excluded,
+      SUM(CASE WHEN m.mode='auto' AND m.checked>? AND i.allowed=1 THEN 1 ELSE 0 END) rights,
+      SUM(CASE WHEN m.mode='auto' AND m.checked>? AND i.allowed=1 AND i.state='利用中' AND i.managed=1 THEN 1 ELSE 0 END) policy
+      FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id`,now-2*D520,now-2*D520);
+    const jobs=this.one(`SELECT COUNT(*) attempts,
+      SUM(CASE WHEN phase='confirmed' THEN 1 ELSE 0 END) confirmed,
+      SUM(CASE WHEN phase IN ('sent','seen') THEN 1 ELSE 0 END) uncertain
+      FROM desk_job WHERE kind='mag' AND phase IN ('sent','seen','confirmed')`);
+    const browser=typeof this.env.BROWSER?.acquire==='function';
+    const enabled=!!this.one('SELECT enabled FROM desk_cfg WHERE id=1').enabled && !!this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled;
+    const blocked=this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked;
+    let message=!enabled?'共同誌への自動追加は休止中です。':blocked>now?'note指定の待機が終わるまで追加しません。':!browser?'CloudflareのBROWSERが未設定か利用できないため、追加操作を開始できません。':
+      !counts.rights?'共同運営者としての編集権限・無料の誌面を確認できた掲載先が0誌のため、追加に進んでいません。':
+      !counts.policy?'編集権限を確認した誌の募集条件を照合中です。各誌の保留理由を確認してください。':
+      !eligible.length?'募集条件を確認した誌の、最近の更新などを再確認しています。':'条件に合う作品を順に照合しています。';
+    return {found:counts.found,excluded:counts.excluded||0,rights:counts.rights||0,policy:counts.policy||0,eligible:eligible.length,
+      attempts:jobs.attempts,confirmed:jobs.confirmed||0,uncertain:jobs.uncertain||0,browser,enabled,message};
+  }
   view(offset=0) {
     const schedules=this.scheduleRecords();
     const cfg=this.one('SELECT enabled,plan,rss_ok,rss_msg,tick_at,started,blocked FROM desk_cfg WHERE id=1');
@@ -1933,8 +1985,9 @@ class Desk520 {
       AND at-prior_at BETWEEN ? AND ? AND pub<=prior_at-? AND likes IS NOT NULL AND previous IS NOT NULL`,
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
-    return {cfg,backlist,reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
-      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
+    const magazineProgress=this.magazineProgress(now,eligible);
+    return {cfg,backlist,join:this.joinView520(),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows('SELECT task,at,message FROM desk_task_health WHERE failed=1 ORDER BY at DESC'),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+      imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
       samples:this.rows('SELECT w.seq,s.age,s.due,s.value,s.at,s.state FROM desk_work w LEFT JOIN desk_release r ON r.article=w.article JOIN desk_sample s ON s.seq=COALESCE(-r.id,w.seq) ORDER BY w.seq,s.age'),
@@ -2861,7 +2914,7 @@ class Desk520 {
     const label=job.kind==='publish'?job.title:job.title+' → '+job.name;
     this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,message) VALUES(?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+15*M520);
     this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
-    let message='通信を確認待ち',slot,lease,env,retry=job.kind==='mag'?D520:15*M520;
+    let message='通信を確認待ち',slot,lease,env,attemptAt=0,retry=job.kind==='mag'?D520:M520;
     try{
       const account=await this.deliveryAccount();
       if(!account){message='520の登録を確認待ち';return;}
@@ -2914,6 +2967,7 @@ class Desk520 {
           if(job.kind==='publish' && (!info || info.cover===null || !info.title || this.publicationSent(key) || this.one('SELECT 1 FROM desk_archive WHERE article=?',key)))return false;
           const marked=this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
           if(!marked)return false;
+          attemptAt=at;
           if(job.kind==='mag' && job.old)this.rows('UPDATE desk_scout_state SET older=1-older WHERE id=1');
           const pending='操作済み ／ noteの公開状態とタイトル・本文・見出し画像を確認待ち';
           if(job.kind==='publish')this.rows('INSERT INTO desk_snapshot(article,title,body_hash) VALUES(?,?,?)',key,info.title,info.hash);
@@ -2929,14 +2983,25 @@ class Desk520 {
         });
       });
       message=result.message;
-      if(result.seen)this.rows("UPDATE desk_job SET phase='seen',message=?,at=? WHERE kind=? AND subject=? AND phase='wait'",message,Date.now(),job.kind,job.subject);
+      if(result.notClicked && attemptAt)this.storage.transactionSync(()=>{
+        const undone=this.one("UPDATE desk_job SET phase='wait',message=? WHERE kind=? AND subject=? AND phase='sent' AND at=? RETURNING target",message,job.kind,job.subject,attemptAt);
+        if(undone && job.kind==='publish'){
+          this.rows('DELETE FROM desk_snapshot WHERE article=? AND confirmed IS NULL',undone.target);
+          if(job.link)this.rows('UPDATE desk_link_plan SET cover=NULL,check_at=NULL,result=? WHERE article=? AND pub IS NULL',message,undone.target);
+          else this.rows('DELETE FROM desk_work_cover WHERE article=? AND seq=?',undone.target,Number(job.subject));
+        }
+      });
+      if(result.seen)this.rows("UPDATE desk_job SET phase='seen',message=?,at=? WHERE kind=? AND subject=? AND (phase='wait' OR (phase='sent' AND at=?))",message,Date.now(),job.kind,job.subject,attemptAt);
+      else if(attemptAt)this.rows("UPDATE desk_job SET message=? WHERE kind=? AND subject=? AND phase='sent' AND at=?",message,job.kind,job.subject,attemptAt);
       if(result.hold){
         const until=Date.now()+result.hold;
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
         await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,slot).run();
       }
     }catch(error){
-      if(readLimit(error)){message='D1の読み取り枠更新後に確認';retry=(day+1)*D520+M520-now;this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+retry);}
+      message=readLimit(error)?'D1の読み取り枠更新後に確認':error instanceof Trouble?failure(error):'接続・保存処理を完了できず・結果の再確認待ち';
+      if(readLimit(error)){retry=(day+1)*D520+M520-now;this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+retry);}
+      if(attemptAt)this.rows("UPDATE desk_job SET message=? WHERE kind=? AND subject=? AND phase='sent' AND at=?",message,job.kind,job.subject,attemptAt);
     }finally{
       this.rows("UPDATE desk_job SET message=?,next=?,at=? WHERE kind=? AND subject=? AND phase='wait'",message,Date.now()+retry,Date.now(),job.kind,job.subject);
       if(lease)await release(env,lease);
@@ -3117,24 +3182,39 @@ class Desk520 {
       });
     }catch{ /* A failed read leaves the result unknown; it never queues another publication. */ }
   }
+  async task520(name, work) {
+    try {
+      const result=await work();
+      this.rows("UPDATE desk_task_health SET failed=0,at=?,message='' WHERE task=? AND failed<>0",Date.now(),name);
+      return result;
+    } catch(error) {
+      const message=readLimit(error)?'D1の読み取り枠更新待ち':error instanceof PublicReadError?publicReadReason(error):'読み取り・保存・接続の途中で失敗しました。次回に再確認します';
+      this.rows('INSERT INTO desk_task_health(task,at,failed,message) VALUES(?,?,1,?) ON CONFLICT(task) DO UPDATE SET at=excluded.at,failed=1,message=excluded.message',name,Date.now(),message);
+      return null;
+    }
+  }
   async tick() {
     this.init();
     const now=Date.now();
-    // A publication with a five-minute window gets the first use of this tick.
     const publication=this.duePublication(now);
-    if(publication)await this.dispatch(now);
-    await Promise.all([this.tickRecords(),this.automaticDirectory(now),this.catalogue(now),this.observeArchive(now),
-      this.ensureRecommendation(now),this.frontPageBackup(now)]);
-    this.planArchive(Date.now());
-    if(!publication)await this.dispatch(Date.now());
-    await this.verifyLinkCover(Date.now());
-    await this.lookupDraftTitle(Date.now());
-    try{await this.resolveDraftDirectory(Date.now());}catch{ /* Metadata can be retried without interrupting other tasks. */ }
-    await this.scoutLiterary(Date.now());
-    if(!publication) {
-      try {await this.syncReactions(Date.now());}
-      catch {this.rows("UPDATE desk_reactions SET due=?,message='お礼の更新を再確認待ち' WHERE id=1",Date.now()+2*HOUR);}
-    }
+    const task=(name,work)=>this.task520(name,work);
+    if(publication)await task('予約作品の公開',()=>this.dispatch(now));
+    await Promise.allSettled([
+      task('作品とフォロワーの記録',()=>this.tickRecords()),
+      task('共同誌の編集権限・募集条件',()=>this.automaticDirectory(now)),
+      task('公開作品の一覧',()=>this.catalogue(now)),
+      task('既刊の詳細',()=>this.observeArchive(now)),
+      task('記事下のおすすめ設定',()=>this.ensureRecommendation(now)),
+      task('新作の補助確認',()=>this.frontPageBackup(now))
+    ]);
+    await task('作品と掲載先の照合',()=>this.planArchive(Date.now()));
+    if(!publication)await task('公開・共同誌への追加',()=>this.dispatch(Date.now()));
+    await task('公開後の本文・見出し画像',()=>this.verifyLinkCover(Date.now()));
+    await task('下書きタイトル',()=>this.lookupDraftTitle(Date.now()));
+    await task('下書き一覧',()=>this.resolveDraftDirectory(Date.now()));
+    await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
+    if(!publication)await task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
+    if(!publication)await task('スキのお礼設定',()=>this.syncReactions(Date.now()));
   }
   async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
@@ -3149,7 +3229,13 @@ class Desk520 {
     const hourly=!cfg.tick_at || Math.floor(cfg.tick_at/HOUR)!==Math.floor(now/HOUR);
     const checkProbe=hourly || !this.probeChecked;
     this.probeChecked=true;
-    const [,,newDue,magUpdated]=await Promise.all([this.followers(now),this.measure(now),this.feed(now),this.magazines(now),checkProbe && this.probe(now)]);
+    const [,,newDue,magUpdated]=await Promise.all([
+      this.task520('フォロワー数の計測',()=>this.followers(now)),
+      this.task520('24時間・7日後の計測',()=>this.measure(now)),
+      this.task520('520のRSS',()=>this.feed(now)),
+      this.task520('共同誌の掲載確認',()=>this.magazines(now)),
+      checkProbe && this.task520('公開情報の取得確認',()=>this.probe(now))
+    ]);
     if(newDue) await this.measure(Date.now());
     if(hourly || magUpdated || cfg.rss_at>0 && cfg.rss_at<=now) this.match(now);
     if(hourly) this.weekly(Date.now());
@@ -3231,7 +3317,7 @@ function meta161(html,field) {
     if((attr161(tag,'property')||attr161(tag,'name')).toLowerCase()===field) return attr161(tag,'content');
   return '';
 }
-const ruleLabel161=/(?:募集(?:要項|条件|規定|ルール|記事)|投稿(?:要項|条件|規定|ルール|ガイド)|参加(?:要項|方法|条件|規約|ルール)|掲載(?:条件|基準|規定)|運営(?:方針|ルール)|ガイドライン|応募要項)/;
+const ruleLabel161=/(?:募集(?:要項|条件|規定|ルール|記事)|投稿(?:要項|条件|規定|ルール|ガイド)|参加(?:要項|方法|条件|規約|ルール|申請)|メンバー募集|掲載(?:条件|基準|規定)|運営(?:方針|ルール)|ガイドライン|応募要項)/;
 function ruleLinks161(description,base) {
   const found=new Map();
   for(const a of anchors161(description)){
@@ -3278,9 +3364,24 @@ function magazinePolicy161(source,context='') {
   }
   for(const line of clauses161(context)){
     if(prohibition(line))continue;
-    if(/(必須|に限[るり]|のみ|投稿数|[0-9]+(?:字|文字)|1日.{0,8}(?:本|回)|曜日指定|限定|対象外|要審査|事前承認|休止中|受付停止|不可|禁止|NG|をお願いします|にしてください|をしてください)/i.test(line) && !clauses.includes(line))unknown.push(line);
+    if(/(必須|に限[るり]|のみ|投稿数|[0-9]+(?:字|文字)|1日.{0,8}(?:本|回)|曜日指定|限定|対象外|要審査|事前(?:承認|審査|確認|申請)|が必要|必要です|休止中|受付停止|不可|禁止|NG|をお願いします|にしてください|をしてください)/i.test(line) && !clauses.includes(line))unknown.push(line);
   }
   for(let line of clauses) {
+    if(/^(?:ご覧(?:いただき|頂き)|お読み(?:いただき|頂き))ありがとうございます[!！]?$/.test(line) ||
+       /^(?:いつも)?(?:ご参加|ご投稿|ご訪問|応援|ご協力)ありがとうございます[!！]?$/.test(line) ||
+       /^(?:どうぞ|今後とも|引き続き)?よろしく(?:お願い(?:いたします|致します|します))?[!！]?$/.test(line))continue;
+    if(/^(?:対象|募集)?ジャンル(?:は|:)?(?:不問(?:です)?|自由(?:です)?|問いません|制限なし|制限はありません)$/.test(line)) {
+      genre520.forEach(v=>groups.genres.add(v));continue;
+    }
+    if(/^(?:制作方法|執筆方法|制作手法)(?:は|:)?(?:不問(?:です)?|自由(?:です)?|問いません|制限なし|制限はありません)$/.test(line) ||
+       /^(?:生成)?AI(?:の)?(?:使用|利用)(?:の有無)?(?:は|を)?(?:問いません|不問(?:です)?)$/.test(line)) {
+      method520.forEach(v=>groups.methods.add(v));continue;
+    }
+    // Normalize politeness on complete permission clauses, never on embedded restrictions.
+    line=line.replace(/(?:掲載|投稿)(?:すること)?ができます$/,'可')
+      .replace(/(?:は)?(?:必要はありません|必要ありません)$/,'は不要')
+      .replace(/(?:も|は)(?:掲載|投稿)(?:して)?(?:いただけます|頂けます)$/,'も可')
+      .replace(/(?:可|OK|歓迎|可能)です$/,m=>m.slice(0,-2));
     if(/^(?:こんにちは|はじめまして|いつも(?:当マガジンを)?(?:お読み|ご覧)いただきありがとうございます|ご参加ありがとうございます|よろしくお願いいたします|以上です|このマガジンの(?:投稿|募集|掲載)条件(?:をご案内します|は以下のとおりです)|https:\/\/note\.com\/(?:[\w-]+\/)?m\/m[a-z0-9]+)[!！]?$/.test(line))continue;
     line=line.replace(/^投稿(?:時|の際)(?:には|に|は)?[、,]?/,'')
       .replace(/^(?:本文|原稿|作品)の(?:長さ|字数|文字数)(?:は|:)/,'字数:')
@@ -3336,7 +3437,8 @@ function magazinePolicy161(source,context='') {
   if(unknown.length)missing.push('読み切れない文・追加条件');
   const summary=[range?'字数 '+(range[0]||0)+'〜'+(range[1]===1000000?'上限なし':range[1]):'',result.genres.join('・'),result.methods.join('・')].filter(Boolean).join(' ／ ');
   const state=excluded.length?'対象外':missing.length?'保留':'利用中';
-  const reason=excluded.length?[...new Set(excluded)].join('・'):missing.join('・');
+  const reason=excluded.length?[...new Set(excluded)].join('・'):missing.join('・')+
+    (unknown.length?' ／ 確認できない記載：'+[...new Set(unknown)].slice(0,2).map(v=>v.slice(0,90)).join(' ／ '):'');
   return {state,reason,summary,draft:{min:range?.[0]??null,max:range?.[1]??null,...result},policy:state==='利用中'?{min:range[0],max:range[1],...result}:null};
 }
 const importSchema161=[
@@ -3483,11 +3585,23 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+  if(s.join)lines.push(joinRecord520(s.join));
   if(s.reactions) {
     const r=s.reactions;
     lines.push('【記事にスキした読者へのお礼】'+(s.deliveryOn && s.cfg.enabled?'':'（自動更新は休止中）'),
       r.message,'更新候補　'+(JSON.parse(r.desired).join(' ／ ')||'公開作品の取得待ち'));
     if(r.checked)lines.push('noteで最後に確認したタイトル（'+tm(r.checked)+'）　'+JSON.parse(r.confirmed).join(' ／ '));
+  }
+  if(s.magazineProgress){
+    const p=s.magazineProgress;
+    lines.push('【共同誌への追加の進み具合】',p.message,
+      '発見 '+p.found+'誌 ／ 編集権限・無料を確認 '+p.rights+'誌 ／ 募集条件を確認 '+p.policy+'誌 ／ 最近の更新も確認 '+p.eligible+'誌',
+      '追加の操作開始・追加済み確認 '+p.attempts+'作品 ／ 誌面RSSで掲載を確認 '+p.confirmed+'作品 ／ 操作後の掲載確認待ち '+p.uncertain+'作品',
+      '参加申請・招待の承認の状態は専用欄に表示します。公開情報で編集権限を確認できない場合も保留します。');
+  }
+  if(s.taskFailures?.length){
+    lines.push('【途中で失敗した処理】');
+    for(const f of s.taskFailures)lines.push(f.task+' ／ '+f.message+' ／ '+tm(f.at));
   }
   if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ 本日探索を試みたページ '+s.scout.used+'か所（最大64） ／ '+s.scout.message);
   const checkedPlans=(s.linkPlans||[]).filter(p=>p.result || p.message);
@@ -3563,9 +3677,13 @@ function publicationLinks(records){
 function planEditorOptions(plans,selected){
   return plans.filter(p=>p.edit).map(p=>'<option value="'+esc(p.edit)+'"'+(p.edit===selected?' selected':'')+'>'+esc(p.when+'　'+p.label)+'</option>').join('');
 }
+function magazineProgressText520(p){
+  return p?p.message+'\n発見 '+p.found+'誌 ／ 編集権限・無料を確認 '+p.rights+'誌 ／ 募集条件を確認 '+p.policy+'誌 ／ 最近の更新も確認 '+p.eligible+'誌'+
+    '\n追加の操作開始・追加済み確認 '+p.attempts+'作品 ／ 誌面RSSで掲載を確認 '+p.confirmed+'作品 ／ 操作後の掲載確認待ち '+p.uncertain+'作品':'記録を開くと、追加がどの段階まで進んでいるか表示します。';
+}
 function deskMagazineList(records) {
   if(!records)return '';
-  const lines=records.imports.map(m=>m.name+' ／ '+(m.mode==='excluded'?'除外済み':m.allowed?m.state:m.memberReason||'運営資格を確認待ち'));
+  const lines=records.imports.map(m=>m.name+' ／ '+(m.mode==='excluded'?'除外済み':m.allowed?m.state+(m.reason?'：'+m.reason:''):m.memberReason||'運営資格を確認待ち'));
   return lines.map(line=>'<p>'+esc(line)+'</p>').join('');
 }
 function deskArchiveList(archive) {
@@ -3588,8 +3706,8 @@ function deskPage(records=null,message='',status=200,editing='') {
     reserved?'「予約済み」の未公開作品はありません。':'上の「記録を開く」を押してください。';
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>520 作品管理 v16.5.1</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>v16.5.1</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<title>520 作品管理 ${VERSION}</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
+<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
 <details id="planform"${selected?' open':''}><summary>下書きの共有リンクで予約</summary>
@@ -3609,7 +3727,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 </details></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#schedules">予約した作品を見る</a></p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
-<details><summary>自動公開・共同誌への追加・スキのお礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
+<details><summary>自動公開・共同誌への追加・参加申請・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>年をまたぐ予約や、登録済みの日付の間への追加もできます。公開日時の順に表示します。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
@@ -3620,9 +3738,23 @@ function deskPage(records=null,message='',status=200,editing='') {
 <label>制作方法<select id="method"><option value="">選択してください</option>${method520.map(v=>'<option>'+v+'</option>').join('')}</select></label>
 <button id="add">完成稿を登録</button>
 <details><summary>複数の完成稿を1回で登録（JSON）</summary><p>配列の各行に seq（順番）, title, body, d（YYYY-MM-DD）, t（HH:MM または空文字）, locked（予約済み true / false）, draft（記事IDまたは空文字）, genre, method を入れます。どれか1本に誤りがあれば一括登録全体を戻します。</p><label>JSONファイル<input id="batch" type="file" accept=".json,application/json"></label><button id="import">一括登録</button></details></details>
+<details open id="joinsection"><summary>参加申請・招待の自動承認</summary>
+<pre id="joinstatus">${esc(records?.join?joinRecord520(records.join):'「記録を開く」で申請・招待の状態を確認できます。')}</pre>
+<p>現在の自動申請先は「創作の森 エンターテイナー・ストリート」です。募集記事と無料の参加方法を確認し、520として参加希望コメントを1回送ります。相手の招待が届いてから承認します。</p>
+<button type="submit" form="readform" name="work_action" value="join_off">自動申請・承認を休止</button>
+<button type="submit" form="readform" name="work_action" value="join_on">自動申請・承認を再開</button>
+<details><summary>届いた招待リンクを登録する（受信未接続の場合）</summary>
+<label>noteから届いた招待の承認リンク<input name="invite_url" form="readform" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+<small>「創作の森」のマガジンIDを含むnote公式の招待リンクに対応します。共有用下書きリンクやマガジンの公開URLではありません。</small>
+<button type="submit" form="readform" name="work_action" value="join_invite">招待を保存して自動承認を待つ</button></details>
+<details><summary>招待メールを自動受信するための設定</summary>
+<p>自分のCloudflare管理ドメインでEmail Routingの受信先をこのWorkerに設定し、NOTE_INVITE_TOにその受信アドレスを設定します。noteの登録メールに届く招待が、この受信先へ届く設定も必要です。メールアドレスや通知設定は、このツールから変更しません。</p>
+<small>noteからの正規の招待を確認できたメールだけ受け付けます。手動転送で送信元が変わる場合は上のリンク登録を使ってください。メール受信の設定だけでは、既存メールボックスに届く招待は読み出せません。</small></details></details>
 <details id="magsection"><summary>マガジンの自動確認</summary>
 <p>520の公開一覧にある誌の編集権限を優先して確認します。ほかの作者の公開ページと文芸誌の最新号からも自動で探します。</p>
+<p>発見しただけの誌には追加しません。共同運営者としての編集権限・無料・募集条件を確認できた誌が対象です。参加申請や招待の承認は自動では行いません。</p>
 <button type="submit" form="readform" name="work_action" value="scout">掲載先を今探す</button>
+<pre id="magprogress">${esc(magazineProgressText520(records?.magazineProgress))}</pre>
 <p id="directory">${esc(records?.directory?.message)}</p><div id="imports">${deskMagazineList(records)}</div><div id="mags"></div>
 <details><summary>公開一覧にない誌のURLを補う（任意）</summary><label>マガジンURL<input id="oneurl" type="url"></label><button id="sourcemag">次回の確認に追加</button></details></details>
 <details><summary>共有可の写真を準備</summary><p>「共有可」に入れた自分の写真をまとめて選べます。画素からJPEGと短い説明を作ります。被写体を一言添えることもできます。画面に保存されるのは加工したJPEGです。実際の共有は、noteアプリの「アカウント」→「アップロードした画像」で加工済みの画像を選び、「共有」を押します。</p>
@@ -3729,7 +3861,9 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
 
     if(!$('seq').value) $('seq').value=(s.works.at(-1)?.seq??0)+1;
     $('result').textContent=s.recordText;
+    if($('joinstatus') && s.join)$('joinstatus').textContent=s.recordText.split('【参加申請・招待の承認】')[1]?.split('【')[0]||s.join.message;
     $('directory').textContent=s.directory.message;
+    $('magprogress').textContent=s.magazineProgressText;
     $('imports').replaceChildren();$('mags').replaceChildren();
     for(const m of s.imports){
       const label=m.mode==='excluded'?'除外済み':m.allowed?m.state:(m.memberReason||'運営資格を確認待ち');
@@ -3776,6 +3910,7 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   $('readform').onsubmit=event=>{
     if(event.submitter===$('basic'))return;
     const action=event.submitter?.value;
+    if(['join_on','join_off','join_invite'].includes(action))return;
     if(action==='scout'){
       event.preventDefault();
       return wrap(async()=>(await send('scout')).correctionMessage)();
@@ -3874,3 +4009,383 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
     }finally{URL.revokeObjectURL(u);}
   }
 })();`;
+
+// v16.7: bounded participation requests and authenticated invitation consumption.
+// Publication eligibility is still decided independently by the existing rule checker.
+const JOIN520 = Object.freeze({
+  id:'m4d9023d7133b', owner:'mitsuruamano', article:'n27b0a1eb95ff',
+  name:'創作の森 エンターテイナー・ストリート',
+  url:'https://note.com/mitsuruamano/m/m4d9023d7133b',
+  rule:'https://note.com/mitsuruamano/n/n27b0a1eb95ff',
+  comment:'はじめまして。520（43__）です。参加希望です。よろしくお願いいたします。'
+});
+function joinFree520(data,html='') {
+  const d=data?.data?.magazine??data?.data;
+  const h=magHeader162(html,{id:JOIN520.id});
+  if(d?.key!==JOIN520.id || d.owner?.urlname!==JOIN520.owner)return false;
+  const paid=h.paid || d.isPaid===true || d.is_paid===true || Number(d.price)>0 ||
+    /^(paid|subscription|membership)$/i.test(d.magazineType??d.type??'');
+  return !paid && (h.free || d.price===0 || d.isFree===true || d.magazineType==='free');
+}
+function joinRecruitment520(n,html='') {
+  if(n?.key!==JOIN520.article || n.user?.urlname!==JOIN520.owner || n.status!=='published' ||
+    n.is_limited===true || n.is_paid===true || n.isLimited===true || n.isPaid===true || Number(n.price)>0 ||
+    typeof n.body!=='string' || n.body.length>250000)return false;
+  const t=words161(n.body).normalize('NFKC').replace(/\s+/g,'');
+  // This is the explicitly reviewed comment-only application route. A changed route is held.
+  if(!/創作の森/.test(t) || !/エンターテイナー[・･]?ストリート/.test(t) || !/共同運営マガジン/.test(t) ||
+    !/参加費は(?:完全)?無料/.test(t) || !/参加の申請は[、,]?コメント欄に参加希望と書くだけです/.test(t) ||
+    !/招待メール/.test(t))return false;
+  if(/募集(?:停止|終了|休止)|受付(?:停止|終了|休止)|満員|新規参加.*(?:不可|お断り)|参加費.*[1-9]\d*円|フォロー|スキを|メンバーシップ|購入|決済|合言葉|審査料/.test(t))return false;
+  // Link in either direction must associate this recruitment article with this exact issue.
+  const forward=anchors161(n.body).some(a=>noteLink161(a.href,JOIN520.rule)?.id===JOIN520.id);
+  const back=noteLink161(meta161(html,'og:url'))?.id===JOIN520.id &&
+    anchors161(html).some(a=>noteLink161(a.href,JOIN520.url,'article')?.id===JOIN520.article);
+  return forward || back;
+}
+function inviteUrl520(raw,id=JOIN520.id,requireId=false) {
+  if(typeof raw!=='string' || raw.length>6000 || /[\x00-\x20\x7f]/.test(raw))return null;
+  try {
+    const u=new URL(xmlValue520(raw));
+    if(u.origin!=='https://note.com' || u.username || u.password || u.hash || u.port)return null;
+    const decoded=decodeURIComponent(u.pathname+'?'+u.searchParams.toString());
+    if(!/invit|招待|承認|accept|(?:^|\/)join(?:\/|\?)/i.test(decoded) || /(?:^|\/)(?:login|logout|settings|api|purchase|checkout)(?:\/|\?|$)/i.test(decoded))return null;
+    const ids=Array.from(decoded.matchAll(/(?:^|[\/=])((?:m)[a-z0-9]{12})(?![a-z0-9])/g),m=>m[1]);
+    if(ids.some(k=>k!==id) || (requireId && !ids.includes(id)))return null;
+    for(const [key,value] of u.searchParams) {
+      if(/redirect|return|next|url|continue/i.test(key))return null;
+      if(/^https?:/i.test(value))return null;
+    }
+    return u.href;
+  } catch{return null;}
+}
+async function sealInvite520(env,id,link) {
+  const key=await encryptionKey(env),iv=crypto.getRandomValues(new Uint8Array(12));
+  const bytes=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode('note-helper:invite:v1:43__:'+id)},key,new TextEncoder().encode(link));
+  return {iv:b64(iv),ciphertext:b64(bytes)};
+}
+async function openInvite520(env,row) {
+  const key=await encryptionKey(env);
+  const bytes=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(row.iv),additionalData:new TextEncoder().encode('note-helper:invite:v1:43__:'+row.id)},key,unb64(row.ciphertext));
+  return new TextDecoder().decode(bytes);
+}
+// The first Authentication-Results field is stamped by Cloudflare Email Routing.
+// A user-forwarded body is not proof of note's sender; nested authentication fields are ignored.
+function noteMail520(message,env) {
+  const to=String(env.NOTE_INVITE_TO||'').trim().toLowerCase();
+  if(!to || String(message.to||'').toLowerCase()!==to)return false;
+  const ar=message.headers.get('Authentication-Results')||'';
+  const first=ar.split(/,(?=\s*[^;,\s]+\s*;)/)[0];
+  if(!/^\s*mx\.cloudflare\.net\s*;/i.test(first) || !/(?:^|;)\s*dmarc=pass\b/i.test(first))return false;
+  const from=message.headers.get('From')||'';
+  const address=from.match(/<([^<>\s]+)>\s*$/)?.[1] || from.trim();
+  if(!/^[^@<>\s,;]+@(?:[a-z0-9-]+\.)?note\.(?:com|mu)$/i.test(address))return false;
+  const domain=address.split('@')[1].toLowerCase();
+  const aligned=first.match(/\bheader\.from=([^;\s,]+)/i)?.[1]?.toLowerCase();
+  return aligned===domain;
+}
+function mailText520(raw,depth=0) {
+  need520(depth<6 && raw.length<=250000,'招待メールの形式を確認できません。');
+  const cut=/\r?\n\r?\n/.exec(raw);
+  need520(cut,'招待メールの本文がありません。');
+  const head=raw.slice(0,cut.index).replace(/\r?\n[ \t]+/g,' '),body=raw.slice(cut.index+cut[0].length);
+  const get=name=>head.match(new RegExp('^'+name+':\\s*(.*)$','im'))?.[1]||'';
+  const type=get('Content-Type');
+  if(/attachment/i.test(get('Content-Disposition')))return '';
+  if(/^multipart\/(?:alternative|mixed|related)\b/i.test(type)) {
+    const boundary=type.match(/boundary\s*=\s*(?:"([^"\r\n]+)"|([^;\s]+))/i);
+    need520(boundary && (boundary[1]||boundary[2]).length<=150,'招待メールの区切りを確認できません。');
+    const token='--'+(boundary[1]||boundary[2]),parts=body.split(token).slice(1);
+    need520(parts.length<=20 && parts.some(p=>p.startsWith('--')),'招待メールを読み切れません。');
+    return parts.filter(p=>!p.startsWith('--')).map(p=>mailText520(p.replace(/^\r?\n/,''),depth+1)).join('\n');
+  }
+  if(type && !/^text\/(?:plain|html)\b/i.test(type))return '';
+  const charset=type.match(/charset\s*=\s*"?([^;"\s]+)/i)?.[1]||'utf-8';
+  need520(/^(?:utf-8|us-ascii)$/i.test(charset),'UTF-8形式の招待メールを指定してください。');
+  const encoding=get('Content-Transfer-Encoding').trim().toLowerCase();
+  let text=body;
+  if(encoding==='base64')text=new TextDecoder('utf-8',{fatal:true}).decode(unb64(body.replace(/\s/g,'')));
+  else if(encoding==='quoted-printable') {
+    const soft=body.replace(/=\r?\n/g,''),bytes=[];
+    for(let i=0;i<soft.length;i++) {
+      if(soft[i]==='=' && /^[a-f0-9]{2}$/i.test(soft.slice(i+1,i+3))){bytes.push(parseInt(soft.slice(i+1,i+3),16));i+=2;}
+      else {need520(soft.charCodeAt(i)<128,'メールの文字コードを確認できません。');bytes.push(soft.charCodeAt(i));}
+    }
+    text=new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array(bytes));
+  }else need520(!encoding || ['7bit','8bit','binary'].includes(encoding),'メールの文字コードを確認できません。');
+  return text;
+}
+function inviteFromMail520(text) {
+  const plain=words161(text).normalize('NFKC').replace(/\s+/g,'');
+  need520(plain.includes('創作の森') && /エンターテイナー[・･]?ストリート/.test(plain) && /招待/.test(plain) && /共同運営/.test(plain),
+    '申請対象の共同運営マガジンの招待を確認できません。');
+  const links=[...anchors161(text).filter(a=>/参加|承認|招待|確認/.test(a.label)).map(a=>a.href),
+    ...Array.from(text.matchAll(/https:\/\/note\.com\/[^\s<>"']+/g),m=>m[0])];
+  const urls=[...new Set(links.map(s=>inviteUrl520(s)).filter(Boolean))];
+  need520(urls.length===1,'招待の承認リンクを1つに特定できません。');
+  return urls[0];
+}
+async function receiveNoteInvite520(message,env) {
+  if(!env.SCHEDULER || !noteMail520(message,env)){message.setReject('Verified note invitation recipient required');return;}
+  if(message.rawSize>250000){message.setReject('Invitation too large');return;}
+  let url;
+  try {url=inviteFromMail520(mailText520(await read520body(new Response(message.raw),250000)));}
+  catch {message.setReject('Unsupported invitation message');return;}
+  // A transient storage failure must fail delivery, not silently acknowledge and lose the invitation.
+  const response=await stub520(env).fetch(new Request('https://scheduler.internal/desk/invitation',{
+    method:'POST',body:JSON.stringify({url,id:JOIN520.id})}));
+  if(!response.ok)throw Error('Invitation could not be saved');
+}
+
+// Only note's native comment composer is changed. No undocumented POST endpoint is used.
+function noteJoinDOM520(step,arg) {
+  if(location.origin!=='https://note.com' || location.pathname.replace(/\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};
+  const canonical=document.querySelector('link[rel="canonical"]')?.href;
+  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\/$/,'')!==location.pathname.replace(/\/$/,''))return {state:'page'};
+  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');
+  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();
+  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));
+  if(fields.length!==1)return {state:'composer'};
+  const field=fields[0];
+  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid="comment-item"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);
+  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));
+  for(const card of cards) {
+    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\/$/,'')==='/43__';}catch{return false;}});
+    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};
+  }
+  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&
+    (e.closest('[class*="comment"],[class*="Comment"],[data-testid*="comment"]')));
+  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}
+  // An incomplete comment history cannot establish that this account has not already applied.
+  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};
+  if(step==='read')return {state:'ready'};
+  let scope=field.closest('form')||field.parentElement;
+  let buttons=[];
+  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {
+    if(scope.querySelectorAll('textarea').length!==1)break;
+    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');
+    if(buttons.length)break;
+  }
+  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};
+  if(step==='fill') {
+    if(field.value && field.value!==arg.comment)return {state:'draft'};
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);
+    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));
+    return {state:'filled'};
+  }
+  if(step==='send') {
+    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};
+    buttons[0].click();return {state:'clicked'};
+  }
+  return {state:'page'};
+}
+async function browserJoin520(binding,id,cookie,job,mark,mayAct) {
+  return inNoteBrowser(binding,cookie,false,async({command,evaluate,blocked,blockedResult:originalBlocked})=>{
+    const blockedResult=()=>{const result=originalBlocked();if(/HTTP (401|403|429)\b/.test(result.message))result.hold=Math.max(2*HOUR,result.hold||0);return result;};
+    const poll=async(fn,ok)=>{for(let i=0;i<12 && !blocked();i++){try{const x=await fn();if(ok(x))return x;}catch{}await pause520(220);}return null;};
+    await command('Page.navigate',{url:'https://note.com/'});
+    const who=await poll(()=>evaluate(noteIdentityJS),x=>x?.id && x?.name);
+    if(blocked())return blockedResult();
+    if(who?.id!==id || who?.name!=='43__')return {message:'520本人のログインを確認待ち'};
+    const member=async()=>{
+      const data=await evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;
+        const r=await fetch('/api/v1/magazines/${JOIN520.id}',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
+        return r.ok?await r.json():null;})()`);
+      return !blocked() && editorialProof162({id:JOIN520.id},data,'').ok;
+    };
+    if(await member())return {joined:true,message:'520が共同運営メンバーであることを確認済み'};
+    if(blocked())return blockedResult();
+    if(job.kind==='verify')return {message:'共同運営メンバーへの反映を再確認待ち'};
+    if(job.kind==='invite') {
+      if(!inviteUrl520(job.url) || !await mayAct())return {message:'招待の対象・待機・設定を再確認待ち'};
+      // Opening a bearer invitation can itself accept it. Persist before navigation, not after it.
+      if(!await mark())return {message:'招待の変更・停止を確認したため承認を保留'};
+      await command('Page.navigate',{url:job.url});
+      await pause520(1000);
+      if(blocked())return blockedResult();
+      const screen=await evaluate(`(()=>{if(location.origin!=='https://note.com')return 'outside';
+        const root=document.querySelector('main,[role=main]')||document.body,t=root.innerText||'';
+        if(/期限切れ|有効期限.*(?:切れ|過ぎ)|無効な招待|招待.*無効/.test(t))return 'expired';
+        if(!t.includes('創作の森')||!/エンターテイナー[・･]?ストリート/.test(t)||!/共同運営/.test(t)||!/招待/.test(t))return 'unknown';
+        if(/購入|支払|決済|月額|有料/.test(t))return 'paid';
+        const buttons=[...root.querySelectorAll('button')].filter(b=>b.getClientRects().length&&!b.disabled&&['招待を承認する','招待を承認','参加する','承認する'].includes(b.textContent.trim()));
+        return buttons.length===1?'ready':'unknown';})()`);
+      if(screen==='ready' && !blocked() && await mayAct()) {
+        // A second identity check covers redirects/login transitions after following the invitation.
+        const identity=await evaluate(noteIdentityJS);
+        if(identity?.id===id && identity.name==='43__' && !blocked())await evaluate(`(()=>{
+          if(location.origin!=='https://note.com')return false;
+          const root=document.querySelector('main,[role=main]')||document.body,t=root.innerText||'';
+          if(!t.includes('創作の森')||!/共同運営/.test(t)||!/招待/.test(t)||/購入|支払|決済|月額|有料/.test(t))return false;
+          const bs=[...root.querySelectorAll('button')].filter(b=>b.getClientRects().length&&!b.disabled&&['招待を承認する','招待を承認','参加する','承認する'].includes(b.textContent.trim()));
+          if(bs.length!==1)return false;bs[0].click();return true;})()`);
+      }
+      return blocked()?blockedResult():{expired:screen==='expired',message:screen==='expired'?'招待リンクが期限切れです。新しい招待を受信すると再確認します。':screen==='paid'?'有料の参加画面を検出・承認を保留':'承認操作を記録・次回に参加状態を別の接続で確認'};
+    }
+    await command('Page.navigate',{url:JOIN520.rule});
+    const fresh=await poll(()=>evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;
+      const r=await fetch('/api/v3/notes/${JOIN520.article}',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
+      if(!r.ok)return null;const n=(await r.json()).data;
+      if(n?.key!==${JSON.stringify(JOIN520.article)}||n.user?.urlname!==${JSON.stringify(JOIN520.owner)}||n.status!=='published')return null;
+      return {hash:await (${draftBodyHash.toString()})(n.body),count:n.commentCount??n.comment_count};})()`),x=>x?.hash);
+    if(blocked())return blockedResult();
+    if(!fresh || fresh.hash!==job.hash)return {message:'募集記事が変更されたため申請を再確認待ち'};
+    const arg={...JOIN520,count:fresh.count};
+    // Comment composers below the article can be mounted only when scrolled into view.
+    await evaluate('window.scrollTo(0,document.documentElement.scrollHeight)');
+    const form=step=>evaluate('('+noteJoinDOM520.toString()+')('+JSON.stringify(step)+','+JSON.stringify(arg)+')');
+    let result=await poll(()=>form('read'),x=>['ready','existing','history'].includes(x?.state));
+    for(let i=0;result?.state==='history' && i<12 && !blocked();i++) {
+      if((await form('more')).state!=='loading')break;
+      await pause520(250);result=await form('read');
+    }
+    if(result?.state==='existing')return {existing:true,message:'520の参加希望コメントを確認済み・招待待ち'};
+    if(job.kind==='check')return {message:'申請結果は未確認・同じ申請は自動再送しません'};
+    if(result?.state!=='ready')return {message:'コメント欄と過去の参加申請を読み切れず・申請を保留'};
+    if(blocked())return blockedResult();
+    if((await form('fill')).state!=='filled')return {message:'参加希望コメントの入力欄を確認待ち'};
+    await pause520(300);
+    const identity=await evaluate(noteIdentityJS);
+    if(blocked())return blockedResult();
+    if(identity?.id!==id || identity.name!=='43__' || !await mayAct() || !await mark())return {message:'本人・停止・待機を再確認したため申請を保留'};
+    const sent=await form('send');
+    return sent?.state==='clicked'?{sent:true,message:'参加申請を操作済み・次回に送信結果を確認'}:
+      {notClicked:true,message:'送信ボタンを確認できず・申請していません'};
+  });
+}
+
+Object.assign(Desk520.prototype,{
+  initJoin520() {
+    if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_join_cfg'"))return;
+    this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_join_cfg(id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,due INTEGER NOT NULL DEFAULT 0,day TEXT NOT NULL DEFAULT '',used INTEGER NOT NULL DEFAULT 0,mail_at INTEGER NOT NULL DEFAULT 0)");
+      this.rows('INSERT INTO desk_join_cfg(id) VALUES(1)');
+      this.rows("CREATE TABLE desk_join(id TEXT PRIMARY KEY,phase TEXT NOT NULL DEFAULT 'wait',at INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '募集方法を確認待ち',account TEXT NOT NULL DEFAULT '',proof INTEGER NOT NULL DEFAULT 0)");
+      this.rows('INSERT INTO desk_join(id) VALUES(?)',JOIN520.id);
+      this.rows("CREATE TABLE desk_invite(hash TEXT PRIMARY KEY,id TEXT NOT NULL,iv TEXT NOT NULL,ciphertext TEXT NOT NULL,created INTEGER NOT NULL,phase TEXT NOT NULL DEFAULT 'wait',at INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '')");
+      this.rows('CREATE INDEX desk_invite_pending ON desk_invite(id,phase,created)');
+      this.rememberMagazine(noteLink161(JOIN520.url),JOIN520.name);
+    });
+  },
+  joinActive520() {
+    return !!this.one(`SELECT 1 FROM desk_join_cfg j JOIN desk_cfg c ON c.id=j.id JOIN desk_delivery d ON d.id=j.id
+      WHERE j.id=1 AND j.enabled=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?
+      AND NOT EXISTS(SELECT 1 FROM desk_member WHERE id=? AND mode='excluded')`,Date.now(),JOIN520.id);
+  },
+  joinView520() {
+    const c=this.one('SELECT enabled,mail_at FROM desk_join_cfg WHERE id=1');
+    const j=this.one('SELECT phase,at,message,proof FROM desk_join WHERE id=?',JOIN520.id);
+    return {enabled:!!c.enabled,active:this.joinActive520(),browser:typeof this.env.BROWSER?.acquire==='function',
+      mailConfigured:!!this.env.NOTE_INVITE_TO,mailReceived:c.mail_at,...j,name:JOIN520.name,rule:JOIN520.rule,comment:JOIN520.comment};
+  },
+  async saveInvitation520(url,trustedMail=false) {
+    this.init();
+    need520(this.one("SELECT 1 FROM desk_member WHERE id=? AND mode<>'excluded'",JOIN520.id),'この誌は除外されています。');
+    const link=inviteUrl520(url,JOIN520.id,!trustedMail);
+    need520(link,'noteの招待承認リンクを確認してください。手動登録には対象のマガジンIDを含むリンクが必要です。');
+    const hash=await draftBodyHash(link);
+    if(this.one('SELECT 1 FROM desk_invite WHERE hash=?',hash))return '登録済みの招待です。承認操作は繰り返しません。';
+    const encrypted=await sealInvite520(this.env,JOIN520.id,link),now=Date.now();
+    this.storage.transactionSync(()=>{
+      need520(this.one("SELECT 1 FROM desk_member WHERE id=? AND mode<>'excluded'",JOIN520.id),'この誌は除外されています。');
+      // A newer invitation supersedes only unopened ones. Already-opened links remain tombstones.
+      this.rows("UPDATE desk_invite SET phase='replaced',iv='',ciphertext='' WHERE id=? AND phase='wait'",JOIN520.id);
+      this.rows('INSERT OR IGNORE INTO desk_invite(hash,id,iv,ciphertext,created) VALUES(?,?,?,?,?)',hash,JOIN520.id,encrypted.iv,encrypted.ciphertext,now);
+      this.rows('UPDATE desk_join SET due=0 WHERE id=?',JOIN520.id);
+      this.rows('UPDATE desk_join_cfg SET due=0,mail_at=CASE WHEN ? THEN ? ELSE mail_at END WHERE id=1',+trustedMail,now);
+    });
+    return '招待を暗号化して保存しました。次の定期起動で520本人と対象誌を確認して承認します。';
+  },
+  async joinTick520(now) {
+    const cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
+    if(cfg.due>now || !this.joinActive520())return;
+    // The publication window and existing account lease take priority over participation.
+    if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) ||
+      this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+    const row=this.one('SELECT * FROM desk_join WHERE id=?',JOIN520.id);
+    if(row.due>now)return;
+    const today=jstDay(now),used=cfg.day===today?cfg.used:0;
+    if(used>=4){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
+    this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+30*M520);
+    let env,lease,message='参加申請・招待の確認を再試行待ち',due=now+2*HOUR,attempt='';
+    try {
+      if(typeof this.env.BROWSER?.acquire!=='function'){message='CloudflareのBROWSER設定が必要です';return;}
+      const pending=this.one("SELECT * FROM desk_invite WHERE id=? AND phase='wait' ORDER BY created DESC LIMIT 1",JOIN520.id);
+      const recent=this.one("SELECT at FROM desk_invite WHERE id=? AND phase IN ('opened','confirmed') ORDER BY at DESC LIMIT 1",JOIN520.id);
+      const kind=row.phase==='joined' || (recent && recent.at>=now-2*HOUR)?'verify':pending?'invite':row.phase==='wait'?'apply':'check';
+      const sources=await Promise.allSettled([
+        this.publicRead('https://note.com/api/v1/magazines/'+JOIN520.id,'json'),
+        this.publicRead(JOIN520.url,'html'),
+        kind==='apply'||kind==='check'?this.publicRead('https://note.com/api/v3/notes/'+JOIN520.article,'json'):Promise.resolve(null)
+      ]);
+      const [mag,html,note]=sources.map(s=>s.status==='fulfilled'?s.value:null);
+      if(!joinFree520(mag,html||'')){message='対象誌が無料か確認できず・申請と承認を保留';due=now+D520;return;}
+      if((kind==='apply'||kind==='check') && !joinRecruitment520(note?.data,html||'')){message='現在の募集方法を照合できず・参加申請を保留';due=now+D520;return;}
+      const accountInfo=await this.deliveryAccount();
+      if(!accountInfo || accountInfo.until>Date.now()){message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.until+M520):now+2*HOUR;return;}
+      if(row.account && row.account!==accountInfo.id){message='登録時の520本人と一致せず・操作を保留';return;}
+      env=scoped(this.env,accountInfo.slot);lease=await acquire(env,false);
+      if(!lease){message='520の処理終了を確認待ち';due=now+4*M520;return;}
+      const credential=await loadCookie(env,accountInfo.id);
+      let link=null;
+      if(kind==='invite') {
+        if(pending.created<now-7*D520){this.rows("UPDATE desk_invite SET phase='expired',iv='',ciphertext='' WHERE hash=? AND phase='wait'",pending.hash);message='受信から7日経過した招待を保留。新しい招待を受信すると再確認します。';return;}
+        link=await openInvite520(this.env,pending);
+      }
+      const live=async()=>{
+        if(!this.joinActive520())return false;
+        const c=await sql(env,`SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c
+          JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1`,accountInfo.slot).first();
+        const t=Date.now();
+        return !!c && c.account===accountInfo.id && c.token===lease && c.lease>t && c.hold_until<=t && (!c.kind || c.next_at<=t);
+      };
+      const marker=crypto.randomUUID();
+      this.rows('UPDATE desk_join_cfg SET day=?,used=? WHERE id=1',today,used+1);
+      const result=await browserJoin520(this.env.BROWSER,accountInfo.id,cleanCookie(credential.NOTE_SESSION),
+        {kind,hash:note?.data?await draftBodyHash(note.data.body):null,url:link},async()=>{
+          if(!await live())return false;
+          return this.storage.transactionSync(()=>{
+            if(!this.joinActive520())return false;
+            if(kind==='apply') {
+              if(!this.one("UPDATE desk_join SET phase='sent',at=?,token=?,account=?,message='参加申請の操作を記録・自動再送なし' WHERE id=? AND phase='wait' RETURNING id",Date.now(),marker,accountInfo.id,JOIN520.id))return false;
+            }else if(kind==='invite') {
+              if(!this.one("UPDATE desk_invite SET phase='opened',at=?,token=?,iv='',ciphertext='' WHERE hash=? AND phase='wait' RETURNING hash",Date.now(),marker,pending.hash))return false;
+              this.rows("UPDATE desk_join SET phase='accepting',at=?,account=?,message='招待承認の開始を記録・参加状態は未確認' WHERE id=?",Date.now(),accountInfo.id,JOIN520.id);
+            }else return false;
+            attempt=marker;return true;
+          });
+        },live);
+      message=result.message;due=Date.now()+(attempt?4*M520:kind==='check'||kind==='verify'?6*HOUR:2*HOUR);
+      this.storage.transactionSync(()=>{
+        if(!this.joinActive520())return;
+        if(result.joined) {
+          this.rows("UPDATE desk_join SET phase='joined',proof=?,at=?,account=? WHERE id=?",Date.now(),Date.now(),accountInfo.id,JOIN520.id);
+          this.rows("UPDATE desk_invite SET phase='confirmed',iv='',ciphertext='' WHERE id=? AND phase IN ('wait','opened')",JOIN520.id);
+          this.rows("UPDATE desk_member SET due=0 WHERE id=? AND mode<>'excluded'",JOIN520.id);
+          this.rows('UPDATE desk_import SET due=0 WHERE id=?',JOIN520.id);
+          due=Date.now()+D520;
+        }else if(result.existing)this.rows("UPDATE desk_join SET phase='applied',at=?,account=? WHERE id=? AND phase IN ('wait','sent','applied')",Date.now(),accountInfo.id,JOIN520.id);
+        else if(result.notClicked && attempt && kind==='apply')this.rows("UPDATE desk_join SET phase='wait',token='' WHERE id=? AND phase='sent' AND token=?",JOIN520.id,attempt);
+        if(result.expired && pending)this.rows("UPDATE desk_invite SET phase='expired',iv='',ciphertext='' WHERE hash=? AND phase='opened'",pending.hash);
+      });
+      if(result.hold>0) {
+        const until=Date.now()+result.hold;due=Math.max(due,until);
+        this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
+        await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,accountInfo.slot).run();
+      }
+    }catch(error) {
+      message=readLimit(error)?'D1の読み取り枠更新後に再確認':'本人確認・画面・保存の途中で失敗。記録済みの操作は再送せず確認します';
+      due=readLimit(error)?(Math.floor(Date.now()/D520)+1)*D520+M520:Date.now()+2*HOUR;
+    }finally {
+      this.rows('UPDATE desk_join SET due=?,message=? WHERE id=?',due,message,JOIN520.id);
+      if(lease)await release(env,lease);
+    }
+  }
+});
+function joinRecord520(j) {
+  if(!j)return '';
+  return ['【参加申請・招待の承認】'+(j.active?'自動確認ON':'休止中'),j.name+' ／ '+j.message,
+    '申請コメント：'+j.comment,
+    j.mailConfigured?(j.mailReceived?'招待メールの受信記録：'+time(j.mailReceived):'受信先は設定済み・招待メールの到着は未確認'):'招待メールの受信が未接続です。承認の自動実行には受信設定が必要です。',
+    '申請は1誌につき1回。確認は1日最大4回。参加後も、作品ごとの掲載条件を確認してから追加します。'].join('\n');
+}
