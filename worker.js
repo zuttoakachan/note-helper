@@ -1,4 +1,4 @@
-const VERSION = 'v16.9';
+const VERSION = 'v16.9.3';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -27,7 +27,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
-<h1>note-helper ${VERSION}</h1><p><a href="/520">520の作品管理・記録</a></p>
+<h1>note-helper ${VERSION}</h1><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <pre>${esc(message)}</pre>
@@ -684,6 +684,7 @@ export default {
   async email(message,env) { await receiveNoteInvite520(message,env); },
   async fetch(request, original) {
     const url = new URL(request.url);
+    if (url.pathname === '/tuta' || url.pathname === '/tuta/') return tutaRoute520(request,original);
     if (url.pathname === '/520') return deskRoute(request,original);
     if (url.pathname === '/' && request.method === 'GET') return page(undefined,url.searchParams.get('account') === '2' ? '2' : '1');
     if (url.pathname !== '/control' || request.method !== 'POST') return reply('Not found',false,404);
@@ -762,10 +763,15 @@ export class NoteScheduler {
         if (path === '/desk/invitation') {
           const input=await request.json();
           this.desk.init();
-          if(typeof input.mail==='string')await this.desk.saveInvitationMail520(input.mail);
-          else {
-            if(!this.desk.joinTarget520(input.id))return deskJson({error:'Unexpected invitation'},400);
-            await this.desk.saveInvitation520(input.url,true,input.id);
+          try {
+            if(typeof input.mail==='string')await this.desk.saveInvitationMail520(input.mail);
+            else {
+              if(!this.desk.joinTarget520(input.id))return deskJson({error:'Unexpected invitation'},400);
+              await this.desk.saveInvitation520(input.url,true,input.id);
+            }
+          } catch(error) {
+            if(error instanceof Input520)return deskJson({error:'Invitation target could not be verified'},400);
+            throw error;
           }
           return deskJson({saved:true});
         }
@@ -905,6 +911,9 @@ async function deskRoute(request,env) {
           article:raw?sharedDraftKey(raw):match?match[1]:sharedDraftKey(''),d:form.get('link_date'),t:form.get('link_time')};
         if(match){input.original=match[1];input.expected=Number(match[2]);}
         if(match && action==='cancel_link' && input.article!==match[1])throw new Input520('取り消す予約と共有リンクが一致しません。');
+      }else if(['tuta_connect','tuta_check','tuta_off'].includes(form.get('work_action'))){
+        input={action:form.get('work_action')};
+        if(input.action==='tuta_connect')Object.assign(input,{email:form.get('tuta_email'),password:form.get('tuta_password'),totp:form.get('tuta_totp')||''});
       }else if(['join_on','join_off','join_invite'].includes(form.get('work_action'))){
         input=form.get('work_action')==='join_invite'?{action:'join_invite',url:(form.get('invite_url')||'').trim()}:
           {action:'join_switch',enable:form.get('work_action')==='join_on'};
@@ -927,7 +936,7 @@ async function deskRoute(request,env) {
     if(!isForm)return res;
     const data=await res.json();
     if(!res.ok){
-      if(res.status===400 && ['reserve_link','replace_link','cancel_link','preview_link','clear_reserved','join_invite','join_switch'].includes(input.action)){
+      if(res.status===400 && ['reserve_link','replace_link','cancel_link','preview_link','clear_reserved','join_invite','join_switch','tuta_connect','tuta_check','tuta_off'].includes(input.action)){
         const overview=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:'status'})}));
         return overview.ok?deskPage(await overview.json(),data.error,400):failure(data.error,400);
       }
@@ -1726,6 +1735,7 @@ class Desk520 {
       });
     }
     this.initJoin520();
+    this.initTuta520();
     this.initShelf520();
     this.initJoinPolicy520();
     this.initExpansion520();
@@ -1790,6 +1800,23 @@ class Desk520 {
           this.rows('UPDATE desk_delivery SET enabled=? WHERE id=1',Number(input.enable));
           break;
         }
+        case 'tuta_status':
+          return deskJson({tuta:this.tutaDashboard520()});
+        case 'tuta_resume':
+          correctionMessage=this.resumeTuta520(now);
+          if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.tutaTick520(Date.now()).catch(()=>{}));
+          break;
+        case 'tuta_connect':
+          correctionMessage=await this.connectTuta520(input);
+          if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.tutaTick520(Date.now()).catch(()=>{}));
+          break;
+        case 'tuta_check':
+          correctionMessage=this.requestTutaCheck520(now);
+          if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.tutaTick520(Date.now()).catch(()=>{}));
+          break;
+        case 'tuta_off':
+          correctionMessage=this.disconnectTuta520();
+          break;
         case 'join_switch':
           need520(typeof input.enable==='boolean','自動申請の指定を確認してください。');
           this.rows('UPDATE desk_join_cfg SET enabled=?,due=0 WHERE id=1',+input.enable);
@@ -1829,6 +1856,7 @@ class Desk520 {
         }
         default: throw new Input520('操作を選んでください。');
       }
+      if(input.tuta_only===true && ['tuta_connect','tuta_check','tuta_off','tuta_resume'].includes(input.action))return deskJson({tuta:this.tutaDashboard520(),correctionMessage});
       const records=this.view(input.action==='status' && Number.isSafeInteger(input.offset) && input.offset>=0?input.offset:0);
       return deskJson({...records,publicationLinks:publicationLinks(records),correctionMessage,recordText:deskRecordText(records)});
     } catch(e) {
@@ -3110,6 +3138,7 @@ class Desk520 {
     await task('下書き一覧',()=>this.resolveDraftDirectory(Date.now()));
     await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
     if(!publication)await task('参加先の募集確認',()=>this.expandJoin520(Date.now()));
+    if(!publication)await task('Tutaの招待確認',()=>this.tutaTick520(Date.now()));
     if(!publication)await task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
     if(!publication)await task('人気記事の入口',()=>this.popularTick520(Date.now()));
     if(!publication)await task('520の作品棚',()=>this.shelfTick520(Date.now()));
@@ -3608,7 +3637,7 @@ function deskPage(records=null,message='',status=200,editing='') {
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>520 作品管理 ${VERSION}</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
 <details id="planform"${selected?' open':''}><summary>下書きの共有リンクで予約</summary>
@@ -3648,9 +3677,22 @@ function deskPage(records=null,message='',status=200,editing='') {
 <label>noteから届いた招待の承認リンク<input name="invite_url" form="readform" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
 <small>登録済みの申請先マガジンIDを含むnote公式の招待リンクに対応します。共有用下書きリンクやマガジンの公開URLではありません。</small>
 <button type="submit" form="readform" name="work_action" value="join_invite">招待を保存して自動承認を待つ</button></details>
-<details><summary>招待メールを自動受信するための設定</summary>
-<p>自分のCloudflare管理ドメインでEmail Routingの受信先をこのWorkerに設定し、NOTE_INVITE_TOにその受信アドレスを設定します。noteの登録メールに届く招待が、この受信先へ届く設定も必要です。メールアドレスは変更しません。「クリエイターからの招待・プレゼント」の通知は自動でONを確認します。</p>
-<small>noteからの正規の招待を確認できたメールだけ受け付けます。手動転送で送信元が変わる場合は上のリンク登録を使ってください。メール受信の設定だけでは、既存メールボックスに届く招待は読み出せません。</small></details></details>
+<details open id="tutaconnect"><summary>Tutaを接続（最初の1回）</summary>
+<p>今のTutaのまま、noteの共同運営招待を自動で確認します。独自ドメイン・転送設定・noteの登録メール変更は不要です。</p>
+<p>上の管理用の鍵を入力し、下にTutaのログイン情報を入力してください。Cloudflare上のブラウザーが受信箱を確認します。接続情報は暗号化保存し、画面やログには出しません。対象の招待メールは既読になる場合があります。</p>
+<label>Tutaのメールアドレス<input name="tuta_email" form="readform" type="email" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="254"></label>
+<label>Tutaのパスワード<input name="tuta_password" form="readform" type="password" autocomplete="new-password" maxlength="1024"></label>
+<details><summary>認証アプリの2段階認証を使っている場合</summary><p>本人のTOTP設定キー（6桁のコードではありません）を指定できます。空欄で追加認証が必要になった場合は保留します。セキュリティキーや別端末での承認は自動で通過できません。</p><label>TOTP設定キー（任意）<input name="tuta_totp" form="readform" type="password" autocomplete="new-password" maxlength="128" autocapitalize="none" spellcheck="false"></label></details>
+<button type="submit" form="readform" name="work_action" value="tuta_connect">Tutaを接続して自動確認</button>
+<button type="submit" form="readform" name="work_action" value="tuta_check">Tutaの接続を再確認</button>
+<button type="submit" form="readform" name="work_action" value="tuta_off">Tutaの接続情報を削除して停止</button>
+<small>設定保存だけでは接続成功ではありません。「記録を開く」で確認結果を見られます。通常は1時間ごと、1日最大24回。直近7日の受信箱を1回最大4ページ・招待8件まで確認し、確認範囲も記録します。参加申請・自動運転の休止中は受信箱も確認しません。</small>
+</details>
+<details><summary>独自ドメインで受信する従来の設定（Tuta接続には不要）</summary>
+<p>note専用の受信アドレスをCloudflare Email Routingで作り、このWorkerへ送る設定にします。受信アドレスをNOTE_INVITE_TOに指定します。</p>
+<p>今読めるメール（Tutaなど）をCloudflareの転送先として確認し、NOTE_MAIL_FORWARD_TOに指定します。専用受信先に届くメールをそこへ転送し、note本人からの対象誌の招待だけを自動処理します。メール変更の確認やパスワード再設定も今の受信箱で読めます。</p>
+<p>登録メールを変更する前に、専用受信先へテストメールを送り、元の受信箱への到着を確認してください。その後、noteの設定で専用受信先へ変更し、届いた確認メールを開きます。このプログラム自体は登録メールを変更しません。「クリエイターからの招待・プレゼント」の通知は自動でONを確認します。</p>
+<small>受信先や転送先の指定だけでは、実際の到着は未確認です。自分のドメインと転送先の確認が必要です。自動処理の対象にできない招待も転送先で読めます。手動で承認する場合は、520でログインして招待メールのリンクを開けます。</small></details></details>
 <details open><summary>520の作品棚・回遊</summary>
 <pre id="shelfstatus">${esc(records?.shelf?shelfRecord520(records.shelf):'「記録を開く」で作品棚の状態を確認できます。')}</pre>
 <p>無料の「520 作品案内」を本人のマガジンに作り、新作と既刊を少しずつ集めます。公開7日後のスキが計測できた作品と、まだ紹介していない作品を選びます。記事下の相互おすすめとスキのお礼も引き続き確認します。プロフィールの「人気記事」表示もONを確認し、読者が過去作を探せる入口を増やします。人気表示はnote側で16記事以上の公開が必要です。</p></details>
@@ -3815,7 +3857,7 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
   $('readform').onsubmit=event=>{
     if(event.submitter===$('basic'))return;
     const action=event.submitter?.value;
-    if(['join_on','join_off','join_invite'].includes(action))return;
+    if(['join_on','join_off','join_invite','tuta_connect','tuta_check','tuta_off'].includes(action))return;
     if(action==='scout'){
       event.preventDefault();
       return wrap(async()=>(await send('scout')).correctionMessage)();
@@ -4034,20 +4076,69 @@ function inviteFromMail520(text,details=false) {
   need520(urls.length===1,'招待の承認リンクを1つに特定できません。');
   return details?{url:urls[0],id:target.id}:urls[0];
 }
+// The registered note address also receives account verification and recovery mail.
+// Keep a copy in the owner's verified inbox; only authenticated invitations can
+// enter the existing approval workflow. No account-verification URL is opened here.
+function noteMailConfig520(env) {
+  const address=value=>{
+    const v=String(value||'').trim();
+    return v.length<=254 && /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(v)?v:'';
+  };
+  const recipient=address(env.NOTE_INVITE_TO),forward=address(env.NOTE_MAIL_FORWARD_TO);
+  const requested=!!String(env.NOTE_MAIL_FORWARD_TO||'').trim();
+  const error=requested && (!recipient || !forward || recipient.toLowerCase()===forward.toLowerCase());
+  return {recipient,forward:requested && !error?forward:'',error};
+}
 async function receiveNoteInvite520(message,env) {
-  if(!env.SCHEDULER || !noteMail520(message,env)){message.setReject('Verified note invitation recipient required');return;}
-  if(message.rawSize>250000){message.setReject('Invitation too large');return;}
-  let invitation;
-  try {
-    const text=mailText520(await read520body(new Response(message.raw),250000));
-    // The owning DO resolves the durable target; raw mail is never persisted.
-    try {invitation=inviteFromMail520(text,true);}catch{invitation={mail:text};}
+  const cfg=noteMailConfig520(env);
+  if(!cfg.recipient || String(message.to||'').toLowerCase()!==cfg.recipient.toLowerCase()) {
+    message.setReject('Unexpected recipient');return;
   }
-  catch {message.setReject('Unsupported invitation message');return;}
-  // A transient storage failure must fail delivery, not silently acknowledge and lose the invitation.
+  if(cfg.error)throw new Error('note-helper: invalid mail forwarding configuration');
+  const trusted=noteMail520(message,env);
+  // Parsing is bounded and never determines whether an inbox copy is kept.
+  // Cloudflare's raw stream can be parsed before calling forward().
+  let text=null;
+  if(trusted && message.rawSize<=250000) {
+    try {text=mailText520(await read520body(new Response(message.raw),250000));}
+    catch { /* Unsupported MIME still reaches the owner's inbox below. */ }
+  }
+  if(cfg.forward) {
+    // A failed forward must never be acknowledged as successful or followed by
+    // an automatic acceptance. Do not expose recipient addresses in errors.
+    try {
+      if(message.canBeForwarded===false || typeof message.forward!=='function')throw Error();
+      await message.forward(cfg.forward);
+    } catch {throw new Error('note-helper: inbox copy could not be forwarded');}
+  }
+  if(!trusted) {
+    if(!cfg.forward)message.setReject('Verified note invitation sender required');
+    return;
+  }
+  if(text===null) {
+    if(!cfg.forward)message.setReject('Unsupported invitation message');
+    return;
+  }
+  const plain=words161(text).normalize('NFKC').replace(/\s+/g,'');
+  if(!/共同運営/.test(plain) || !/招待/.test(plain)) {
+    if(!cfg.forward)message.setReject('Invitation-only recipient; inbox forwarding is not configured');
+    return;
+  }
+  if(!env.SCHEDULER)throw new Error('note-helper: invitation storage unavailable');
+  let invitation;
+  try {invitation=inviteFromMail520(text,true);}catch{invitation={mail:text};}
+  // The owning DO resolves durable targets. Raw mail is not stored or displayed.
   const response=await stub520(env).fetch(new Request('https://scheduler.internal/desk/invitation',{
     method:'POST',body:JSON.stringify(invitation)}));
-  if(!response.ok)throw Error('Invitation could not be saved');
+  const status=response.status;
+  await response.body?.cancel().catch(()=>{});
+  if(status===400) {
+    // An unmatched invitation remains readable in the owner's inbox. Storage
+    // errors use a different status and must never be mistaken for a mismatch.
+    if(!cfg.forward)message.setReject('Invitation target could not be verified');
+    return;
+  }
+  if(!response.ok)throw new Error('note-helper: invitation could not be saved');
 }
 
 // Only note's native comment composer is changed. No undocumented POST endpoint is used.
@@ -4207,9 +4298,9 @@ Object.assign(Desk520.prototype,{
       return {phase:row.phase,at:row.at,message:row.message,proof:row.proof,name:target.name,rule:target.rule,comment:target.comment,active:this.joinActive520(target.id)};
     });
     return {enabled:!!c.enabled,active:this.joinActive520(''),browser:typeof this.env.BROWSER?.acquire==='function',
-      mailConfigured:!!this.env.NOTE_INVITE_TO,mailReceived:c.mail_at,items,total:this.one('SELECT COUNT(*) n FROM desk_join_target').n};
+      mailConfigured:!!noteMailConfig520(this.env).recipient,mailReceived:c.mail_at,mailForwardConfigured:!!noteMailConfig520(this.env).forward,mailForwardError:noteMailConfig520(this.env).error,tuta:this.tutaView520(),items,total:this.one('SELECT COUNT(*) n FROM desk_join_target').n};
   },
-  async saveInvitation520(url,trustedMail=false,id=null) {
+  async saveInvitation520(url,trustedMail=false,id=null,active=()=>true) {
     this.init();
     const candidates=invitationIds520(url).map(k=>this.joinTarget520(k)).filter(j=>j && inviteUrl520(url,j.id,true));
     const target=id?this.joinTarget520(id):candidates.length===1?candidates[0]:null;
@@ -4222,6 +4313,7 @@ Object.assign(Desk520.prototype,{
     const encrypted=await sealInvite520(this.env,target.id,link),now=Date.now();
     this.storage.transactionSync(()=>{
       need520(this.one("SELECT 1 FROM desk_member WHERE id=? AND mode<>'excluded'",target.id),'この誌は除外されています。');
+      need520(active(),'招待の受信を停止しました。');
       // A newer invitation supersedes only unopened ones. Already-opened links remain tombstones.
       this.rows("UPDATE desk_invite SET phase='replaced',iv='',ciphertext='' WHERE id=? AND phase='wait'",target.id);
       this.rows('INSERT OR IGNORE INTO desk_invite(hash,id,iv,ciphertext,created) VALUES(?,?,?,?,?)',hash,target.id,encrypted.iv,encrypted.ciphertext,now);
@@ -4334,7 +4426,8 @@ function joinRecord520(j) {
   if(!j)return '';
   return ['【参加申請・招待の承認】'+(j.active?'自動確認ON':'休止中'),
     ...(j.items||[]).map(r=>r.name+' ／ '+(r.active?'':'休止・除外 ／ ')+r.message),
-    j.mailConfigured?(j.mailReceived?'招待メールの最終受信：'+time(j.mailReceived):'受信先の指定あり・メール到着は未確認'):'招待メールの受信が未接続です。自動承認の稼働には1回の受信接続が必要です。',
+    j.tuta?.configured?tutaRecord520(j.tuta):j.mailConfigured?(j.mailReceived?'招待メールの最終受信：'+time(j.mailReceived):'受信先の指定あり・メール到着は未確認'):'招待メールの受信が未接続です。自動承認の稼働には1回の受信接続が必要です。',
+    j.tuta?.configured?'確認・復旧メールは引き続きTutaで受信します。':j.mailForwardError?'確認・復旧メールの転送先設定に誤りがあります。登録メールの変更は保留してください。':j.mailForwardConfigured?'確認・復旧メール：転送先の指定あり。実際に元の受信箱へ届くことを確認してから登録メールを変更してください。':'確認・復旧メールの転送先は未設定です。この受信先へ登録メールを変更する前に設定してください。',
     '探索・参加先に固定の累計上限はありません。フォロー操作は行いません。新規申請は1日2誌、本人画面の確認は1日8回まで続けます。',
     '申請経路を確認できた誌：'+(j.total??j.items?.length??0)+'誌（この欄の表示は直近40誌。全件の処理と記録は継続）。',
     '送信済みは再申請しません。相手の招待待ちは自動承認できません。参加後も作品ごとの掲載条件を確認します。'].join('\n');
@@ -4738,7 +4831,7 @@ Object.assign(Desk520.prototype,{
     if(!row)return null;
     try{const t=JSON.parse(row.definition);return t.id===id && validJoinTarget520(t)?t:null;}catch{return null;}
   },
-  async saveInvitationMail520(text){
+  async saveInvitationMail520(text,active=()=>true){
     need520(typeof text==='string' && text.length<=250000,'招待本文を確認できません。');
     const plain=words161(text).normalize('NFKC').replace(/\s+/g,'');
     need520(/共同運営/.test(plain)&&/招待/.test(plain),'共同運営招待を確認できません。');
@@ -4755,7 +4848,7 @@ Object.assign(Desk520.prototype,{
     need520(targets.length===1,'招待の対象誌を特定できません。');
     const target=targets[0],urls=[...new Set(links.map(s=>inviteUrl520(s,target.id,ids.length>0)).filter(Boolean))];
     need520(urls.length===1,'承認リンクを1つに特定できません。');
-    return this.saveInvitation520(urls[0],true,target.id);
+    return this.saveInvitation520(urls[0],true,target.id,active);
   },
   async expandJoin520(now){
     const c=this.one('SELECT * FROM desk_expansion WHERE id=1');
@@ -4946,3 +5039,139 @@ Object.assign(Desk520.prototype,{
     finally{this.rows('UPDATE desk_popular SET due=?,message=? WHERE id=1',due,message);if(lease)await release(env,lease);}
   }
 });
+
+// Tuta's own web client performs its decryption. This bridge never uses IMAP,
+// exports a mailbox, follows email links, or dismisses authentication warnings.
+// UI contracts checked against tutao/tutanota MailView, ListModel,
+// ConversationViewModel and MailViewerViewModel; unknown versions fail closed.
+const TUTA520_ORIGIN='https://app.tuta.com';
+function tutaCredentials520(input) {
+  const email=typeof input.email==='string'?input.email.trim().toLowerCase():'';
+  const password=typeof input.password==='string'?input.password:'';
+  const totp=typeof input.totp==='string'?input.totp.replace(/\s/g,'').toUpperCase():'';
+  need520(email.length<=254 && /^[^\s<>@,;]+@(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(email),'Tutaのメールアドレスを末尾まで入力してください。');
+  need520(password.length>0 && password.length<=1024 && !/[\x00\r\n]/.test(password),'Tutaのパスワードを入力してください。');
+  need520(!totp || /^[A-Z2-7]{16,128}$/.test(totp),'TOTPには6桁のコードではなく、本人の認証アプリ設定キーを入力してください。');
+  return {email,password,totp};
+}
+async function tutaSeal520(env,generation,input) {
+  const key=await encryptionKey(env),iv=crypto.getRandomValues(new Uint8Array(12));
+  const data=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode('note-helper:tuta:v1:'+generation)},key,new TextEncoder().encode(JSON.stringify(input)));
+  return {iv:b64(iv),ciphertext:b64(data)};
+}
+async function tutaOpen520(env,row) {
+  const key=await encryptionKey(env);
+  const data=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(row.iv),additionalData:new TextEncoder().encode('note-helper:tuta:v1:'+row.generation)},key,unb64(row.ciphertext));
+  return tutaCredentials520(JSON.parse(new TextDecoder().decode(data)));
+}
+async function tutaTotp520(secret,at=Date.now()) {
+  if(!/^[A-Z2-7]{16,128}$/.test(secret))throw new Error('TOTP configuration');
+  let value=0,bits=0;const bytes=[],alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  for(const char of secret){value=(value<<5)|alphabet.indexOf(char);bits+=5;if(bits>=8){bits-=8;bytes.push((value>>>bits)&255);}}
+  const counter=new Uint8Array(8);new DataView(counter.buffer).setBigUint64(0,BigInt(Math.floor(at/30000)));
+  const key=await crypto.subtle.importKey('raw',new Uint8Array(bytes),{name:'HMAC',hash:'SHA-1'},false,['sign']);
+  const hash=new Uint8Array(await crypto.subtle.sign('HMAC',key,counter)),offset=hash.at(-1)&15;
+  return String((new DataView(hash.buffer).getUint32(offset)&0x7fffffff)%1000000).padStart(6,'0');
+}
+
+// Executed only inside app.tuta.com. Return booleans and candidate identifiers;
+// unrelated subjects, addresses, bodies and authentication data stay in the tab.
+async function tutaScreen520(step,arg={}) {
+  if(location.origin!=='https://app.tuta.com')return {state:'outside'};
+  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden="true"]');
+  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);
+  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();
+  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,...Array.from(e.labels||[],name)].filter(Boolean).join(' ');
+  const unique=xs=>xs.length===1?xs[0]:null;
+  const input=(e,v)=>{
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);
+    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));
+  };
+  const buttons=(root=document)=>all('button,[role="button"],input[type="submit"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');
+  const passwords=all('input[type="password"]').filter(e=>!e.disabled);
+  const emails=all('input[type="email"],input[autocomplete="username"],input[type="text"]')
+    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));
+  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));
+  const captcha=all('iframe[src*="captcha"],input[name*="captcha"]');
+  if(captcha.length)return {state:'challenge'};
+  if(step==='login'||step==='loginSubmit') {
+    if(!/^\/(?:login)?\/?$/.test(location.pathname))return {state:'outside'};
+    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));
+    if(!email||!pass)return {state:'page'};
+    if(step==='login'){
+      input(email,arg.email);input(pass,arg.password);
+      return {state:email.value===arg.email&&pass.value===arg.password?'filled':'page'};
+    }
+    const submit=unique(buttons().filter(e=>/^(?:log\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));
+    if(!submit||email.value!==arg.email||!pass.value)return {state:'page'};
+    submit.click();return {state:'sent'};
+  }
+  if(step==='otp'||step==='otpSubmit') {
+    const field=unique(otp),root=field?.closest('[role="dialog"],dialog,form')||document;
+    if(!field)return {state:'challenge'};
+    if(step==='otp'){
+      if(!/^\d{6}$/.test(arg.code||''))return {state:'challenge'};
+      input(field,arg.code);return {state:'filled'};
+    }
+    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));
+    if(!submit||!/^\d{6}$/.test(field.value))return {state:'page'};
+    submit.click();return {state:'sent'};
+  }
+  if(otp.length)return {state:'otp'};
+  if(passwords.length && emails.length)return {state:'login'};
+
+  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;
+  // email HTML and DOM attributes cannot create an application model here.
+  const queue=[];
+  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {
+    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;
+    if(Array.isArray(nodes))queue.push(...nodes);
+  }
+  const seen=new Set(),models=new Set();
+  for(let i=0;i<queue.length && i<12000;i++) {
+    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);
+    for(const container of [node.attrs,node.state]) {
+      const model=container?.mailViewModel;
+      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);
+    }
+    if(node.instance)queue.push(node.instance);
+    if(Array.isArray(node.children))queue.push(...node.children);
+  }
+  const model=unique([...models]);if(!model)return {state:'page'};
+  const list=model.listModel,items=list.state?.items;
+  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page'};
+
+  // Locate the signed-in controller through the trusted application's own model
+  // dependencies. Never infer identity from text in an email or a screen label.
+  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;
+  for(let i=0;i<dependencies.length && i<600;i++) {
+    const {object,depth}=dependencies[i];
+    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;
+    checked.add(object);
+    if(typeof object.getUserController==='function') {
+      try{
+        const email=object.getUserController()?.userGroupInfo?.mailAddress;
+        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}
+      }catch{}
+    }
+    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {
+      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});
+    }
+  }
+  if(wrong || !identity)return {state:'identity'};
+  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};
+  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;
+  const sender=address=>typeof address==='string' && /^[^@<>\s,;]+@(?:[a-z0-9-]+\.)?note\.(?:com|mu)$/i.test(address);
+  const date=mail=>new Date(mail.receivedDate).getTime();
+  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();
+  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));
+  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),
+    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};
+  if(step==='more') {
+    if(typeof list.loadMore!=='function')return {state:'page'};
+    await list.loadMore();return {state:'loaded'};
+  }
+  if(step==='open') {
+    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));
+    if(!mail)return {state:'changed'};
+    await model.onSingleSelection
