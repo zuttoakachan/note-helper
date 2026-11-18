@@ -5476,3 +5476,6 @@ Object.assign(Desk520.prototype,{
       this.rows('UPDATE desk_delivery SET enabled=1 WHERE id=1');
       this.rows('UPDATE desk_join_cfg SET enabled=1 WHERE id=1');
     });
+    return 'Tuta確認と520の自動運転を再開しました。待機期限・次回時刻・履歴・除外設定は維持します。Tutaへの接続成功は確認記録を見てください。';
+  }
+});
