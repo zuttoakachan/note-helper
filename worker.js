@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.5';
+const VERSION = 'v16.9.6';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -2021,7 +2021,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows('SELECT task,at,message FROM desk_task_health WHERE failed=1 ORDER BY at DESC'),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3040,7 +3040,7 @@ class Desk520 {
       this.rows('UPDATE desk_recommend SET utc_day=?,used=? WHERE id=1',today,used+1);
       message='Cloudflareのブラウザーを起動できず・再確認待ち';
       const result=await browserRecommendation(binding,id,cookie,state.attempted,state.tries,async()=>{
-        if(!this.shelfActive520())return false;
+        if(!this.deliveryActive520())return false;
         const live=await sql(recommendEnv,'SELECT c.token,c.lease,c.account,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',slot).first(),at=Date.now();
         if(!live || live.token!==recommendLease || live.account!==id || live.lease<=at || live.hold_until>at || (live.kind && live.next_at>at))return false;
         this.rows("UPDATE desk_recommend SET attempted=?,tries=tries+1,message='ON操作の保存結果を確認待ち' WHERE id=1",at);
@@ -3141,7 +3141,6 @@ class Desk520 {
     if(!publication)await task('Tutaの招待確認',()=>this.tutaTick520(Date.now()));
     if(!publication)await task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
     if(!publication)await task('人気記事の入口',()=>this.popularTick520(Date.now()));
-    if(!publication)await task('520の作品棚',()=>this.shelfTick520(Date.now()));
     if(!publication)await task('スキのお礼設定',()=>this.syncReactions(Date.now()));
   }
   async tickRecords() {
@@ -3657,7 +3656,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 </details></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#schedules">予約した作品を見る</a></p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
-<details><summary>自動公開・共同誌・参加申請・作品棚・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
+<details><summary>自動公開・共同誌・参加申請・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>年をまたぐ予約や、登録済みの日付の間への追加もできます。公開日時の順に表示します。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
@@ -3693,9 +3692,9 @@ function deskPage(records=null,message='',status=200,editing='') {
 <p>今読めるメール（Tutaなど）をCloudflareの転送先として確認し、NOTE_MAIL_FORWARD_TOに指定します。専用受信先に届くメールをそこへ転送し、note本人からの対象誌の招待だけを自動処理します。メール変更の確認やパスワード再設定も今の受信箱で読めます。</p>
 <p>登録メールを変更する前に、専用受信先へテストメールを送り、元の受信箱への到着を確認してください。その後、noteの設定で専用受信先へ変更し、届いた確認メールを開きます。このプログラム自体は登録メールを変更しません。「クリエイターからの招待・プレゼント」の通知は自動でONを確認します。</p>
 <small>受信先や転送先の指定だけでは、実際の到着は未確認です。自分のドメインと転送先の確認が必要です。自動処理の対象にできない招待も転送先で読めます。手動で承認する場合は、520でログインして招待メールのリンクを開けます。</small></details></details>
-<details open><summary>520の作品棚・回遊</summary>
-<pre id="shelfstatus">${esc(records?.shelf?shelfRecord520(records.shelf):'「記録を開く」で作品棚の状態を確認できます。')}</pre>
-<p>無料の「520 作品案内」を本人のマガジンに作り、新作と既刊を少しずつ集めます。公開7日後のスキが計測できた作品と、まだ紹介していない作品を選びます。記事下の相互おすすめとスキのお礼も引き続き確認します。プロフィールの「人気記事」表示もONを確認し、読者が過去作を探せる入口を増やします。人気表示はnote側で16記事以上の公開が必要です。</p></details>
+<details><summary>旧版の作品棚の記録（自動作成・追加は廃止）</summary>
+<pre id="shelfstatus">${esc(records?.shelf?shelfRecord520(records.shelf):'「記録を開く」で旧版の操作記録を確認できます。')}</pre>
+<p>本人のマガジンの自動作成と作品追加は行いません。旧版の記録だけを表示します。記事内の誘導リンクや案内記事も追加しません。</p></details>
 <details id="magsection"><summary>マガジンの自動確認</summary>
 <p>520の公開一覧、ほかの作者の一覧、文芸誌の最新号から継続して探します。1回に処理しきれない一覧と次ページは続きから確認します。累計誌数の上限は設けません。通信量と申請間隔は抑えます。</p>
 <p>発見しただけの誌には追加しません。共同運営者としての編集権限・無料・募集条件を確認できた誌が対象です。参加申請・招待の承認は上の専用欄に表示します。</p>
@@ -4486,213 +4485,29 @@ async function prepareJoinAccount520(io,target,id,steps,mark,mayAct) {
   return {noFollow:true,message:'参加に新しいフォローが必要なため申請を見送り。フォロー数は増やしません'};
 }
 
-const SHELF520=Object.freeze({name:'520 作品案内',description:'520（43__）の小説・エッセイ・詩を集めた作品棚です。新作と、これまでの作品をここから読めます。'});
-function shelfProof520(payload,key=null){
-  const d=payload?.data?.magazine??payload?.data;
-  return !!d && /^m[a-z0-9]{1,64}$/.test(d.key||'') && (!key||d.key===key) && d.owner?.urlname==='43__' &&
-    d.name===SHELF520.name && (d.description??d.desc)===SHELF520.description &&
-    !d.isPaid && !d.is_paid && !(Number(d.price)>0) && (d.price===0||d.isFree===true||d.magazineType==='free') &&
-    !d.isPrivate && !d.is_private && (d.isPrivate===false||d.is_private===false||d.isPublic===true||d.status==='published'||d.status==='public') && !['private','paid','subscription','membership'].includes(d.status??d.magazineType??d.type);
-}
-function shelfDOM520(step,arg){
-  if(location.origin!=='https://note.com')return {state:'page'};
-  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');
-  const text=e=>(e.getAttribute('aria-label')||e.textContent||e.value||'').trim();
-  const buttons=root=>[...root.querySelectorAll('button,[role=button],input[type=submit]')].filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true');
-  const root=document.querySelector('main,[role=main]')||document.body;
-  const safeLink=a=>{try{const u=new URL(a.href);return u.origin===location.origin&&!u.username&&!u.password?u:null;}catch{return null;}};
-  if(step==='menu'){
-    const links=[...document.querySelectorAll('a[href]')].filter(a=>visible(a)&&text(a)==='マガジン').map(safeLink).filter(u=>u&&/^\/(?:43__\/)?magazines\/?$/.test(u.pathname));
-    const urls=[...new Set(links.map(u=>u.href))];
-    if(urls.length===1)return {state:'link',url:urls[0]};
-    const menus=buttons(document).filter(b=>['アカウントメニュー','ユーザーメニュー','プロフィールメニュー'].includes(text(b)));
-    if(menus.length===1){menus[0].click();return {state:'opening'};}
-    return {state:'missing'};
-  }
-  if(step==='list'){
-    if(!/^\/(?:43__\/)?magazines\/?$/.test(location.pathname))return {state:'page'};
-    const links=[...root.querySelectorAll('a[href]')].filter(visible),keys=new Set();
-    for(const a of links){const u=safeLink(a),m=u&&/^\/(?:43__\/)?m\/(m[a-z0-9]{1,64})\/?$/.exec(u.pathname);
-      if(m && (text(a)===arg.name || [...a.querySelectorAll('h1,h2,h3,h4')].some(h=>text(h)===arg.name)))keys.add(m[1]);}
-    const more=buttons(root).filter(b=>/^(もっと見る|さらに表示|次へ|次のページ)$/.test(text(b)));
-    const pages=links.filter(a=>a.rel==='next'||['次へ','次のページ'].includes(text(a))).map(safeLink).filter(u=>u && u.pathname===location.pathname && u.href!==location.href);
-    if(keys.size>1)return {state:'ambiguous'};
-    if(keys.size===1)return {state:'found',key:[...keys][0]};
-    if(pages.length===1)return {state:'next',url:pages[0].href};
-    if(more.length===1){more[0].click();return {state:'loading'};}
-    if(more.length||pages.length)return {state:'incomplete'};
-    const create=links.filter(a=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(a))).map(safeLink)
-      .filter(u=>u && /^\/magazines\/(?:new|create)\/?$/.test(u.pathname));
-    if(create.length===1)return {state:'new',url:create[0].href};
-    const bs=buttons(root).filter(b=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(b)));
-    if(bs.length===1)return {state:'newbutton'};
-    return {state:'missing'};
-  }
-  if(step==='open'){
-    if(!/^\/(?:43__\/)?magazines\/?$/.test(location.pathname))return {state:'page'};
-    const bs=buttons(root).filter(b=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(b)));
-    if(bs.length!==1)return {state:'missing'};bs[0].click();return {state:'opened'};
-  }
-  if(!/^\/magazines\/(?:new|create)\/?$/.test(location.pathname) && !document.querySelector('[role=dialog]'))return {state:'page'};
-  const form=document.querySelector('[role=dialog]')||root;
-  if(!/マガジン/.test(form.innerText||''))return {state:'page'};
-  const fields=[...form.querySelectorAll('input,textarea')].filter(e=>visible(e)&&!e.disabled&&!e.readOnly);
-  const caption=e=>[e.placeholder,e.getAttribute('aria-label'),...(e.labels||[])].map(v=>typeof v==='string'?v:v?.textContent||'').join(' ');
-  const names=fields.filter(e=>/マガジン(?:の)?(?:タイトル|名)|タイトル/.test(caption(e)) && ['text',''].includes(e.type||''));
-  const descriptions=fields.filter(e=>/説明/.test(caption(e)) && e.tagName==='TEXTAREA');
-  if(names.length!==1 || descriptions.length!==1)return {state:'missing'};
-  const selected=[...form.querySelectorAll('input:checked,[aria-checked=true],[aria-selected=true]')].filter(visible)
-    .map(e=>e.labels?.length?[...e.labels].map(text).join(' '):text(e));
-  // Both public visibility and free distribution must be explicit. Never silently accept a paid default.
-  if(!selected.some(t=>/^無料(?:マガジン)?$/.test(t.trim())) || !selected.some(t=>/^公開$/.test(t.trim())) ||
-     selected.some(t=>/有料|定期購読|非公開|メンバーシップ/.test(t)))return {state:'unsafe'};
-  if(step==='fill'){
-    if((names[0].value && names[0].value!==arg.name)||(descriptions[0].value && descriptions[0].value!==arg.description))return {state:'draft'};
-    for(const [el,value] of [[names[0],arg.name],[descriptions[0],arg.description]]){
-      Object.getOwnPropertyDescriptor(el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,'value').set.call(el,value);
-      el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));
-    }
-    return {state:'filled'};
-  }
-  if(step==='create'){
-    if(names[0].value!==arg.name || descriptions[0].value!==arg.description)return {state:'changed'};
-    const bs=buttons(form).filter(b=>['作成','作成する'].includes(text(b)));
-    if(bs.length!==1)return {state:'missing'};bs[0].click();return {state:'clicked'};
-  }
-  return {state:'ready'};
-}
-async function browserShelf520(binding,id,cookie,create,mark,live){
-  return inNoteBrowser(binding,cookie,false,async({command,evaluate,blocked,blockedResult})=>{
-    const poll=async(fn,ok)=>{for(let i=0;i<10&&!blocked();i++){try{const v=await fn();if(ok(v))return v;}catch{}await pause520(250);}return null;};
-    const dom=step=>evaluate('('+BROWSER_SOURCES520.shelfDOM520+')('+JSON.stringify(step)+','+JSON.stringify(SHELF520)+')');
-    await command('Page.navigate',{url:'https://note.com/43__/magazines'});
-    const who=await poll(()=>evaluate(noteIdentityJS),v=>v?.id);
-    if(who?.id!==id || who?.name!=='43__')return {message:'作品棚の作成前に520本人を確認待ち'};
-    let listing=await poll(()=>dom('list'),v=>['found','new','newbutton','next','loading','ambiguous'].includes(v?.state));
-    if(!listing){
-      const menu=await dom('menu');
-      if(menu.state==='opening'){await pause520(300);listing=await dom('menu');}else listing=menu;
-      if(listing?.state==='link'){await command('Page.navigate',{url:listing.url});listing=await poll(()=>dom('list'),v=>v?.state!=='page'&&v?.state!=='missing');}
-    }
-    const visited=new Set();
-    for(let i=0;i<6 && !blocked() && ['next','loading'].includes(listing?.state);i++){
-      if(listing.state==='next'){if(visited.has(listing.url))break;visited.add(listing.url);await command('Page.navigate',{url:listing.url});}
-      await pause520(400);listing=await dom('list');
-    }
-    if(blocked())return blockedResult();
-    if(listing?.state==='found'){
-      const data=await evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;const r=await fetch('/api/v1/magazines/'+${JSON.stringify(listing.key)},{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});return r.ok?await r.json():null;})()`);
-      return shelfProof520(data,listing.key)?{key:listing.key,message:'520本人の無料の作品棚を確認済み'}:{message:'同名のマガジンを確認しましたが、所有者・無料・説明が一致しないため保留'};
-    }
-    if(!create)return {message:'作成操作の結果を再確認待ち・同じ作品棚を重複作成しません'};
-    if(!['new','newbutton'].includes(listing?.state))return {message:'マガジン一覧と新規作成欄を確認待ち'};
-    if(listing.state==='new')await command('Page.navigate',{url:listing.url});else await dom('open');
-    const fields=await poll(()=>dom('fill'),v=>v?.state==='filled');
-    if(!fields)return blocked()?blockedResult():{message:'作品棚の無料・公開設定と入力欄を確認待ち'};
-    const identity=await evaluate(noteIdentityJS);
-    if(blocked())return blockedResult();
-    if(identity?.id!==id || identity?.name!=='43__' || !await live() || !await mark())return {message:'作品棚の作成を保留'};
-    const result=await dom('create');
-    return result?.state==='clicked'?{sent:true,message:'作品棚の作成を操作済み・次回に公開情報で確認'}:{notClicked:true,message:'作成ボタンを確認できず・再確認待ち'};
-  });
-}
-function shelfCandidates520(rows,now){
-  const eligible=rows.filter(r=>r.title.trim()!=='521' && r.pub>0 && r.pub<=now && r.verified>=now-8*D520);
-  const recent=[...eligible].sort((a,b)=>b.pub-a.pub||a.article.localeCompare(b.article)).slice(0,2);
-  const rest=eligible.filter(r=>!recent.some(a=>a.article===r.article));
-  // Comparable seven-day counts pick entrances; unknown counts stay eligible for discovery.
-  rest.sort((a,b)=>(b.d7??-1)-(a.d7??-1)||a.pub-b.pub||a.article.localeCompare(b.article));
-  const measured=rest.slice(0,4),remaining=rest.slice(4);
-  const week=Math.floor((now+9*HOUR)/(7*D520)),start=remaining.length?week*2%remaining.length:0;
-  const explore=Array.from({length:Math.min(2,remaining.length)},(_,i)=>remaining[(start+i)%remaining.length]);
-  return recent.concat(measured,explore);
-}
+// Previous shelf records are retained for inspection only; no creation or addition code remains.
 Object.assign(Desk520.prototype,{
   initShelf520(){
     if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_shelf'"))return;
     this.storage.transactionSync(()=>{
-      this.rows("CREATE TABLE desk_shelf(id INTEGER PRIMARY KEY,phase TEXT NOT NULL DEFAULT 'wait',article TEXT NOT NULL DEFAULT '',due INTEGER NOT NULL DEFAULT 0,at INTEGER NOT NULL DEFAULT 0,day TEXT NOT NULL DEFAULT '',used INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '無料の作品棚を確認待ち')");
+      this.rows("CREATE TABLE desk_shelf(id INTEGER PRIMARY KEY,phase TEXT NOT NULL DEFAULT 'wait',article TEXT NOT NULL DEFAULT '',due INTEGER NOT NULL DEFAULT 0,at INTEGER NOT NULL DEFAULT 0,day TEXT NOT NULL DEFAULT '',used INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '自作マガジンの自動作成・作品追加は廃止')");
       this.rows('INSERT INTO desk_shelf(id) VALUES(1)');
       this.rows("CREATE TABLE desk_shelf_item(article TEXT PRIMARY KEY,phase TEXT NOT NULL,at INTEGER NOT NULL,due INTEGER NOT NULL,baseline INTEGER,message TEXT NOT NULL)");
       this.rows('CREATE INDEX desk_shelf_item_due ON desk_shelf_item(due)');
     });
   },
-  shelfActive520(){return !!this.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());},
+  deliveryActive520(){return !!this.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());},
   shelfView520(){
     const s=this.one('SELECT phase,article,at,message FROM desk_shelf WHERE id=1');
     const items=this.rows('SELECT i.phase,i.message,i.at,a.title FROM desk_shelf_item i JOIN desk_archive a ON a.article=i.article ORDER BY i.at DESC LIMIT 12');
-    return {...s,items,active:this.shelfActive520(),url:s.article?'https://note.com/43__/m/'+s.article:null};
+    return {...s,items,active:false,message:'自作マガジンの自動作成・作品追加は廃止しました。',previousMessage:s.message,url:s.article?'https://note.com/43__/m/'+s.article:null};
   },
-  async shelfTick520(now){
-    const state=this.one('SELECT * FROM desk_shelf WHERE id=1');
-    if(!this.shelfActive520() || state.due>now || typeof this.env.BROWSER?.acquire!=='function')return;
-    if(this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520)||
-       this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
-    const today=jstDay(now),used=state.day===today?state.used:0;
-    if(used>=4){this.rows('UPDATE desk_shelf SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
-    this.rows('UPDATE desk_shelf SET due=? WHERE id=1',now+30*M520);
-    let env,lease,message=state.message,due=now+2*HOUR,attempt=0;
-    try{
-      const info=await this.deliveryAccount();
-      if(!info || info.until>Date.now()){message='作品棚の更新は520の処理・待機終了後';due=Math.max(now+4*M520,info?.until||0);return;}
-      env=scoped(this.env,info.slot);lease=await acquire(env,false);
-      if(!lease){message='作品棚の更新は520の使用終了後';due=now+4*M520;return;}
-      const cookie=cleanCookie((await loadCookie(env,info.id)).NOTE_SESSION);
-      const live=async()=>{
-        if(!this.shelfActive520())return false;
-        const c=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',info.slot).first(),at=Date.now();
-        return c?.account===info.id && c.token===lease && c.lease>at && c.hold_until<=at && (!c.kind||c.next_at<=at);
-      };
-      let result;
-      if(!state.article){
-        this.rows('UPDATE desk_shelf SET day=?,used=? WHERE id=1',today,used+1);
-        result=await browserShelf520(this.env.BROWSER,info.id,cookie,state.phase==='wait',async()=>{
-          if(!await live())return false;
-          const row=this.one("UPDATE desk_shelf SET phase='sent',at=? WHERE id=1 AND phase='wait' RETURNING id",Date.now());
-          if(row)attempt=Date.now();return !!row;
-        },live);
-        if(result.key && this.shelfActive520())this.rows("UPDATE desk_shelf SET article=?,phase='ready' WHERE id=1",result.key);
-        if(result.notClicked && attempt)this.rows("UPDATE desk_shelf SET phase='wait' WHERE id=1 AND phase='sent' AND at=?",attempt);
-      }else{
-        if(!shelfProof520(await this.publicRead('https://note.com/api/v1/magazines/'+state.article,'json'),state.article)){message='作品棚の所有者・無料・説明の再確認待ち';due=now+D520;return;}
-        // Only read pending confirmations. Public RSS confirms entries independently of browser clicks.
-        const pending=this.rows("SELECT article FROM desk_shelf_item WHERE phase IN ('sent','seen') AND due<=? ORDER BY due LIMIT 8",now);
-        if(pending.length){
-          const entries=await this.readIssue('https://note.com/43__/m/'+state.article);
-          for(const p of pending){
-            const confirmed=entries.some(e=>publicKey520(e.link)===p.article);
-            this.rows('UPDATE desk_shelf_item SET phase=?,due=?,message=? WHERE article=?',confirmed?'confirmed':'sent',now+6*HOUR,confirmed?'作品棚のRSSで掲載を確認済み':'掲載結果を確認待ち・再追加なし',p.article);
-          }
-        }
-        if(this.one("SELECT COUNT(*) n FROM desk_shelf_item WHERE at>=?",jstStart(today)).n>=2){message='本日の作品棚への追加2本を操作済み';due=jstStart(today)+D520+M520;return;}
-        const candidates=this.rows(`SELECT a.article,a.title,a.pub,a.verified,a.likes,s.value d7 FROM desk_archive a
-          LEFT JOIN desk_entries e ON e.article=a.article LEFT JOIN desk_sample s ON s.seq=e.seq AND s.age=7
-          WHERE a.verified>=? ORDER BY a.pub DESC LIMIT 300`,now-8*D520);
-        const work=shelfCandidates520(candidates,now).find(w=>!this.one('SELECT 1 FROM desk_shelf_item WHERE article=?',w.article));
-        if(!work){message='現在確認できた作品棚の追加候補は処理済み';due=now+6*HOUR;return;}
-        const n=(await this.publicRead('https://note.com/api/v3/notes/'+work.article,'json'))?.data;
-        if(n?.key!==work.article || !isPublishedBy520(n) || n.name!==work.title || n.name.trim()==='521'){message='作品棚の候補の現在の公開状態を再確認待ち';return;}
-        this.rows('UPDATE desk_shelf SET day=?,used=? WHERE id=1',today,used+1);
-        result=await browserDelivery(this.env.BROWSER,info.id,cookie,{kind:'mag',key:work.article,title:work.title,target:state.article},async key=>{
-          if(key!==work.article || !await live())return false;
-          const row=this.one("INSERT OR IGNORE INTO desk_shelf_item(article,phase,at,due,baseline,message) VALUES(?,'sent',?,?,?,'作品棚への追加操作を記録・結果未確認') RETURNING article",key,Date.now(),Date.now()+4*M520,work.likes);
-          if(row)attempt=Date.now();return !!row;
-        });
-        if(result.notClicked && attempt)this.rows("DELETE FROM desk_shelf_item WHERE article=? AND phase='sent' AND at=?",work.article,attempt);
-        if(result.seen)this.rows("INSERT INTO desk_shelf_item(article,phase,at,due,baseline,message) VALUES(?,'seen',?,?,?,'画面で追加済み・RSSで再確認待ち') ON CONFLICT(article) DO UPDATE SET phase='seen'",work.article,Date.now(),Date.now()+4*M520,work.likes);
-      }
-      message=result.message;due=Date.now()+(result.key||result.sent||attempt?4*M520:2*HOUR);
-      if(result.hold>0){const until=Date.now()+result.hold;due=Math.max(due,until);this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,info.slot).run();}
-    }catch(error){message=readLimit(error)?'D1の読み取り枠更新後に作品棚を確認':'作品棚の処理を再確認待ち・記録済みの操作は再送しません';due=readLimit(error)?(Math.floor(Date.now()/D520)+1)*D520+M520:Date.now()+2*HOUR;}
-    finally{this.rows('UPDATE desk_shelf SET due=?,message=? WHERE id=1',due,message);if(lease)await release(env,lease);}
-  }
 });
 function shelfRecord520(s){
   if(!s)return '';
-  return ['【520の作品棚】'+(s.active?'自動更新ON':'休止中'),s.message,s.url||'無料の「520 作品案内」を作成・確認待ち',
-    ...s.items.map(i=>i.title+' ／ '+i.message),
-    '新作2本を優先し、公開7日後のスキと未紹介の既刊から選択。追加は1日2本まで。原文と固定記事521は編集しません。',
-    'スキ・フォロワーの推移を記録します。回遊率や読了数、掲載による増加効果そのものは未計測です。'].join('\n');
+  return ['【520の作品棚】自動作成・作品追加の機能は廃止',
+    ...(s.article || s.at || s.items.length ? ['以下は旧版の操作記録です。',s.previousMessage||'',s.url||'',
+      ...s.items.map(i=>i.title+' ／ '+i.message)] : [])].filter(Boolean).join('\n');
 }
 
 // Reviewed publishers' broad invitations are not re-labelled as explicit AI approval.
@@ -5012,7 +4827,7 @@ async function browserPopular520(binding,id,cookie,mayChange,mark){
 Object.assign(Desk520.prototype,{
   async popularTick520(now){
     const state=this.one('SELECT * FROM desk_popular WHERE id=1');
-    if(state.due>now || !this.shelfActive520())return;
+    if(state.due>now || !this.deliveryActive520())return;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520)||
       this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     this.rows('UPDATE desk_popular SET due=? WHERE id=1',now+2*HOUR);
@@ -5025,7 +4840,7 @@ Object.assign(Desk520.prototype,{
       if(!lease){due=now+30*M520;return;}
       const cookie=cleanCookie((await loadCookie(env,a.id)).NOTE_SESSION);
       const result=await browserPopular520(this.env.BROWSER,a.id,cookie,!state.attempt||state.attempt<=now-D520,async(saveOnly=false)=>{
-        if(!this.shelfActive520())return false;
+        if(!this.deliveryActive520())return false;
         const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',a.slot).first(),at=Date.now();
         if(!live || live.account!==a.id || live.token!==lease || live.lease<=at || live.hold_until>at || (live.kind && live.next_at>at))return false;
         if(saveOnly)return true;
@@ -5562,6 +5377,5 @@ const BROWSER_SOURCES520 = Object.freeze({
   "draftBodyHash": "async function draftBodyHash(body){\n  if(typeof body!=='string' || !body.trim() || body.length>2500000)return null;\n  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(body));\n  return Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('');\n}",
   "noteJoinDOM520": "function noteJoinDOM520(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();\n  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));\n  if(fields.length!==1)return {state:'composer'};\n  const field=fields[0];\n  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);\n  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));\n  for(const card of cards) {\n    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\\/$/,'')==='/43__';}catch{return false;}});\n    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};\n  }\n  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&\n    (e.closest('[class*=\"comment\"],[class*=\"Comment\"],[data-testid*=\"comment\"]')));\n  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}\n  // An incomplete comment history cannot establish that this account has not already applied.\n  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};\n  if(step==='read')return {state:'ready'};\n  let scope=field.closest('form')||field.parentElement;\n  let buttons=[];\n  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {\n    if(scope.querySelectorAll('textarea').length!==1)break;\n    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');\n    if(buttons.length)break;\n  }\n  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};\n  if(step==='fill') {\n    if(field.value && field.value!==arg.comment)return {state:'draft'};\n    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);\n    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));\n    return {state:'filled'};\n  }\n  if(step==='send') {\n    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};\n    buttons[0].click();return {state:'clicked'};\n  }\n  return {state:'page'};\n}",
   "joinFollowDOM520": "function joinFollowDOM520(owner,action) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const canonical=document.querySelector('link[rel=canonical]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();\n  const roots=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));\n  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];\n  if(controls.length!==1)return 'missing';\n  const b=controls[0];\n  if(name(b)==='フォロー中')return 'on';\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  // This function is deliberately read-only, regardless of action.\n  return 'off';\n}",
-  "shelfDOM520": "function shelfDOM520(step,arg){\n  if(location.origin!=='https://note.com')return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const text=e=>(e.getAttribute('aria-label')||e.textContent||e.value||'').trim();\n  const buttons=root=>[...root.querySelectorAll('button,[role=button],input[type=submit]')].filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true');\n  const root=document.querySelector('main,[role=main]')||document.body;\n  const safeLink=a=>{try{const u=new URL(a.href);return u.origin===location.origin&&!u.username&&!u.password?u:null;}catch{return null;}};\n  if(step==='menu'){\n    const links=[...document.querySelectorAll('a[href]')].filter(a=>visible(a)&&text(a)==='マガジン').map(safeLink).filter(u=>u&&/^\\/(?:43__\\/)?magazines\\/?$/.test(u.pathname));\n    const urls=[...new Set(links.map(u=>u.href))];\n    if(urls.length===1)return {state:'link',url:urls[0]};\n    const menus=buttons(document).filter(b=>['アカウントメニュー','ユーザーメニュー','プロフィールメニュー'].includes(text(b)));\n    if(menus.length===1){menus[0].click();return {state:'opening'};}\n    return {state:'missing'};\n  }\n  if(step==='list'){\n    if(!/^\\/(?:43__\\/)?magazines\\/?$/.test(location.pathname))return {state:'page'};\n    const links=[...root.querySelectorAll('a[href]')].filter(visible),keys=new Set();\n    for(const a of links){const u=safeLink(a),m=u&&/^\\/(?:43__\\/)?m\\/(m[a-z0-9]{1,64})\\/?$/.exec(u.pathname);\n      if(m && (text(a)===arg.name || [...a.querySelectorAll('h1,h2,h3,h4')].some(h=>text(h)===arg.name)))keys.add(m[1]);}\n    const more=buttons(root).filter(b=>/^(もっと見る|さらに表示|次へ|次のページ)$/.test(text(b)));\n    const pages=links.filter(a=>a.rel==='next'||['次へ','次のページ'].includes(text(a))).map(safeLink).filter(u=>u && u.pathname===location.pathname && u.href!==location.href);\n    if(keys.size>1)return {state:'ambiguous'};\n    if(keys.size===1)return {state:'found',key:[...keys][0]};\n    if(pages.length===1)return {state:'next',url:pages[0].href};\n    if(more.length===1){more[0].click();return {state:'loading'};}\n    if(more.length||pages.length)return {state:'incomplete'};\n    const create=links.filter(a=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(a))).map(safeLink)\n      .filter(u=>u && /^\\/magazines\\/(?:new|create)\\/?$/.test(u.pathname));\n    if(create.length===1)return {state:'new',url:create[0].href};\n    const bs=buttons(root).filter(b=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(b)));\n    if(bs.length===1)return {state:'newbutton'};\n    return {state:'missing'};\n  }\n  if(step==='open'){\n    if(!/^\\/(?:43__\\/)?magazines\\/?$/.test(location.pathname))return {state:'page'};\n    const bs=buttons(root).filter(b=>['マガジンを作る','マガジンをつくる','マガジンを作成'].includes(text(b)));\n    if(bs.length!==1)return {state:'missing'};bs[0].click();return {state:'opened'};\n  }\n  if(!/^\\/magazines\\/(?:new|create)\\/?$/.test(location.pathname) && !document.querySelector('[role=dialog]'))return {state:'page'};\n  const form=document.querySelector('[role=dialog]')||root;\n  if(!/マガジン/.test(form.innerText||''))return {state:'page'};\n  const fields=[...form.querySelectorAll('input,textarea')].filter(e=>visible(e)&&!e.disabled&&!e.readOnly);\n  const caption=e=>[e.placeholder,e.getAttribute('aria-label'),...(e.labels||[])].map(v=>typeof v==='string'?v:v?.textContent||'').join(' ');\n  const names=fields.filter(e=>/マガジン(?:の)?(?:タイトル|名)|タイトル/.test(caption(e)) && ['text',''].includes(e.type||''));\n  const descriptions=fields.filter(e=>/説明/.test(caption(e)) && e.tagName==='TEXTAREA');\n  if(names.length!==1 || descriptions.length!==1)return {state:'missing'};\n  const selected=[...form.querySelectorAll('input:checked,[aria-checked=true],[aria-selected=true]')].filter(visible)\n    .map(e=>e.labels?.length?[...e.labels].map(text).join(' '):text(e));\n  // Both public visibility and free distribution must be explicit. Never silently accept a paid default.\n  if(!selected.some(t=>/^無料(?:マガジン)?$/.test(t.trim())) || !selected.some(t=>/^公開$/.test(t.trim())) ||\n     selected.some(t=>/有料|定期購読|非公開|メンバーシップ/.test(t)))return {state:'unsafe'};\n  if(step==='fill'){\n    if((names[0].value && names[0].value!==arg.name)||(descriptions[0].value && descriptions[0].value!==arg.description))return {state:'draft'};\n    for(const [el,value] of [[names[0],arg.name],[descriptions[0],arg.description]]){\n      Object.getOwnPropertyDescriptor(el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,'value').set.call(el,value);\n      el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));\n    }\n    return {state:'filled'};\n  }\n  if(step==='create'){\n    if(names[0].value!==arg.name || descriptions[0].value!==arg.description)return {state:'changed'};\n    const bs=buttons(form).filter(b=>['作成','作成する'].includes(text(b)));\n    if(bs.length!==1)return {state:'missing'};bs[0].click();return {state:'clicked'};\n  }\n  return {state:'ready'};\n}",
   "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel,items=list.state?.items;\n  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    await list.loadMore();return {state:'loaded'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}"
 });
