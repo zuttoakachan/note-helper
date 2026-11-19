@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.9';
+const VERSION = 'v16.9.10';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -31,6 +31,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>創作記事の感想コメントへのスキと、創作記事に反応した読者の公開記事を自動で探索します。追加探索は30分以上空け、各アカウント1日12回まで。送信枠と同じ人への待機を記事巡回と共有します。成功件数と確認待ちは状態欄に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
+<p>質問箱の文芸に関する回答へのスキと、520の0円メンバーシップ参加も自動で探索します。通常会費0円と、新しくフォローしないことを確認できた場合だけ参加します。結果は状態確認に表示します。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
 <label>操作するアカウント<select name="account">
@@ -71,7 +72,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v16.9.9-ready';
+const READY = 'v16.9.10-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -134,6 +135,7 @@ async function prepare(original) {
   schema.push(sql(original,'INSERT OR IGNORE INTO nh_v14_settings (id,tags,author_hours) VALUES (1,?,168)',JSON.stringify(DEFAULT_TAGS)));
   schema.push(...discoverySchema1697.map(q=>db.prepare(q)));
   schema.push(...growthSchema1699.map(q=>db.prepare(q)));
+  schema.push(...outreachSchema16910.map(q=>db.prepare(q)));
   await db.batch(schema);
   const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
   const names = new Set(done.results.map(row=>row.name));
@@ -160,6 +162,7 @@ function orderFor(tags, slot) {
   return tags.slice(offset).concat(tags.slice(0,offset));
 }
 const REASONS = {
+  qa_checks:'質問箱の探索',qa_sent:'回答へのスキ確認',member_checks:'0円参加の探索',member_joined:'0円プランの参加確認',
   reader_saved:'読者候補の保存・更新',reader_profiles:'保存した読者の公開記事確認',reader_wait:'保存した読者の作者待機',reader_fallback:'読者候補から通常巡回へ継続',reader_returning:'自分の作品の読者探索',
   reader_checks:'読者・感想の追加探索', comment_sent:'感想コメントへのスキ確認成功', comment_recovered:'前回コメントのスキ確認成功', reader_sent:'読者経由の記事スキ確認成功', runs:'自動確認', sent:'送信成功', recovered:'前回送信の成功確認', author_recent:'同じ作者への待機で除外した候補',
   seen:'記事履歴で除外した候補', own_or_liked:'自分たちの記事・スキ済み', missing:'削除済み', no_author:'作者不明',
@@ -491,6 +494,7 @@ function publicFiction1697(n) {
 }
 async function saveSeed1697(env,notes,tag,ownIds,cursor) {
   if(!FICTION1697.has(tag))return;
+  await rememberOutreach16910(env,notes,ownIds,cursor);
   const candidates=notes.filter(n=>/^n[a-z0-9]{1,64}$/.test(n?.key||'') && /^[\w-]{1,80}$/.test(n.user?.urlname||'') &&
     !ownIds.has(String(n.user?.id)) && ((Number(n.comment_count??n.commentCount)||0)>0 || (Number(n.like_count??n.likeCount)||0)>0));
   if(!candidates.length)return;
@@ -818,6 +822,9 @@ async function run(original,slot) {
       sql(env,'SELECT tag,until_at FROM nh_v15_tag_wait WHERE slot=? AND tag IN ('+marks(tags)+') AND until_at>?',slot,...tags,Date.now())
     ]);
     const ownIds=new Set([state.account,otherRows.results[0].account].filter(Boolean));
+    stage='質問箱・0円参加の追加探索';
+    const extra=await outreachOpportunity16910(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
+    if(extra?.handled){await finish(extra.message,extra.success);return true;}
     stage='感想・読者の追加探索';
     const opportunity=await readerOpportunity1697(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
     if(opportunity?.handled){await finish(opportunity.message,opportunity.success);return true;}
@@ -960,6 +967,10 @@ async function dashboard(original, settings, prefix = '') {
   blocks.push('【追加の自動巡回】感想コメントへのスキ／創作記事に反応した読者の記事探索\n'+discovery.results.map(r=>
     'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件／保存した読者候補 '+r.queued+'人\n'+r.message+'\n次の追加探索：'+time(r.due)).join('\n\n')+
     '\n記事スキとコメントスキの送信枠・同じ人への待機は共通です。記事の累計にはコメント分を含めません。画面確認待ちは送信成功ではありません。読者からの訪問・読了・通知到達は未計測です。');
+  const outreach=await sql(original,'SELECT slot,qa,members,pending,member_blocked,qa_message,member_message FROM nh_v16910_state ORDER BY slot').all();
+  blocks.push('【質問箱の回答へのスキ・0円メンバーシップ】\n'+outreach.results.map(r=>
+    'アカウント '+r.slot+'：回答スキの確認 '+r.qa+'件／0円参加の確認 '+r.members+'件\n質問箱：'+r.qa_message+'\n0円参加：'+r.member_message+(r.pending?'\n前回の操作結果を確認中・自動再送なし':'')).join('\n\n')+
+    '\n回答スキは両アカウント、メンバーシップは520だけが対象です。通常会費0円・新しいフォローなしを確認できる場合だけ参加します。初月無料は対象外です。参加は1日1回まで。追加探索は感想・読者探索と共通の各12回/UTC日、30分以上の間隔です。\n520の作品管理で自動公開等を休止すると、新規の0円参加も休止します。参加数はアクセス数ではありません。');
   const [tg,stats,metrics,audit] = summary;
   const telegram=tg.results[0];
   const warnings=[];
@@ -1116,7 +1127,10 @@ export class NoteScheduler {
       const due = schedule.active.find(s=>s.eligible<=Date.now());
       if (due) {
         await sql(this.env,'UPDATE nh_v15_runtime SET last_slot=?,last_at=? WHERE id=1',due.slot,Date.now()).run();
-        try { await run(this.env,due.slot); }
+        try { await run({...this.env,MEMBER_GATE16910:()=>{
+          this.desk ||= new Desk520(this.ctx.storage,this.env);this.desk.init();
+          return !!this.desk.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
+        }},due.slot); }
         catch (error) {
           if (readLimit(error)) throw error;
           console.error('note-helper: account ' + due.slot + ' storage/runtime failure');
@@ -3958,7 +3972,7 @@ function deskPage(records=null,message='',status=200,editing='') {
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>520 作品管理 ${VERSION}</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><a href="/">スキ回りの管理画面へ</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><a href="/">スキ回り・質問箱・0円参加の結果を確認</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
 <details id="planform"${selected?' open':''}><summary>下書きの共有リンクで予約</summary>
@@ -3978,7 +3992,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 </details></form>
 <p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#schedules">予約した作品を見る</a></p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を1作品につき1誌まで追加します。「記録を開く」で結果が見られます。</p>
-<details><summary>自動公開・共同誌・参加申請・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
+<details><summary>自動公開・共同誌・参加申請・0円参加・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>年をまたぐ予約や、登録済みの日付の間への追加もできます。公開日時の順に表示します。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
 <label>公開する順番<input id="seq" type="number" min="1" step="1"></label><label>タイトル（原文）<input id="title"></label>
 <label>本文（原文）<textarea id="body" rows="6"></textarea></label><label>または完成稿のUTF-8テキストファイル<input id="manuscript" type="file" accept=".txt,text/plain"></label>
@@ -5927,13 +5941,282 @@ function observationText1698(s) {
   return lines.join('\n');
 }
 
-const BROWSER_SOURCES520 = Object.freeze({
-  "articleReactionForm": "function articleReactionForm(step, titles) {\n  if (location.origin !== 'https://note.com' || location.pathname.replace(/\\/$/,'') !== '/settings/reactions/like/note') return {state:'page'};\n  const visible = el => el.getClientRects().length > 0 && !el.closest('[hidden],[aria-hidden=\"true\"]');\n  const name = el => (el.getAttribute('aria-label') || el.textContent || el.value || el.title || '').trim();\n  const root = document.querySelector('[role=\"dialog\"]') || document.querySelector('main,[role=\"main\"]') || document.body;\n  if (!root || !/スキのお礼/.test(root.innerText) || !/記事にスキ/.test(root.innerText)) return {state:'page'};\n  const controls = el => [...el.querySelectorAll('button,[role=\"button\"],input[type=\"submit\"],a[href=\"#\"]')].filter(visible);\n  const selected = [...root.querySelectorAll('[role=\"tab\"][aria-selected=\"true\"],a[aria-current=\"page\"]')].filter(visible);\n  if (selected.some(el => /コメントにスキ|掲示板.*スキ/.test(name(el)))) return {state:'page'};\n  const pane = [...root.querySelectorAll('[role=\"tabpanel\"]')].filter(visible);\n  if (pane.length > 1) return {state:'page'};\n  const scope = pane[0] || root;\n  const saves = controls(root).filter(el=>/^保存(する)?$/.test(name(el)));\n  if (saves.length !== 1) return {state:'page'};\n  const fields = [...scope.querySelectorAll('textarea,input[type=\"text\"],input:not([type])')].filter(el =>\n    visible(el) && !el.closest('header,nav,[role=\"search\"]') && !el.readOnly && !el.disabled);\n  if (fields.length > 10 || fields.some(el => !/お礼|リアクション|メッセージ|ありがとう|スキ/.test(\n    [el.placeholder,el.getAttribute('aria-label'),el.name,...Array.from(el.labels || [],name)].join(' ')) &&\n    !(el.maxLength > 0 && el.maxLength <= 50) && el.tagName !== 'TEXTAREA')) return {state:'page'};\n  const add = controls(scope).filter(el => /^(?:[+＋]\\s*)?(?:(?:新し[いく]|他の|別の|もう1つの)?(?:スキの)?(?:お礼(?:メッセージ)?|メッセージ|リアクション)(?:を|の)?)?追加(?:する)?(?:[（(][^()（）]*[）)])?$/.test(name(el)));\n  if (!fields.length && add.length !== 1) return {state:'page'};\n  // Look for a selected reaction image inside each message card. Ignore site navigation and stock illustrations.\n  const media = [];\n  for (const field of fields) {\n    for (let row=field.parentElement; row && row!==root.parentElement; row=row.parentElement) {\n      if (fields.filter(f=>row.contains(f)).length !== 1) break;\n      const remove = controls(row).filter(b=>/^(?:設定した|登録した)?(?:画像|お礼画像)(?:を|の)?(?:削除|解除)(?:する)?$/.test(name(b)));\n      if (remove.length === 1) {media.push(remove[0]);break;}\n      const image = [...row.querySelectorAll('img[src]')].some(img=>visible(img) &&\n        (/^blob:|\\/uploads\\/|\\/production\\/uploads\\//.test(img.currentSrc || img.src)) &&\n        !img.closest('header,nav,a') && !/アイコン|サンプル|アバター/.test(img.alt));\n      if (image) {media.push(null);break;}\n      if (row===scope || row===root) break;\n    }\n  }\n  const limits = fields.map(el=>el.maxLength).filter(n=>n>0);\n  const lengthHint = (scope.innerText || '').match(/(\\d{1,3})\\s*(?:文字|字)以内/);\n  if(lengthHint && Number(lengthHint[1])>0)limits.push(Number(lengthHint[1]));\n  const limit = limits.length ? Math.min(...limits) : 35;\n  const values = fields.map(el=>el.value);\n  const active = values.filter(Boolean);\n  const sorted = [...titles].sort();\n  const same = active.length===titles.length && [...active].sort().every((v,i)=>v===sorted[i]);\n  if (step==='read') return {state:'ready',same:same && !media.length,limit,signature:JSON.stringify([values,media.length])};\n  if (titles.some(v=>v.length>limit)) return {state:'limit',limit};\n  if (media.length) {\n    if (!media[0] || step!=='edit') return {state:'image'};\n    media[0].click();return {state:'more'};\n  }\n  const filled = titles.every((v,i)=>values[i]===v) && values.slice(titles.length).every(v=>!v);\n  if (step==='save') {\n    if (!filled || saves[0].disabled || saves[0].getAttribute('aria-disabled')==='true') return {state:'page'};\n    saves[0].click();return {state:'sent'};\n  }\n  if (step!=='edit') return {state:'page'};\n  // Fill existing slots before adding another. Some screens enable Add only after text input.\n  for (const [i,el] of fields.entries()) {\n    const next = titles[i] || '';\n    if (el.value === next) continue;\n    const proto = el.tagName==='TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;\n    Object.getOwnPropertyDescriptor(proto,'value').set.call(el,next);\n    el.dispatchEvent(new Event('input',{bubbles:true}));\n    el.dispatchEvent(new Event('change',{bubbles:true}));\n  }\n  if (fields.length < titles.length) {\n    if (add.length!==1) return {state:'page'};\n    if (!add[0].disabled && add[0].getAttribute('aria-disabled')!=='true') add[0].click();\n    return {state:'more'};\n  }\n  return {state:'filled'};\n}",
-  "readDraftCover": "async function readDraftCover(key,accountId,hashBody) {\n  if(location.origin!=='https://note.com' || !/^n[a-z0-9]{1,64}$/.test(key))return null;\n  try {\n    const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});\n    if(!r.ok)return null;\n    const n=(await r.json())?.data;\n    if(!n || n.key!==key)return null;\n    if(n.user?.urlname && n.user.urlname!=='43__' || n.user?.id && String(n.user.id)!==accountId || ['published','reserved','scheduled'].includes(n.status) ||\n       [n.scheduledPublishAt,n.scheduled_publish_at,n.publishAt,n.publish_at].some(t=>t && Date.parse(t)>Date.now()))return {unsafe:true};\n    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId)return null;\n    const full=n.is_limited!==true && n.is_paid!==true && !(Number(n.price)>0);\n    return {name:n.name,hash:full?await hashBody(n.body):null,...(Object.hasOwn(n,'eyecatch')?{cover:n.eyecatch}:{})};\n  }catch{return null;}\n}",
-  "draftBodyHash": "async function draftBodyHash(body){\n  if(typeof body!=='string' || !body.trim() || body.length>2500000)return null;\n  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(body));\n  return Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('');\n}",
-  "noteJoinDOM520": "function noteJoinDOM520(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();\n  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));\n  if(fields.length!==1)return {state:'composer'};\n  const field=fields[0];\n  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);\n  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));\n  for(const card of cards) {\n    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\\/$/,'')==='/43__';}catch{return false;}});\n    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};\n  }\n  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&\n    (e.closest('[class*=\"comment\"],[class*=\"Comment\"],[data-testid*=\"comment\"]')));\n  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}\n  // An incomplete comment history cannot establish that this account has not already applied.\n  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};\n  if(step==='read')return {state:'ready'};\n  let scope=field.closest('form')||field.parentElement;\n  let buttons=[];\n  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {\n    if(scope.querySelectorAll('textarea').length!==1)break;\n    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');\n    if(buttons.length)break;\n  }\n  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};\n  if(step==='fill') {\n    if(field.value && field.value!==arg.comment)return {state:'draft'};\n    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);\n    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));\n    return {state:'filled'};\n  }\n  if(step==='send') {\n    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};\n    buttons[0].click();return {state:'clicked'};\n  }\n  return {state:'page'};\n}",
-  "joinFollowDOM520": "function joinFollowDOM520(owner,action) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const canonical=document.querySelector('link[rel=canonical]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();\n  const roots=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));\n  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];\n  if(controls.length!==1)return 'missing';\n  const b=controls[0];\n  if(name(b)==='フォロー中')return 'on';\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  // This function is deliberately read-only, regardless of action.\n  return 'off';\n}",
-  "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel,items=list.state?.items;\n  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    await list.loadMore();return {state:'loaded'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}",
-  "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible = e => !!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const controls=root=>[...root.querySelectorAll('button,[role=\"button\"]')].filter(visible);\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item';\n  const all=[...document.querySelectorAll(rowSelector)].filter(visible);\n  // Nested replies are separate rows. Only the innermost matching container owns a control.\n  const roots=all.filter(r=>!all.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const names=[...new Set([...root.querySelectorAll('a[href]')].filter(a=>visible(a)&&local(a)).map(owner).filter(Boolean))];\n    const bodies=[...root.querySelectorAll('[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]')].filter(e=>visible(e)&&local(e));\n    const texts=[...new Set(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean))];\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text));\n    const hash=Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed');\n      const n=label(button);\n      if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)$/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  if(step==='comments')return {state:'ready',rows:rows.map(({button,...r})=>r)};\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];\n    if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible||r.liked!==false||!r.button||r.button.disabled||r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(all.length)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示)?|コメント\\s*\\d+|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    const options=controls(document).filter(b=>/^(?:スキした(?:人|ユーザー|クリエイター)(?:の一覧)?|スキの一覧|スキ一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const dialogs=[...document.querySelectorAll('[role=\"dialog\"],dialog[open]')].filter(visible);\n    const modal=dialogs.length===1 && /スキした|スキの一覧|スキ一覧/.test(dialogs[0].innerText)?dialogs[0]:null;\n    const likers=modal?[...new Set([...modal.querySelectorAll('a[href]')].filter(visible).map(owner).filter(Boolean))]:[];\n    return {state:'ready',owners:[...new Set([...rows.map(r=>r.owner),...likers])].filter(v=>v!==arg.owner).slice(0,20),comments:rows.length,likers:likers.length};\n  }\n  return {state:'missing'};\n}",
-  "observationScreen1698": "function observationScreen1698(job) {\n  const unknown=reason=>({state:'unknown',reason});\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]') && getComputedStyle(e).visibility!=='hidden';\n  const text=e=>(e?.textContent||'').replace(/\\s+/g,' ').trim();\n  const absolute=raw=>{try{const u=new URL(raw,location.href);return u.origin==='https://note.com' && !u.username && !u.password?u:null;}catch{return null;}};\n  const rawCanonical=document.querySelector('link[rel=\"canonical\"]')?.getAttribute('href');\n  const canonical=rawCanonical?absolute(rawCanonical):null;\n  if(location.origin!=='https://note.com' || document.readyState!=='complete' || !canonical ||\n     canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return unknown('page');\n  const bodySelector='[contenteditable],.note-common-styles__textnote-body,.o-noteContentText,[data-testid=\"note-body\"],[class*=\"noteBody\"],[class*=\"NoteBody\"],blockquote';\n  const h1=[...document.querySelectorAll('h1')].filter(visible);\n  if(h1.length!==1)return unknown('heading');\n  if(job.kind==='keyword') {\n    let path;try{path=decodeURIComponent(location.pathname).replace(/\\/$/,'');}catch{return unknown('page');}\n    const mode=new URL(location.href).searchParams.get('mode');\n    if(path!=='/tag/'+job.subject || text(h1[0])!==job.subject ||\n       (job.mode==='new'?mode!=='new':mode!==null))return unknown('page');\n    const mains=[...document.querySelectorAll('main,[role=\"main\"]')].filter(visible);\n    const root=mains.length===1?mains[0]:null;\n    if(!root)return unknown('list');\n    const tabs=[...root.querySelectorAll('a[href],[role=\"tab\"]')].filter(e=>visible(e)&&['人気','新着'].includes(text(e)));\n    const selected=tabs.filter(e=>e.getAttribute('aria-selected')==='true' || ['page','true'].includes(e.getAttribute('aria-current')) || e.classList.contains('is-active'));\n    if(selected.length!==1 || text(selected[0])!==(job.mode==='new'?'新着':'人気'))return unknown('sort');\n    const cardSelector='article,[data-testid=\"note-card\"],.m-note,.m-largeNoteWrapper,[class*=\"noteCard\"],[class*=\"NoteCard\"]';\n    const cards=[...root.querySelectorAll(cardSelector)].filter(e=>visible(e)&&!e.closest('aside,nav,footer,[class*=\"recommend\" i],[data-testid*=\"recommend\"],'+bodySelector));\n    const leaves=cards.filter(e=>!cards.some(other=>other!==e && e.contains(other)));\n    if(!leaves.length)return unknown('list');\n    const entries=[],seen=new Set();let incomplete=false;\n    for(const card of leaves.slice(0,50)) {\n      const headings=[...card.querySelectorAll('h2,h3,h4')].filter(visible);\n      if(headings.length!==1 || !text(headings[0])){incomplete=true;continue;}\n      const urls=[...new Set([...card.querySelectorAll('a[href],[data-href]')].concat(card.matches('a[href],[data-href]')?[card]:[])\n        .filter(visible).map(e=>absolute(e.getAttribute('href')||e.getAttribute('data-href')))\n        .filter(u=>u && /^\\/[\\w-]{1,80}\\/n\\/n[a-z0-9]{1,64}\\/?$/.test(u.pathname)).map(u=>u.origin+u.pathname.replace(/\\/$/,'')))];\n      if(urls.length!==1){incomplete=true;continue;}\n      if(seen.has(urls[0]))continue;\n      seen.add(urls[0]);entries.push({url:urls[0],title:text(headings[0]).slice(0,300)});\n    }\n    // A missing/unrecognized card is not proof that 520 is absent from this page.\n    if(!entries.length)return unknown('cards');\n    return {state:'observed',complete:!incomplete,entries,scope:'initial_cards'};\n  }\n  if(job.kind!=='footer' || location.pathname.replace(/\\/$/,'')!=='/43__/n/'+job.subject || text(h1[0])==='521')return unknown('page');\n  const groups=[...document.querySelectorAll('[aria-label*=\"パンくず\"],[aria-label*=\"breadcrumb\" i],[class*=\"breadcrumb\" i]')]\n    .filter(e=>visible(e) && !e.closest(bodySelector));\n  const paths=[];\n  for(const group of groups) {\n    if(group.getBoundingClientRect().top<h1[0].getBoundingClientRect().bottom)continue;\n    const links=[...group.querySelectorAll('a[href]')].filter(visible);\n    const list=links.map(a=>({u:absolute(a.getAttribute('href')),label:text(a)}));\n    if(!list.some(x=>x.u?.pathname==='/' && ['トップ','ホーム'].includes(x.label)))continue;\n    const topics=list.filter(x=>x.u && /^\\/topic\\/[a-z0-9_/-]+\\/?$/.test(x.u.pathname) && x.label && x.label.length<=100)\n      .map(x=>({label:x.label,url:x.u.origin+x.u.pathname}));\n    if(topics.length && topics.length<=8)paths.push(topics);\n  }\n  const unique=[...new Map(paths.map(p=>[JSON.stringify(p),p])).values()];\n  return unique.length===1?{state:'observed',title:text(h1[0]).slice(0,300),topics:unique[0]}:unknown('breadcrumb');\n}"
-});
+// v16.9.10: native question-answer likes and strictly zero-fee memberships.
+// Both use the ordinary account lease, author cooldown and discovery budget.
+const outreachSchema16910 = [
+  `CREATE TABLE IF NOT EXISTS nh_v16910_state(slot TEXT PRIMARY KEY,pending TEXT NOT NULL DEFAULT '',qa INTEGER NOT NULL DEFAULT 0,members INTEGER NOT NULL DEFAULT 0,member_day TEXT NOT NULL DEFAULT '',member_used INTEGER NOT NULL DEFAULT 0,member_blocked INTEGER NOT NULL DEFAULT 0,qa_message TEXT NOT NULL DEFAULT '文芸作者の質問箱を探索待ち',member_message TEXT NOT NULL DEFAULT '520の0円プランを探索待ち')`,
+  `INSERT OR IGNORE INTO nh_v16910_state(slot) VALUES('1'),('2')`,
+  `CREATE TABLE IF NOT EXISTS nh_v16910_sources(slot TEXT NOT NULL,owner TEXT NOT NULL,author TEXT NOT NULL,source TEXT NOT NULL,seen INTEGER NOT NULL,qa_due INTEGER NOT NULL DEFAULT 0,member_due INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(slot,owner))`,
+  `CREATE INDEX IF NOT EXISTS nh_v16910_qa_due ON nh_v16910_sources(slot,qa_due,owner)`,
+  `CREATE INDEX IF NOT EXISTS nh_v16910_member_due ON nh_v16910_sources(slot,member_due,owner)`,
+  `CREATE INDEX IF NOT EXISTS nh_v16910_source_age ON nh_v16910_sources(seen)`,
+  `CREATE TABLE IF NOT EXISTS nh_v16910_actions(key TEXT PRIMARY KEY,slot TEXT NOT NULL,kind TEXT NOT NULL,owner TEXT NOT NULL,author TEXT NOT NULL,source TEXT NOT NULL,url TEXT NOT NULL,hash TEXT NOT NULL,plan TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,confirmed INTEGER,verifications INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS nh_v16910_action_slot ON nh_v16910_actions(slot,created DESC)`
+];
+async function rememberOutreach16910(env,notes,ownIds,cursor) {
+  const pool=[...new Map(notes.filter(n=>/^n[a-z0-9]{1,64}$/.test(n?.key||'') && /^[\w-]{1,80}$/.test(n.user?.urlname||'') &&
+    /^[1-9]\d{0,19}$/.test(String(n.user?.id)) && !ownIds.has(String(n.user.id))).map(n=>[n.user.urlname,n])).values()];
+  if(!pool.length)return;
+  const selected=Array.from({length:Math.min(3,pool.length)},(_,i)=>pool[(cursor+i)%pool.length]),now=Date.now();
+  await env.DB.batch([
+    sql(env,'DELETE FROM nh_v16910_sources WHERE seen<?',now-14*24*HOUR),
+    ...selected.map(n=>sql(env,`INSERT INTO nh_v16910_sources(slot,owner,author,source,seen) VALUES(?,?,?,?,?)
+      ON CONFLICT(slot,owner) DO UPDATE SET author=excluded.author,source=excluded.source,seen=excluded.seen`,env.SLOT,n.user.urlname,String(n.user.id),n.key,now))
+  ]);
+}
+function membershipPrice16910(raw) {
+  if(typeof raw!=='string' || raw.length>6000)return false;
+  const text=raw.normalize('NFKC').replace(/[ \t\u00a0]+/g,' ');
+  if(/初月|初回|お試し|無料体験|無料期間|トライアル|クーポン|割引|返金|キャッシュバック|ポイント還元|期間限定|無料招待|有料|翌月|次月|(?:ヶ月|か月|ヵ月|日間|週間|年間|年|半年)無料|無料.{0,12}(?:終了|期間後)|フォロー必須|フォローが必要|フォローしてください|自動的にフォロー|自動フォロー/.test(text))return false;
+  // A marketing mention of "無料" is never a regular monthly price.
+  const regular=/(?:^|\n)\s*(?:(?:月額|会費|月会費|通常料金|通常会費)\s*[:：]?\s*0\s*円|[¥￥]\s*0\s*(?:\/|／)\s*月|0\s*円\s*(?:\/|／)\s*月)\s*(?:[（(]税込[）)])?\s*(?:$|\n)/m.test(text);
+  if(!regular)return false;
+  for(const m of text.matchAll(/(?:[¥￥]\s*([\d,]+(?:\.\d+)?)|([\d,]+(?:\.\d+)?)\s*円)/g))if(Number((m[1]||m[2]).replaceAll(',',''))!==0)return false;
+  return true;
+}
+// Only native controls are clicked. All targets are read again immediately before
+// clicking; unknown states, duplicate cards and unrelated forms fail closed.
+async function outreachScreen16910(step,arg,freePrice) {
+  if(location.origin!=='https://note.com' || !/^[\w-]{1,80}$/.test(arg.owner||''))return {state:'page'};
+  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden="true"]');
+  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||e.value||'').trim();
+  const all=(root,s)=>[...root.querySelectorAll(s)].filter(visible);
+  const unique=a=>a.length===1?a[0]:null;
+  const buttons=root=>all(root,'button,[role="button"],input[type="submit"]');
+  const enabled=e=>e && !e.disabled && e.getAttribute('aria-disabled')!=='true';
+  const path=location.pathname.replace(/\/$/,'');
+  const canonical=document.querySelector('link[rel="canonical"]')?.href;
+  const samePage=()=>{try{const u=new URL(canonical);return u.origin===location.origin && u.pathname.replace(/\/$/,'')===path;}catch{return false;}};
+  const link=e=>{try{const u=new URL(e.href,location.href);return u.origin===location.origin && !u.username && !u.password?u.href:null;}catch{return null;}};
+  const digest=async s=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s))),b=>b.toString(16).padStart(2,'0')).join('');
+  if(arg.kind==='qa'){
+    if(path!=='/qa/'+arg.owner || !samePage())return {state:'page'};
+    const main=document.querySelector('main,[role="main"]');if(!main)return {state:'page'};
+    const roots=new Set();
+    for(const h of all(main,'h2')){
+      for(let root=h.parentElement,depth=0;root && root!==main && depth<7;root=root.parentElement,depth++){
+        if(all(root,'h2').length!==1)break;
+        const likes=buttons(root).filter(b=>/^(?:回答に)?スキ(?:する|をする|をつける|を取り消す|を取消す|済み)?$/.test(label(b)) ||
+          (b.hasAttribute('aria-pressed') && /like|スキ/i.test(b.className+' '+(b.querySelector('svg')?.getAttribute('aria-label')||''))));
+        if(likes.length===1 && all(root,'p').some(p=>p.innerText.trim().length>=12)){roots.add(root);break;}
+      }
+    }
+    const rows=[];
+    for(const root of [...roots].slice(0,20)){
+      const q=unique(all(root,'h2'));
+      const b=unique(buttons(root).filter(b=>/^(?:回答に)?スキ(?:する|をする|をつける|を取り消す|を取消す|済み)?$/.test(label(b)) ||
+        (b.hasAttribute('aria-pressed') && /like|スキ/i.test(b.className+' '+(b.querySelector('svg')?.getAttribute('aria-label')||'')))));
+      const answer=all(root,'p').filter(p=>!p.closest('button,nav,header,footer') && !q.contains(p)).map(p=>p.innerText.trim()).filter(Boolean).join('\n');
+      if(!q||!b||!answer||answer.length>4000)continue;
+      const question=q.innerText.trim(),content=question+'\n'+answer;
+      if(!question || content.length>6000)continue;
+      const pressed=b.getAttribute('aria-pressed'),name=label(b);
+      const liked=pressed==='true'||/取り消す|取消す|済み/.test(name)?true:pressed==='false'||/スキ(?:する|をする|をつける)$/.test(name)?false:null;
+      rows.push({hash:await digest(arg.owner+'\n'+content),liked,eligible:/小説|詩|文学|文芸|読書|創作|物語|文章|執筆|作家|作品|本を読/.test(content) && !/スキ返|相互フォロー|参加希望|https?:\/\//.test(content),button:b});
+    }
+    if(step==='read')return {state:'ready',rows:rows.map(({button,...r})=>r)};
+    const row=unique(rows.filter(r=>r.hash===arg.hash));if(!row)return {state:'unknown'};
+    if(row.liked===true)return {state:'confirmed'};
+    if(step==='verify')return {state:row.liked===false?'off':'unknown'};
+    if(step!=='act' || !row.eligible || row.liked!==false || !enabled(row.button))return {state:'unknown'};
+    row.button.click();return {state:'clicked'};
+  }
+  if(arg.kind!=='member')return {state:'page'};
+  if(step==='entry'){
+    if(path!=='/'+arg.owner || !samePage())return {state:'page'};
+    const urls=[...new Set(all(document,'a[href]').filter(a=>/^メンバーシップ$/.test(label(a))).map(link).filter(h=>h && new URL(h).pathname.replace(/\/$/,'')==='/'+arg.owner+'/membership'))];
+    return urls.length===1?{state:'entry',url:urls[0]}:{state:'missing'};
+  }
+  const native=document.querySelector('main,[role="main"]');if(!native)return {state:'page'};
+  if(step==='plans' || step==='verify'){
+    if(path!=='/'+arg.owner+'/membership' || !samePage())return {state:'page'};
+    const cards=new Map();
+    for(const h of all(native,'h2,h3')){
+      const title=h.innerText.trim();if(!title||title.length>200)continue;
+      for(let root=h.parentElement,depth=0;root && root!==native && depth<6;root=root.parentElement,depth++){
+        if(all(root,'h2,h3').length!==1)break;
+        const text=root.innerText,joined=all(root,'button,[role="button"],a,span,p').some(e=>/^(?:このプランに)?参加中$|^加入中$|^退会する$/.test(label(e)));
+        const links=all(root,'a[href]').filter(e=>label(e)==='参加手続きへ' && link(e));
+        const controls=buttons(root).filter(e=>label(e)==='参加手続きへ');
+        if(joined || links.length+controls.length===1){cards.set(root,{title,joined,free:freePrice(text),control:links[0]||controls[0]});break;}
+      }
+    }
+    if(step==='verify'){
+      const matching=[...cards.values()].filter(p=>p.title===arg.plan);
+      return matching.length===1?{state:matching[0].joined?(matching[0].free?'confirmed':'price_changed'):'off'}:{state:'unknown'};
+    }
+    // Do not replace an existing plan or join multiple plans of one owner.
+    if([...cards.values()].some(p=>p.joined))return {state:'already'};
+    const eligible=[...cards.values()].filter(p=>p.free && enabled(p.control));
+    if(eligible.length!==1)return {state:'no_free'};
+    const chosen=eligible[0];
+    if(!arg.open)return {state:'plan',plan:chosen.title};
+    if(chosen.title!==arg.plan)return {state:'changed'};
+    chosen.control.click();return {state:'opened'};
+  }
+  // Checkout must identify both the owner and the previously selected plan.
+  const dialogs=all(document,'[role="dialog"],dialog[open]');
+  if(dialogs.length>1)return {state:'unknown'};
+  const scope=dialogs[0]||native;
+  const titles=all(scope,'h1,h2,h3,h4').filter(h=>h.innerText.trim()===arg.plan);
+  const ownerLinks=all(scope,'a[href]').filter(a=>link(a) && new URL(link(a)).pathname.replace(/\/$/,'')==='/'+arg.owner);
+  if(!titles.length||!ownerLinks.length||!freePrice(scope.innerText))return {state:'price'};
+  if(all(scope,'input,textarea,select').some(e=>!e.disabled && (e.matches('textarea,select') ||
+    !['checkbox','radio','hidden','submit','button'].includes(e.type||'text'))))return {state:'input'};
+  const checks=all(scope,'input[type="checkbox"],[role="checkbox"]');
+  const checkLabel=e=>(e.getAttribute('aria-label')||[...(e.labels||[])].map(l=>l.textContent).join(' ')||e.parentElement?.innerText||'').trim();
+  const following=checks.filter(e=>/^(?:このクリエイターを|クリエイターを|参加と同時に)?フォローする$/.test(checkLabel(e)));
+  if(following.length>1)return {state:'follow'};
+  const checked=e=>e.matches('input')?(e.indeterminate?null:e.checked):e.getAttribute('aria-checked')==='true'?true:e.getAttribute('aria-checked')==='false'?false:null;
+  if(checks.some(e=>!following.includes(e)&&(e.required||checked(e)!==false)))return {state:'input'};
+  if(following.length && checked(following[0])!==false && arg.wasFollowing!==true){
+    if(step==='nofollow' && checked(following[0])===true && enabled(following[0])){following[0].click();return {state:'changed'};}
+    return {state:'follow'};
+  }
+  // With no explicit opt-out, only an already-followed owner is eligible.
+  if(arg.wasFollowing!==true && !(following.length===1 && checked(following[0])===false))return {state:'follow'};
+  const submit=unique(buttons(scope).filter(b=>/^(?:無料で)?参加する$/.test(label(b))));
+  if(!enabled(submit))return {state:'unknown'};
+  const signature=JSON.stringify([arg.owner,arg.plan,scope.innerText.replace(/\s+/g,' '),following.length,following[0]?checked(following[0]):null]);
+  if(step==='check')return {state:'ready',signature};
+  if(step!=='act' || signature!==arg.signature)return {state:'changed'};
+  submit.click();return {state:'clicked'};
+}
+async function relationship16910(owner,author) {
+  if(location.origin!=='https://note.com' || !/^[\w-]{1,80}$/.test(owner))return null;
+  try{
+    const r=await fetch('/api/v2/creators/'+encodeURIComponent(owner),{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
+    if(!r.ok)return null;
+    const j=await r.json(),d=j.data??j;
+    if(d.urlname!==owner || String(d.id)!==author)return null;
+    const values=[d.isFollowing,d.is_following].filter(v=>typeof v==='boolean');
+    return values.length && values.every(v=>v===values[0])?values[0]:null;
+  }catch{return null;}
+}
+async function reserveOutreach16910(env,token,settings,job) {
+  const now=Date.now(),cutoff=now-settings.author_hours*HOUR;
+  const key=job.kind==='qa'?'qa:'+job.owner+':'+job.hash:'member:'+job.author;
+  const r=await env.DB.batch([
+    sql(env,`INSERT INTO nh_v15_authors(author,last_at,slot,token) SELECT ?,?,?,?
+      WHERE EXISTS(SELECT 1 FROM nh_control c JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1 AND c.enabled=1 AND c.token=? AND c.lease>? AND n.hold_until<=?)
+      AND NOT EXISTS(SELECT 1 FROM nh_shared WHERE key=?)
+      AND NOT EXISTS(SELECT 1 FROM nh_v14_authors WHERE author=? AND last_at>?)
+      AND EXISTS(SELECT 1 FROM nh_v16910_state WHERE slot=? AND pending='' AND (?='qa' OR (member_blocked=0 AND (member_day<>? OR member_used<1))))
+      AND EXISTS(SELECT 1 FROM nh_v1697_discovery WHERE slot=? AND pending='')
+      ON CONFLICT(author) DO UPDATE SET last_at=excluded.last_at,slot=excluded.slot,token=excluded.token WHERE nh_v15_authors.last_at<=?`,
+      job.author,now,env.SLOT,token,env.SLOT,token,now,now,key,job.author,cutoff,env.SLOT,job.kind,day(),env.SLOT,cutoff),
+    sql(env,`INSERT OR IGNORE INTO nh_shared(key,slot,token,created) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM nh_v15_authors WHERE author=? AND token=? AND last_at=?)`,key,env.SLOT,token,now,job.author,token,now),
+    sql(env,`INSERT OR IGNORE INTO nh_v16910_actions(key,slot,kind,owner,author,source,url,hash,plan,status,created)
+      SELECT ?,?,?,?,?,?,?,?,?,'pending',? WHERE EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?)`,key,env.SLOT,job.kind,job.owner,job.author,job.source,job.url,job.hash||'',job.plan||'',now,key,token),
+    sql(env,`UPDATE nh_v16910_state SET pending=?,member_used=CASE WHEN ?='member' THEN CASE WHEN member_day=? THEN member_used+1 ELSE 1 END ELSE member_used END,
+      member_day=CASE WHEN ?='member' THEN ? ELSE member_day END WHERE slot=? AND pending=''
+      AND EXISTS(SELECT 1 FROM nh_v16910_actions WHERE key=? AND slot=? AND status='pending') AND EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?)`,key,job.kind,day(),job.kind,day(),env.SLOT,key,env.SLOT,key,token),
+    sql(env,`INSERT INTO nh_v14_authors(slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token`,env.SLOT,job.author,now,token,key,token)
+  ]);
+  return [0,1,2,3].every(i=>r[i].meta.changes)?key:null;
+}
+async function settleOutreach16910(env,job,confirmed) {
+  const field=job.kind==='qa'?'qa':'members';
+  await env.DB.batch([
+    sql(env,`UPDATE nh_v16910_state SET ${field}=${field}+? WHERE slot=? AND pending=? AND EXISTS(SELECT 1 FROM nh_v16910_actions WHERE key=? AND slot=? AND status='pending')`,+confirmed,env.SLOT,job.key,job.key,env.SLOT),
+    sql(env,`UPDATE nh_v16910_actions SET status=?,confirmed=? WHERE key=? AND slot=? AND status='pending'`,confirmed?'confirmed':'uncertain',confirmed?Date.now():null,job.key,env.SLOT),
+    sql(env,`UPDATE nh_v16910_state SET pending='' WHERE slot=? AND pending=?`,env.SLOT,job.key)
+  ]);
+}
+const outreachReason16910 = state=>({follow:'新しいフォローなしで参加できることを確認できず・保留',price:'通常会費0円と参加先の一致を確認できず・保留',input:'決済情報・追加入力や同意が必要なため保留',no_free:'通常会費0円のプランを確認できず',already:'参加済みのプランあり・追加参加なし',unknown:'画面を一意に確認できず・次回再確認',page:'対象の画面を確認できず・次回再確認'}[state]||'画面の状態が変わったため保留');
+async function browserOutreach16910(env,accountId,job,reserve,live) {
+  return inNoteBrowser(env.BROWSER,cleanCookie(env.NOTE_SESSION),false,async ({command,evaluate,blocked,blockedResult})=>{
+    const form=(step,extra={})=>evaluate('('+BROWSER_SOURCES520.outreachScreen16910+')('+JSON.stringify(step)+','+JSON.stringify({...job,...extra})+',('+BROWSER_SOURCES520.membershipPrice16910+'))');
+    const wait=async(read,accept)=>{
+      let previous='';
+      for(let i=0;i<10&&!blocked();i++){
+        let r;try{r=await read();}catch{}
+        const signature=JSON.stringify(r);
+        if(r&&accept(r)&&signature===previous)return r;
+        previous=signature;await pause520(250);
+      }
+      return null;
+    };
+    await command('Page.navigate',{url:job.url});
+    const identity=await wait(()=>evaluate(noteIdentityJS),x=>!!x?.id);
+    if(blocked())return blockedResult();
+    if(identity?.id!==accountId || (job.kind==='member'&&identity.name!=='43__'))return {message:'登録したnote本人を確認できず・操作なし'};
+    if(job.recover){
+      const r=await wait(()=>form('verify'),r=>['confirmed','off'].includes(r.state));
+      if(blocked())return blockedResult();
+      return {resolved:!!r,confirmed:r?.state==='confirmed',message:r?.state==='confirmed'?'前回の操作結果をnoteで確認':'前回の操作結果は未確認・自動再送なし'};
+    }
+    if(job.kind==='qa'){
+      const list=await wait(()=>form('read'),r=>r.state==='ready'&&r.rows?.length>0);
+      if(blocked())return blockedResult();
+      if(!list)return {message:'質問と回答・スキ状態を識別できず・候補保留'};
+      for(const row of list.rows.filter(r=>r.eligible&&r.liked===false).slice(0,3)){
+        const next={...job,hash:row.hash};
+        if(!await live() || blocked())return blocked()?blockedResult():{message:'停止・待機のため操作保留'};
+        if(!await reserve(next))continue;
+        if(!await live() || blocked())return blocked()?blockedResult():{message:'停止・待機のため操作保留'};
+        const r=await form('act',{hash:row.hash});
+        if(r.state!=='clicked')return {message:'回答の状態が変わったため操作保留'};
+        const verified=await wait(()=>form('verify',{hash:row.hash}),r=>r.state==='confirmed');
+        if(blocked())return blockedResult();
+        return {confirmed:!!verified,message:verified?'質問箱の回答へのスキ確認済み':'回答へのスキは操作済み・結果確認待ち'};
+      }
+      return {message:'文芸の回答候補なし・スキ済み・作者待機'};
+    }
+    const relation=()=>evaluate('('+BROWSER_SOURCES520.relationship16910+')('+JSON.stringify(job.owner)+','+JSON.stringify(job.author)+')');
+    const wasFollowing=await relation();
+    const entry=await wait(()=>form('entry'),r=>r.state==='entry');
+    if(blocked())return blockedResult();
+    if(!entry)return {message:'公開プロフィールにメンバーシップの入口を確認できず'};
+    await command('Page.navigate',{url:entry.url});
+    const selected=await wait(()=>form('plans'),r=>['plan','already','no_free'].includes(r.state));
+    if(blocked())return blockedResult();
+    if(selected?.state!=='plan')return {message:outreachReason16910(selected?.state)};
+    if(!await live())return {message:'停止・待機のため参加保留'};
+    if((await form('plans',{open:true,plan:selected.plan})).state!=='opened')return {message:'参加プランが変わったため保留'};
+    let check=await wait(()=>form('check',{plan:selected.plan,wasFollowing}),r=>['ready','follow','price','input'].includes(r.state));
+    if(check?.state==='follow'){
+      await form('nofollow',{plan:selected.plan,wasFollowing});
+      check=await wait(()=>form('check',{plan:selected.plan,wasFollowing}),r=>['ready','follow','price','input'].includes(r.state));
+    }
+    if(blocked())return blockedResult();
+    if(check?.state!=='ready')return {message:outreachReason16910(check?.state)};
+    const who=await evaluate(noteIdentityJS);
+    if(blocked())return blockedResult();
+    if(who?.id!==accountId||who?.name!=='43__'||!await live())return {message:'本人・停止状態を確認できず参加保留'};
+    const next={...job,url:entry.url,plan:selected.plan};
+    if(!await reserve(next))return {message:'参加済み・作者待機・本日の参加枠により見送り'};
+    if(blocked()||!await live())return blocked()?blockedResult():{message:'停止・待機のため参加保留'};
+    if((await form('act',{plan:selected.plan,wasFollowing,signature:check.signature})).state!=='clicked')return {message:'参加直前の条件が変わったため保留'};
+    await pause520(1000);
+    if(blocked())return blockedResult();
+    // A new page read, never the optimistic local success banner.
+    await command('Page.navigate',{url:entry.url});
+    const verified=await wait(()=>form('verify',{plan:selected.plan}),r=>r.state==='confirmed');
+    const after=await relation();
+    if(blocked())return blockedResult();
+    return {confirmed:!!verified,followChanged:wasFollowing!==true&&after===true,message:wasFollowing!==true&&after===true?
+      '参加後に新しいフォローを検出・追加参加を停止しました':verified?'0円プランへの参加をnoteで確認':'参加操作済み・noteで結果確認待ち'};
+  },env.TRACE);
+}
+async function outreachOpportunity16910(env,state,settings,token,ownIds,markSending,bump) {
+  const now=Date.now(),utc=Math.floor(now/(24*HOUR));
+  const [states,discoveries]=await env.DB.batch([sql(env,'SELECT * FROM nh_v16910_state WHERE slot=?',env.SLOT),sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT)]);
+  const s=states.results[0],d=discoveries.results[0];
+  if(d.pending || (!s.pending && d.due>now))return null;
+  let job=s.pending?await sql(env,'SELECT * FROM nh_v16910_actions WHERE key=? AND slot=?',s.pending,env.SLOT).first():null;
+  if(s.pending && !job)throw new Trouble('追加操作の確認記録を読み出せません','config');
+  if(job){job.recover=true;markSending();}
+  const is520=env.TRACE?.identity?.owner==='43__';
+  const kind=job?.kind||(d.turn%8===2?'qa':d.turn%8===6&&is520?'member':null);
+  if(!kind)return null;
+  const record=message=>sql(env,'UPDATE nh_v16910_state SET '+(kind==='qa'?'qa_message':'member_message')+'=? WHERE slot=?',message,env.SLOT).run();
+  if(kind==='member' && !job?.recover && !env.MEMBER_GATE16910?.()){
+    await record('作品管理の自動運転が休止中・0円参加も休止中');return null;
+  }
+  if(typeof env.BROWSER?.acquire!=='function'){
+    await record('BROWSERの接続待ち');return job?{handled:true,message:'追加操作の結果は未確認・BROWSERの接続待ち'}:null;
+  }
+  if(d.utc_day===utc&&d.used>=12){await record('本日の追加探索12回に達したため翌日に確認');return job?{handled:true,message:'前回操作は再送せず翌日の確認待ち'}:null;}
+  if(!job){
+    if(kind==='member'&&(s.member_blocked || s.member_day===day()&&s.member
