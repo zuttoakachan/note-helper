@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.6';
+const VERSION = 'v16.9.7';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -28,6 +28,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
+<p>創作記事の感想コメントへのスキと、創作記事に反応した読者の公開記事を自動で探索します。追加探索は30分以上空け、各アカウント1日12回まで。送信枠と同じ人への待機を記事巡回と共有します。成功件数と確認待ちは状態欄に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <pre>${esc(message)}</pre>
@@ -70,7 +71,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v15.2-ready';
+const READY = 'v16.9.7-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -131,6 +132,7 @@ async function prepare(original) {
     'CREATE INDEX IF NOT EXISTS nh_v152_metrics_day ON nh_v15_metrics(day,slot,reason)'
   ]) schema.push(db.prepare(query));
   schema.push(sql(original,'INSERT OR IGNORE INTO nh_v14_settings (id,tags,author_hours) VALUES (1,?,168)',JSON.stringify(DEFAULT_TAGS)));
+  schema.push(...discoverySchema1697.map(q=>db.prepare(q)));
   await db.batch(schema);
   const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
   const names = new Set(done.results.map(row=>row.name));
@@ -157,7 +159,7 @@ function orderFor(tags, slot) {
   return tags.slice(offset).concat(tags.slice(0,offset));
 }
 const REASONS = {
-  runs:'自動確認', sent:'送信成功', recovered:'前回送信の成功確認', author_recent:'同じ作者への待機で除外した候補',
+  reader_checks:'読者・感想の追加探索', comment_sent:'感想コメントへのスキ確認成功', comment_recovered:'前回コメントのスキ確認成功', reader_sent:'読者経由の記事スキ確認成功', runs:'自動確認', sent:'送信成功', recovered:'前回送信の成功確認', author_recent:'同じ作者への待機で除外した候補',
   seen:'記事履歴で除外した候補', own_or_liked:'自分たちの記事・スキ済み', missing:'削除済み', no_author:'作者不明',
   no_candidates:'候補なしのタグ', tag_wait:'候補なし待機を省略したタグ', candidate_limit:'探索上限で見送り',
   reserved:'他の処理の予約で見送り', errors:'自動確認エラー', requests:'noteへの通信数'
@@ -471,6 +473,243 @@ async function connection(original, slot, candidate = null) {
     }
   } finally { await release(env, token); }
 }
+// Reader discovery shares the normal account lease and sending interval.
+// Browser text is transient. Only a comment fingerprint and author cooldown persist.
+const FICTION1697 = new Set(['小説','短編小説','掌編小説','ショートショート','創作','散文','エッセイ','詩','文学']);
+const discoverySchema1697 = [
+  `CREATE TABLE IF NOT EXISTS nh_v1697_discovery(slot TEXT PRIMARY KEY,turn INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL DEFAULT 0,utc_day INTEGER NOT NULL DEFAULT -1,used INTEGER NOT NULL DEFAULT 0,seed TEXT NOT NULL DEFAULT '',seed_owner TEXT NOT NULL DEFAULT '',seed_at INTEGER NOT NULL DEFAULT 0,pending TEXT NOT NULL DEFAULT '',reader_pending TEXT NOT NULL DEFAULT '',comments INTEGER NOT NULL DEFAULT 0,readers INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '創作記事の取得待ち')`,
+  `INSERT OR IGNORE INTO nh_v1697_discovery(slot) VALUES('1'),('2')`,
+  `CREATE TABLE IF NOT EXISTS nh_v1697_comments(key TEXT PRIMARY KEY,slot TEXT NOT NULL,source TEXT NOT NULL,source_owner TEXT NOT NULL,owner TEXT NOT NULL,hash TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,confirmed INTEGER)`
+];
+function publicFiction1697(n) {
+  const tags=Array.isArray(n?.hashtags)?n.hashtags:[];
+  return n?.status==='published' && /^n[a-z0-9]{1,64}$/.test(n.key) && /^[\w-]{1,80}$/.test(n.user?.urlname||'') &&
+    tags.some(t=>FICTION1697.has(String(typeof t==='string'?t:t?.hashtag?.name??t?.name??'').replace(/^#/,'')));
+}
+async function saveSeed1697(env,notes,tag,ownIds,cursor) {
+  if(!FICTION1697.has(tag))return;
+  const candidates=notes.filter(n=>/^n[a-z0-9]{1,64}$/.test(n?.key||'') && /^[\w-]{1,80}$/.test(n.user?.urlname||'') &&
+    !ownIds.has(String(n.user?.id)) && ((Number(n.comment_count??n.commentCount)||0)>0 || (Number(n.like_count??n.likeCount)||0)>0));
+  if(!candidates.length)return;
+  const n=candidates[cursor%candidates.length];
+  await sql(env,'UPDATE nh_v1697_discovery SET seed=?,seed_owner=?,seed_at=? WHERE slot=?',n.key,n.user.urlname,Date.now(),env.SLOT).run();
+}
+async function liveDiscovery1697(env,token) {
+  return !!await sql(env,`SELECT 1 FROM nh_control c JOIN nh_v13_connection n ON n.slot=?
+    WHERE c.id=1 AND c.enabled=1 AND c.token=? AND c.lease>? AND n.hold_until<=?`,env.SLOT,token,Date.now(),Date.now()).first();
+}
+async function reserveComment1697(env,token,settings,seed,row,author) {
+  const now=Date.now(),cutoff=now-settings.author_hours*HOUR,key='comment:'+seed.key+':'+row.hash;
+  const result=await env.DB.batch([
+    sql(env,`INSERT INTO nh_v15_authors(author,last_at,slot,token) SELECT ?,?,?,?
+      WHERE EXISTS(SELECT 1 FROM nh_control c JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1 AND c.enabled=1 AND c.token=? AND c.lease>? AND n.hold_until<=?)
+      AND NOT EXISTS(SELECT 1 FROM nh_shared WHERE key=?)
+      AND NOT EXISTS(SELECT 1 FROM nh_v14_authors WHERE author=? AND last_at>?)
+      AND EXISTS(SELECT 1 FROM nh_v1697_discovery WHERE slot=? AND pending='')
+      ON CONFLICT(author) DO UPDATE SET last_at=excluded.last_at,slot=excluded.slot,token=excluded.token WHERE nh_v15_authors.last_at<=?`,
+      author,now,env.SLOT,token,env.SLOT,token,now,now,key,author,cutoff,env.SLOT,cutoff),
+    sql(env,`INSERT OR IGNORE INTO nh_shared(key,slot,token,created) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM nh_v15_authors WHERE author=? AND token=? AND last_at=?)`,key,env.SLOT,token,now,author,token,now),
+    sql(env,`INSERT OR IGNORE INTO nh_v1697_comments(key,slot,source,source_owner,owner,hash,status,created)
+      SELECT ?,?,?,?,?,?,'pending',? WHERE EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?)`,key,env.SLOT,seed.key,seed.owner,row.owner,row.hash,now,key,token),
+    sql(env,`UPDATE nh_v1697_discovery SET pending=? WHERE slot=? AND pending='' AND EXISTS(SELECT 1 FROM nh_v1697_comments WHERE key=? AND slot=? AND status='pending') AND EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?)`,key,env.SLOT,key,env.SLOT,key,token),
+    sql(env,`INSERT INTO nh_v14_authors(slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token`,env.SLOT,author,now,token,key,token)
+  ]);
+  return [0,1,2,3].every(i=>result[i].meta.changes)?key:null;
+}
+async function settleComment1697(env,key,liked) {
+  // Count exactly once, including a confirmed recovery after a lost browser reply.
+  await env.DB.batch([
+    sql(env,`UPDATE nh_v1697_discovery SET comments=comments+? WHERE slot=? AND pending=? AND EXISTS(SELECT 1 FROM nh_v1697_comments WHERE key=? AND status='pending')`,+liked,env.SLOT,key,key),
+    sql(env,`UPDATE nh_v1697_comments SET status=?,confirmed=? WHERE key=? AND slot=? AND status='pending'`,liked?'liked':'uncertain',liked?Date.now():null,key,env.SLOT),
+    sql(env,`UPDATE nh_v1697_discovery SET pending='' WHERE slot=? AND pending=?`,env.SLOT,key)
+  ]);
+}
+
+// Strict native UI adapter: no guessed comment-write endpoint and no toggle based
+// on heart colour. Missing/ambiguous identity, text or pressed state means no click.
+async function readerScreen1697(step,arg) {
+  if(location.origin!=='https://note.com' || location.pathname.replace(/\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};
+  const canonical=document.querySelector('link[rel="canonical"]')?.href;
+  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\/$/,'')!==location.pathname.replace(/\/$/,''))return {state:'page'};
+  const visible = e => !!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden="true"]');
+  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();
+  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\/([\w-]{1,80})\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};
+  const controls=root=>[...root.querySelectorAll('button,[role="button"]')].filter(visible);
+  const rowSelector='[data-comment-id],[data-testid="comment-item"],.m-comment,.o-commentList__item,.m-commentList__item';
+  const all=[...document.querySelectorAll(rowSelector)].filter(visible);
+  // Nested replies are separate rows. Only the innermost matching container owns a control.
+  const roots=all.filter(r=>!all.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));
+  const rows=[];
+  for(const root of roots.slice(0,24)){
+    const local=e=>e.closest(rowSelector)===root;
+    const names=[...new Set([...root.querySelectorAll('a[href]')].filter(a=>visible(a)&&local(a)).map(owner).filter(Boolean))];
+    const bodies=[...root.querySelectorAll('[data-testid="comment-body"],[data-testid="comment-text"],.m-comment__body,.m-comment__text,[class*="commentBody"],[class*="CommentBody"],[class*="commentText"],[class*="CommentText"]')].filter(e=>visible(e)&&local(e));
+    const texts=[...new Set(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean))];
+    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;
+    const text=texts[0],name=names[0];
+    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\n'+text));
+    const hash=Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');
+    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?$/.test(label(b)));
+    const button=likes.length===1?likes[0]:null;
+    let liked=null;
+    if(button){
+      const pressed=button.getAttribute('aria-pressed');
+      const n=label(button);
+      if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;
+      else if(pressed==='false'||/スキ(?:する|をする|をつける)$/.test(n))liked=false;
+    }
+    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&
+      !/https?:|www\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);
+    rows.push({owner:name,hash,liked,eligible,button});
+  }
+  if(step==='comments')return {state:'ready',rows:rows.map(({button,...r})=>r)};
+  if(step==='verify'||step==='like'){
+    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);
+    if(found.length!==1)return {state:'missing'};
+    const r=found[0];
+    if(r.liked===true)return {state:'liked'};
+    if(step==='verify')return {state:r.liked===false?'off':'unknown'};
+    if(!r.eligible||r.liked!==false||!r.button||r.button.disabled||r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};
+    r.button.click();return {state:'clicked'};
+  }
+  if(step==='openComments'){
+    if(all.length)return {state:'ready'};
+    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示)?|コメント\s*\d+|\d+\s*コメント)$/.test(label(b)) && !b.closest(rowSelector));
+    if(options.length!==1)return {state:'missing'};
+    options[0].click();return {state:'opened'};
+  }
+  if(step==='openLikers'){
+    const options=controls(document).filter(b=>/^(?:スキした(?:人|ユーザー|クリエイター)(?:の一覧)?|スキの一覧|スキ一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector));
+    if(options.length!==1)return {state:'missing'};
+    options[0].click();return {state:'opened'};
+  }
+  if(step==='readers'){
+    const dialogs=[...document.querySelectorAll('[role="dialog"],dialog[open]')].filter(visible);
+    const modal=dialogs.length===1 && /スキした|スキの一覧|スキ一覧/.test(dialogs[0].innerText)?dialogs[0]:null;
+    const likers=modal?[...new Set([...modal.querySelectorAll('a[href]')].filter(visible).map(owner).filter(Boolean))]:[];
+    return {state:'ready',owners:[...new Set([...rows.map(r=>r.owner),...likers])].filter(v=>v!==arg.owner).slice(0,20),comments:rows.length,likers:likers.length};
+  }
+  return {state:'missing'};
+}
+
+async function readerOpportunity1697(env,state,settings,token,ownIds,markSending,bump) {
+  const now=Date.now(),utc=Math.floor(now/(24*HOUR));
+  const s=await sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first();
+  if(!s.pending && (!s.seed || s.due>now))return null;
+  const record=async message=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run();
+  if(typeof env.BROWSER?.acquire!=='function'){
+    await sql(env,"UPDATE nh_v1697_discovery SET due=?,message='BROWSER未設定・追加巡回は待機中' WHERE slot=?",now+6*HOUR,env.SLOT).run();
+    if(s.pending)return {handled:true,message:'前回のコメント操作は未確認。BROWSERの接続待ちです。'};
+    return null;
+  }
+  if(s.utc_day===utc && s.used>=12){
+    await sql(env,"UPDATE nh_v1697_discovery SET due=?,message='追加巡回は本日12回確認済み・翌日に自動再開' WHERE slot=?",(utc+1)*24*HOUR+60000,env.SLOT).run();
+    return s.pending?{handled:true,message:'前回のコメント操作は再送せず、翌日の確認待ちです。'}:null;
+  }
+  const pending=s.pending?await sql(env,'SELECT * FROM nh_v1697_comments WHERE key=? AND slot=?',s.pending,env.SLOT).first():null;
+  if(s.pending && !pending)throw new Trouble('コメントの確認記録が一致しません','config');
+  if(pending)markSending();
+  const seed=pending?{key:pending.source,owner:pending.source_owner}:{key:s.seed,owner:s.seed_owner};
+  if(!/^n[a-z0-9]{1,64}$/.test(seed.key)||!/^[\w-]{1,80}$/.test(seed.owner))return null;
+  if(!await liveDiscovery1697(env,token))return {handled:true,message:'停止または処理期限のため追加巡回を終了しました'};
+  const mode=pending?'verify':s.turn%2?'readers':'comments';
+  await sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=turn+?,utc_day=?,used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END WHERE slot=?',now+30*60000,+!pending,utc,utc,env.SLOT).run();
+  bump('reader_checks');
+  const source=await article(env,seed.key);
+  if(!source || source.key!==seed.key || source.user?.urlname!==seed.owner || ownIds.has(String(source.user?.id)) || (!pending&&!publicFiction1697(source))){
+    if(pending){await settleComment1697(env,s.pending,false);return {handled:true,message:'前回のコメントの公開元を確認できず、再送せず除外しました'};}
+    await record('創作タグ・公開元の一致を確認できず・次の巡回で別の記事を確認');return null;
+  }
+  let reserved='',failure=null;
+  const guard=async fn=>{try{return await fn();}catch(e){failure=e;throw e;}};
+  const result=await inNoteBrowser(env.BROWSER,cleanCookie(env.NOTE_SESSION),false,async io=>{
+    const {command,evaluate,blocked,blockedResult}=io;
+    const form=(step,extra={})=>evaluate('('+BROWSER_SOURCES520.readerScreen1697+')('+JSON.stringify(step)+','+JSON.stringify({...seed,...extra})+')');
+    await command('Page.navigate',{url:'https://note.com/'+seed.owner+'/n/'+seed.key});
+    let identity;
+    for(let n=0;n<6&&!blocked();n++){
+      try{identity=await evaluate(noteIdentityJS);if(identity?.id)break;}catch{}
+      await pause520(250);
+    }
+    if(blocked())return blockedResult();
+    if(identity?.id!==state.account)return {message:'追加巡回の本人確認が一致せず・操作なし'};
+    await evaluate('window.scrollTo(0,document.documentElement.scrollHeight)');
+    await pause520(300);
+    await form('openComments');
+    let rows=[],previous='',stable=false;
+    for(let n=0;n<8&&!blocked();n++){
+      const r=await form('comments');
+      const signature=JSON.stringify(r);
+      if(r.state==='ready'&&r.rows.length&&signature===previous){rows=r.rows;stable=true;break;}
+      previous=signature;await pause520(250);
+    }
+    if(blocked())return blockedResult();
+    if(pending){
+      const r=await form('verify',{commentOwner:pending.owner,hash:pending.hash});
+      return {recovered:r.state==='liked',resolved:true,message:r.state==='liked'?'前回のコメントへのスキを確認しました':'前回のコメントへのスキは未確認・再送せず除外しました'};
+    }
+    if(mode==='readers'){
+      await form('openLikers');await pause520(300);
+      if(blocked())return blockedResult();
+      const r=await form('readers');
+      return {owners:r.owners||[],message:r.owners?.length?'創作記事に反応した読者を確認':'感想・スキした人の一覧を確認できず・記事巡回を継続'};
+    }
+    if(!stable)return {message:'コメント欄の本文・作者・スキ状態を確認できず・操作なし'};
+    let checked=0;
+    for(const row of rows){
+      if(!row.eligible||row.liked!==false||row.owner===seed.owner)continue;
+      if(++checked>3)break;
+      const who=await guard(()=>api(env,'/api/v2/creators/'+encodeURIComponent(row.owner)));
+      const author=String(who?.id||'');
+      if(who?.urlname!==row.owner||!/^\d+$/.test(author)||ownIds.has(author))continue;
+      const key=await guard(()=>reserveComment1697(env,token,settings,seed,row,author));
+      if(!key){bump('reserved');continue;}
+      reserved=key;markSending();
+      if(blocked())return blockedResult();
+      if(!await guard(()=>liveDiscovery1697(env,token)))return {message:'停止・待機のためコメント操作を保留'};
+      const target={commentOwner:row.owner,hash:row.hash};
+      if((await form('like',target)).state!=='clicked')return {message:'コメントの状態が変わったため操作を保留'};
+      await pause520(1000);
+      if(blocked())return blockedResult();
+      const verified=(await form('verify',target)).state==='liked';
+      return {verified,message:verified?'感想コメントへのスキ確認済み':'コメントへのスキは操作済み・次回に結果確認'};
+    }
+    return {message:'感想コメントの候補なし・作者待機・スキ済み'};
+  },env.TRACE);
+  if(failure)throw failure;
+  await record(result.message||'追加巡回の画面を確認待ち');
+  if(result.code||result.hold)throw new Trouble(result.message,result.code===429?'rate':[401,403].includes(result.code)?'auth':'network',result.hold||0,result.code||0);
+  if(pending){
+    // An unavailable page is not a reason to retry a click. Recovery is read-only.
+    if(!result.resolved)throw new Trouble(result.message||'前回のコメント操作の確認待ち');
+    await settleComment1697(env,s.pending,!!result.recovered);
+    if(result.recovered)bump('comment_recovered');
+    return {handled:true,success:!!result.recovered,message:result.message};
+  }
+  if(reserved){
+    if(result.verified){await settleComment1697(env,reserved,true);bump('comment_sent');}
+    else throw new Trouble(result.message||'コメントの送信結果は未確認');
+    return {handled:true,success:true,message:result.message};
+  }
+  if(!result.owners?.length)return null;
+  const names=[...new Set(result.owners)].filter(n=>typeof n==='string'&&/^[\w-]{1,80}$/.test(n));
+  const offset=Math.floor(s.turn/2)%names.length;
+  const ordered=names.slice(offset).concat(names.slice(0,offset));
+  const notes=[];
+  for(const owner of ordered.slice(0,3)){
+    if(!await liveDiscovery1697(env,token))break;
+    const data=await api(env,'/api/v2/creators/'+encodeURIComponent(owner)+'/contents?kind=note&page=1');
+    if(!Array.isArray(data?.contents))continue;
+    for(const n of data.contents.slice(0,30)){
+      if(publicFiction1697(n)&&n.user.urlname===owner&&!ownIds.has(String(n.user.id)))notes.push(n);
+      if(notes.length>=settings.scan_notes)break;
+    }
+    if(notes.length>=settings.scan_notes)break;
+  }
+  await record(notes.length?'読者経由の記事候補 '+notes.length+'件・送信結果は通常巡回欄に記録':'読者の公開記事に創作タグのある候補なし');
+  return notes.length?{notes}:null;
+}
+
 async function run(original,slot) {
   const baseEnv = scoped(original,slot);
   const token = await acquire(baseEnv,true);
@@ -502,7 +741,8 @@ async function run(original,slot) {
       const add=liked && before?.status!=='liked';
       const items=[
         sql(env,'INSERT INTO nh_seen VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET status=excluded.status',state.inflight,liked?'liked':'uncertain',Date.now()),
-        sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=?",+add,token)
+        sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=?",+add,token),
+        sql(env,"UPDATE nh_v1697_discovery SET readers=readers+?,reader_pending='',message=? WHERE slot=? AND reader_pending=?",+add,liked?'前回の読者経由の記事スキを確認':'前回の読者経由の記事は再送せず除外',slot,state.inflight)
       ];
       if (add) { items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,state.inflight,day(),Date.now())); bump('recovered'); }
       await env.DB.batch(items);
@@ -516,19 +756,24 @@ async function run(original,slot) {
       sql(env,'SELECT tag,until_at FROM nh_v15_tag_wait WHERE slot=? AND tag IN ('+marks(tags)+') AND until_at>?',slot,...tags,Date.now())
     ]);
     const ownIds=new Set([state.account,otherRows.results[0].account].filter(Boolean));
+    stage='感想・読者の追加探索';
+    const opportunity=await readerOpportunity1697(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
+    if(opportunity?.handled){await finish(opportunity.message,opportunity.success);return true;}
+    const readerNotes=opportunity?.notes||null;
     const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
     let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
-    for (let visited=0; visited<tags.length && lists<settings.scan_tags; visited++) {
+    for (let visited=0; visited<(readerNotes?1:tags.length) && lists<settings.scan_tags; visited++) {
       if (details>=settings.scan_notes || Date.now()-started>=90000) { limited=true; break; }
-      const tag=tags[cursor%tags.length]; cursor++;
+      const tag=readerNotes?'':tags[cursor%tags.length]; if(!readerNotes)cursor++;
       if (waits.get(tag)>Date.now()) { bump('tag_wait'); continue; }
       const live=await sql(env,'UPDATE nh_control SET cursor=? WHERE id=1 AND token=? AND enabled=1 AND lease>?',cursor,token,Date.now()).run();
       if (!live.meta.changes) { await finish('停止または処理期限により探索を終了しました'); return true; }
       savedCursor=cursor;
       stage='記事一覧の取得'; activeTag=tag; lists++;
-      await env.DB.batch(statItems(env,tag,'checks'));
-      const data=await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
+      if(tag)await env.DB.batch(statItems(env,tag,'checks'));
+      const data=readerNotes?{notes:readerNotes}:await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
       if (!Array.isArray(data.notes)) throw new Trouble('記事一覧の形式を確認できません','response');
+      if(!readerNotes)await saveSeed1697(env,data.notes,tag,ownIds,cursor);
       const notes=new Map(data.notes.filter(n=>typeof n?.key==='string' && /^n[a-z0-9]+$/.test(n.key)).map(n=>[n.key,n]));
       const keys=[...notes.keys()].slice(0,50);
       let candidates=[];
@@ -552,6 +797,7 @@ async function run(original,slot) {
         stage='記事確認'; details++;
         const note=await article(env,key);
         const author=authorOf(note);
+        if(readerNotes && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
         if (!note || note.is_liked===true || ownIds.has(author)) {
           await sql(env,"INSERT OR IGNORE INTO nh_seen VALUES (?,'skip',?)",key,Date.now()).run();
           bump(!note?'missing':'own_or_liked'); continue;
@@ -580,7 +826,8 @@ async function run(original,slot) {
           sql(env,'INSERT OR IGNORE INTO nh_shared (key,slot,token,created) SELECT ?,?,?,? FROM nh_control WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_v15_authors WHERE author=? AND token=?)',key,slot,token,now,token,now,author,token),
           sql(env,"INSERT OR IGNORE INTO nh_seen (key,status,created) SELECT ?,'pending',? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)",key,now,key,token),
           sql(env,'UPDATE nh_control SET inflight=?,lease=? WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)',key,now+LEASE,token,now,key,token),
-          sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token)
+          sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token),
+          ...(readerNotes?[sql(env,'UPDATE nh_v1697_discovery SET reader_pending=? WHERE slot=? AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=? AND inflight=?)',key,slot,token,key)]:[])
         ]);
         if (!reserved[0].meta.changes || !reserved[1].meta.changes || !reserved[3].meta.changes) { bump('reserved'); continue; }
         checkingSend=true;
@@ -591,14 +838,16 @@ async function run(original,slot) {
         await env.DB.batch([
           sql(env,"UPDATE nh_seen SET status='liked' WHERE key=?",key),
           sql(env,"UPDATE nh_control SET inflight='',total=total+1 WHERE id=1 AND token=?",token),
-          sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now())
+          sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now()),
+          ...(readerNotes?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
         ]);
-        bump('sent');
-        await finish('スキ確認済み：'+key+'（#'+tag+'）／探索 '+lists+'タグ・'+details+'記事',true);
+        bump('sent');if(readerNotes)bump('reader_sent');
+        await finish('スキ確認済み：'+key+(readerNotes?'（創作記事に反応した読者経由）':'（#'+tag+'）')+'／詳細確認 '+details+'記事',true);
         return true;
       }
       if (limited) break;
       bump('no_candidates');
+      if(readerNotes){activeTag=null;break;}
       await env.DB.batch([
         ...statItems(env,tag,'skips'),
         sql(env,'INSERT INTO nh_v15_tag_wait (slot,tag,until_at) VALUES (?,?,?) ON CONFLICT(slot,tag) DO UPDATE SET until_at=excluded.until_at',slot,tag,Date.now()+settings.empty_minutes*60000)
@@ -644,6 +893,10 @@ async function dashboard(original, settings, prefix = '') {
       FROM nh_health h JOIN nh_v13_connection c ON c.slot=?
       LEFT JOIN nh_v13_credentials k ON k.slot=c.slot WHERE h.id=1`,day(),slot,slot))
   ]);
+  const discovery=await sql(original,'SELECT slot,comments,readers,message,due,used,utc_day FROM nh_v1697_discovery ORDER BY slot').all();
+  blocks.push('【追加の自動巡回】感想コメントへのスキ／創作記事に反応した読者の記事探索\n'+discovery.results.map(r=>
+    'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件\n'+r.message+'\n次の追加探索：'+time(r.due)).join('\n\n')+
+    '\n記事スキとコメントスキの送信枠・同じ人への待機は共通です。記事の累計にはコメント分を含めません。画面確認待ちは送信成功ではありません。読者からの訪問・読了・通知到達は未計測です。');
   const [tg,stats,metrics,audit] = summary;
   const telegram=tg.results[0];
   const warnings=[];
@@ -1096,7 +1349,7 @@ const pause520 = ms => new Promise(resolve=>setTimeout(resolve,ms));
 const noteIdentityJS=`(async()=>{if(location.origin!=='https://note.com')return null;
       const r=await fetch('/api/v2/current_user',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
       if(!r.ok)return null;const j=await r.json(),d=j.data??j,u=d.user??d;return {id:String(u.id),name:u.urlname};})()`;
-async function inNoteBrowser(binding,cookie,allowEditor,action){
+async function inNoteBrowser(binding,cookie,allowEditor,action,requestTrace=null){
   let session, socket, stage='ブラウザーの起動';
   let retry=0, denied=0;
   try {
@@ -1112,6 +1365,7 @@ async function inNoteBrowser(binding,cookie,allowEditor,action){
     socket.addEventListener('message',event=>{
       let data;
       try {data=JSON.parse(event.data);} catch{return;}
+      if(requestTrace && data.method==='Network.requestWillBeSent' && ['Document','XHR','Fetch'].includes(data.params?.type) && /^https:\/\/(?:editor\.)?note\.com\//.test(data.params?.request?.url||''))requestTrace.calls++;
       if(data.method!=='Network.responseReceived')return;
       const {type,response}=data.params;
       if(!['Document','XHR','Fetch'].includes(type) || !/^https:\/\/(?:editor\.)?note\.com\//.test(response.url))return;
@@ -1129,7 +1383,7 @@ async function inNoteBrowser(binding,cookie,allowEditor,action){
       return r.result.value;
     };
     const blocked=()=>denied || retry>0;
-    const blockedResult=()=>({message:denied?'note応答 HTTP '+denied+'・操作結果は未確認':'note指定の待機・操作結果は未確認',hold:Math.max(denied===429?2*HOUR:0,retry)});
+    const blockedResult=()=>({code:denied,message:denied?'note応答 HTTP '+denied+'・操作結果は未確認':'note指定の待機・操作結果は未確認',hold:Math.max(denied===429?2*HOUR:0,retry)});
     await command('Network.enable');
     await command('Network.setCacheDisabled',{cacheDisabled:true});
     const installed=await command('Network.setCookie',{url:'https://note.com/',name:'_note_session_v5',value:cookie,secure:true,httpOnly:true,sameSite:'Lax'});
@@ -1141,7 +1395,7 @@ async function inNoteBrowser(binding,cookie,allowEditor,action){
     stage='noteの画面との通信';
     return await action({command,evaluate,blocked,blockedResult});
   } catch {
-    return denied || retry>0?{message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:stage+'を完了できず・再確認待ち'};
+    return denied || retry>0?{code:denied,message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:stage+'を完了できず・再確認待ち'};
   } finally {
     try {socket?.close();} catch {}
     if(session?.sessionId)await binding.closeSession(session.sessionId).catch(()=>{});
@@ -5377,5 +5631,6 @@ const BROWSER_SOURCES520 = Object.freeze({
   "draftBodyHash": "async function draftBodyHash(body){\n  if(typeof body!=='string' || !body.trim() || body.length>2500000)return null;\n  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(body));\n  return Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('');\n}",
   "noteJoinDOM520": "function noteJoinDOM520(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();\n  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));\n  if(fields.length!==1)return {state:'composer'};\n  const field=fields[0];\n  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);\n  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));\n  for(const card of cards) {\n    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\\/$/,'')==='/43__';}catch{return false;}});\n    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};\n  }\n  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&\n    (e.closest('[class*=\"comment\"],[class*=\"Comment\"],[data-testid*=\"comment\"]')));\n  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}\n  // An incomplete comment history cannot establish that this account has not already applied.\n  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};\n  if(step==='read')return {state:'ready'};\n  let scope=field.closest('form')||field.parentElement;\n  let buttons=[];\n  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {\n    if(scope.querySelectorAll('textarea').length!==1)break;\n    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');\n    if(buttons.length)break;\n  }\n  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};\n  if(step==='fill') {\n    if(field.value && field.value!==arg.comment)return {state:'draft'};\n    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);\n    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));\n    return {state:'filled'};\n  }\n  if(step==='send') {\n    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};\n    buttons[0].click();return {state:'clicked'};\n  }\n  return {state:'page'};\n}",
   "joinFollowDOM520": "function joinFollowDOM520(owner,action) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const canonical=document.querySelector('link[rel=canonical]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();\n  const roots=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));\n  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];\n  if(controls.length!==1)return 'missing';\n  const b=controls[0];\n  if(name(b)==='フォロー中')return 'on';\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  // This function is deliberately read-only, regardless of action.\n  return 'off';\n}",
-  "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel,items=list.state?.items;\n  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    await list.loadMore();return {state:'loaded'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}"
+  "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel,items=list.state?.items;\n  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    await list.loadMore();return {state:'loaded'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}",
+  "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible = e => !!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const controls=root=>[...root.querySelectorAll('button,[role=\"button\"]')].filter(visible);\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item';\n  const all=[...document.querySelectorAll(rowSelector)].filter(visible);\n  // Nested replies are separate rows. Only the innermost matching container owns a control.\n  const roots=all.filter(r=>!all.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const names=[...new Set([...root.querySelectorAll('a[href]')].filter(a=>visible(a)&&local(a)).map(owner).filter(Boolean))];\n    const bodies=[...root.querySelectorAll('[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]')].filter(e=>visible(e)&&local(e));\n    const texts=[...new Set(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean))];\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text));\n    const hash=Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed');\n      const n=label(button);\n      if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)$/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  if(step==='comments')return {state:'ready',rows:rows.map(({button,...r})=>r)};\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];\n    if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible||r.liked!==false||!r.button||r.button.disabled||r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(all.length)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示)?|コメント\\s*\\d+|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    const options=controls(document).filter(b=>/^(?:スキした(?:人|ユーザー|クリエイター)(?:の一覧)?|スキの一覧|スキ一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const dialogs=[...document.querySelectorAll('[role=\"dialog\"],dialog[open]')].filter(visible);\n    const modal=dialogs.length===1 && /スキした|スキの一覧|スキ一覧/.test(dialogs[0].innerText)?dialogs[0]:null;\n    const likers=modal?[...new Set([...modal.querySelectorAll('a[href]')].filter(visible).map(owner).filter(Boolean))]:[];\n    return {state:'ready',owners:[...new Set([...rows.map(r=>r.owner),...likers])].filter(v=>v!==arg.owner).slice(0,20),comments:rows.length,likers:likers.length};\n  }\n  return {state:'missing'};\n}"
 });
