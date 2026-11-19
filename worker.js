@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.8';
+const VERSION = 'v16.9.9';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -71,7 +71,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v16.9.7-ready';
+const READY = 'v16.9.9-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -133,6 +133,7 @@ async function prepare(original) {
   ]) schema.push(db.prepare(query));
   schema.push(sql(original,'INSERT OR IGNORE INTO nh_v14_settings (id,tags,author_hours) VALUES (1,?,168)',JSON.stringify(DEFAULT_TAGS)));
   schema.push(...discoverySchema1697.map(q=>db.prepare(q)));
+  schema.push(...growthSchema1699.map(q=>db.prepare(q)));
   await db.batch(schema);
   const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
   const names = new Set(done.results.map(row=>row.name));
@@ -159,6 +160,7 @@ function orderFor(tags, slot) {
   return tags.slice(offset).concat(tags.slice(0,offset));
 }
 const REASONS = {
+  reader_saved:'読者候補の保存・更新',reader_profiles:'保存した読者の公開記事確認',reader_wait:'保存した読者の作者待機',reader_fallback:'読者候補から通常巡回へ継続',reader_returning:'自分の作品の読者探索',
   reader_checks:'読者・感想の追加探索', comment_sent:'感想コメントへのスキ確認成功', comment_recovered:'前回コメントのスキ確認成功', reader_sent:'読者経由の記事スキ確認成功', runs:'自動確認', sent:'送信成功', recovered:'前回送信の成功確認', author_recent:'同じ作者への待機で除外した候補',
   seen:'記事履歴で除外した候補', own_or_liked:'自分たちの記事・スキ済み', missing:'削除済み', no_author:'作者不明',
   no_candidates:'候補なしのタグ', tag_wait:'候補なし待機を省略したタグ', candidate_limit:'探索上限で見送り',
@@ -414,6 +416,7 @@ async function api(env, path, post = false, referer = 'https://note.com/') {
 async function account(env) {
   const data = await api(env, '/api/v2/current_user'), user = data.user ?? data;
   if (!user?.id || !user?.urlname) throw new Trouble('ログイン情報の更新が必要です', 'auth');
+  if(env.TRACE)env.TRACE.identity={id:String(user.id),owner:user.urlname};
   return String(user.id);
 }
 async function article(env, key) {
@@ -592,10 +595,79 @@ async function readerScreen1697(step,arg) {
   return {state:'missing'};
 }
 
+// Persist public reader identities between discovery runs. No private mail,
+// notification feed, guessed write endpoint, or return-visit attribution.
+const growthSchema1699 = [
+  `CREATE TABLE IF NOT EXISTS nh_v1699_readers(slot TEXT NOT NULL,owner TEXT NOT NULL,source TEXT NOT NULL,origin TEXT NOT NULL,author TEXT NOT NULL DEFAULT '',seen INTEGER NOT NULL,expires INTEGER NOT NULL,next_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(slot,owner))`,
+  `CREATE INDEX IF NOT EXISTS nh_v1699_readers_due ON nh_v1699_readers(slot,next_at,owner)`,
+  `CREATE INDEX IF NOT EXISTS nh_v1699_readers_expiry ON nh_v1699_readers(expires)`
+];
+async function rememberReaders1699(env,owners,seed,origin,bump) {
+  const now=Date.now();
+  const names=[...new Set(owners)].filter(n=>typeof n==='string' && /^[\w-]{1,80}$/.test(n) && n!==seed.owner && n!==env.TRACE?.identity?.owner).slice(0,20);
+  if(!names.length)return;
+  // Maximum 64 pending public identities per account; all lookups use indexes.
+  // Refreshing an existing reader never shortens its next-check time.
+  const result=await env.DB.batch([
+    sql(env,'DELETE FROM nh_v1699_readers WHERE expires<=?',now),
+    ...names.map(owner=>sql(env,`INSERT INTO nh_v1699_readers(slot,owner,source,origin,seen,expires,next_at) SELECT ?,?,?,?,?,?,0
+      WHERE (SELECT COUNT(*) FROM nh_v1699_readers WHERE slot=?)<64 OR EXISTS(SELECT 1 FROM nh_v1699_readers WHERE slot=? AND owner=?)
+      ON CONFLICT(slot,owner) DO UPDATE SET source=excluded.source,origin=excluded.origin,seen=excluded.seen,expires=excluded.expires`,
+      env.SLOT,owner,seed.key,origin,now,now+7*24*HOUR,env.SLOT,env.SLOT,owner))
+  ]);
+  bump('reader_saved',result.slice(1).filter(r=>r.meta.changes).length);
+}
+async function queuedReader1699(env,state,settings,token,ownIds,bump) {
+  if(!await liveDiscovery1697(env,token))return null;
+  const now=Date.now();
+  const row=await sql(env,`SELECT q.*,a.last_at FROM nh_v1699_readers q LEFT JOIN nh_v15_authors a ON a.author=q.author
+    WHERE q.slot=? AND q.next_at<=? AND q.expires>? ORDER BY q.next_at,q.owner LIMIT 1`,env.SLOT,now,now).first();
+  if(!row)return null;
+  const wait=Math.max(now+24*HOUR,(row.last_at||0)+settings.author_hours*HOUR);
+  const claimed=await sql(env,`UPDATE nh_v1699_readers SET next_at=? WHERE slot=? AND owner=? AND next_at<=?
+    AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND enabled=1 AND token=? AND lease>?)`,wait,env.SLOT,row.owner,now,token,now).run();
+  if(!claimed.meta.changes)return null;
+  if(ownIds.has(row.author) || row.owner===env.TRACE?.identity?.owner || (row.last_at||0)>now-settings.author_hours*HOUR){bump('reader_wait');return null;}
+  if(!await liveDiscovery1697(env,token))return null;
+  bump('reader_profiles');
+  let data;
+  try{data=await api(env,'/api/v2/creators/'+encodeURIComponent(row.owner)+'/contents?kind=note&page=1');}
+  catch(error){
+    if(error instanceof Trouble && [404,410].includes(error.code) && !error.retry){
+      await sql(env,'DELETE FROM nh_v1699_readers WHERE slot=? AND owner=?',env.SLOT,row.owner).run();return null;
+    }
+    throw error;
+  }
+  if(!Array.isArray(data?.contents))return null;
+  const notes=data.contents.slice(0,30).filter(n=>publicFiction1697(n) && n.user.urlname===row.owner &&
+    /^[1-9]\d{0,19}$/.test(String(n.user.id)) && !ownIds.has(String(n.user.id)) && n.is_liked!==true).slice(0,settings.scan_notes);
+  if(notes.length){
+    const ids=new Set(notes.map(n=>String(n.user.id)));
+    if(ids.size!==1)return null;
+    await sql(env,'UPDATE nh_v1699_readers SET author=? WHERE slot=? AND owner=?',String(notes[0].user.id),env.SLOT,row.owner).run();
+    await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',
+      (row.origin==='returning'?'自分の作品に反応した読者':'文芸記事に反応した読者')+'の公開記事を確認・送信結果は通常巡回欄に記録',env.SLOT).run();
+  }
+  return notes.length?notes:null;
+}
+async function ownReaderSeed1699(env,state,turn) {
+  const identity=env.TRACE?.identity;
+  if(identity?.id!==state.account || !/^[\w-]{1,80}$/.test(identity.owner))return null;
+  const data=await api(env,'/api/v2/creators/'+encodeURIComponent(identity.owner)+'/contents?kind=note&page=1');
+  if(!Array.isArray(data?.contents))return null;
+  const notes=data.contents.slice(0,30).filter(n=>n?.status==='published' && /^n[a-z0-9]{1,64}$/.test(n.key) &&
+    n.user?.urlname===identity.owner && String(n.user?.id)===state.account && typeof n.name==='string' && n.name.trim() && n.name.trim()!=='521' &&
+    Math.max(Number(n.like_count??n.likeCount)||0,Number(n.comment_count??n.commentCount)||0)>0);
+  // The creator endpoint provides recent content. No hashtags are required on the user's own work.
+  const n=notes[Math.floor(turn/4)%Math.min(4,notes.length)];
+  return n?{key:n.key,owner:identity.owner}:null;
+}
+
 async function readerOpportunity1697(env,state,settings,token,ownIds,markSending,bump) {
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
   const s=await sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first();
-  if(!s.pending && (!s.seed || s.due>now))return null;
+  const returning=!s.pending && s.turn%4===3;
+  if(!s.pending && ((!s.seed && !returning) || s.due>now))return null;
   const record=async message=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run();
   if(typeof env.BROWSER?.acquire!=='function'){
     await sql(env,"UPDATE nh_v1697_discovery SET due=?,message='BROWSER未設定・追加巡回は待機中' WHERE slot=?",now+6*HOUR,env.SLOT).run();
@@ -609,14 +681,18 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   const pending=s.pending?await sql(env,'SELECT * FROM nh_v1697_comments WHERE key=? AND slot=?',s.pending,env.SLOT).first():null;
   if(s.pending && !pending)throw new Trouble('コメントの確認記録が一致しません','config');
   if(pending)markSending();
-  const seed=pending?{key:pending.source,owner:pending.source_owner}:{key:s.seed,owner:s.seed_owner};
-  if(!/^n[a-z0-9]{1,64}$/.test(seed.key)||!/^[\w-]{1,80}$/.test(seed.owner))return null;
+  let seed=pending?{key:pending.source,owner:pending.source_owner}:{key:s.seed,owner:s.seed_owner};
+  if(!returning && (!/^n[a-z0-9]{1,64}$/.test(seed.key)||!/^[\w-]{1,80}$/.test(seed.owner)))return null;
   if(!await liveDiscovery1697(env,token))return {handled:true,message:'停止または処理期限のため追加巡回を終了しました'};
   const mode=pending?'verify':s.turn%2?'readers':'comments';
   await sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=turn+?,utc_day=?,used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END WHERE slot=?',now+30*60000,+!pending,utc,utc,env.SLOT).run();
   bump('reader_checks');
+  if(returning){
+    bump('reader_returning');seed=await ownReaderSeed1699(env,state,s.turn);
+    if(!seed){await record('自分の公開作品の読者候補なし・通常巡回を継続');return null;}
+  }
   const source=await article(env,seed.key);
-  if(!source || source.key!==seed.key || source.user?.urlname!==seed.owner || ownIds.has(String(source.user?.id)) || (!pending&&!publicFiction1697(source))){
+  if(!source || source.key!==seed.key || source.user?.urlname!==seed.owner || (returning?String(source.user?.id)!==state.account || source.status!=='published':ownIds.has(String(source.user?.id)) || (!pending&&!publicFiction1697(source)))){
     if(pending){await settleComment1697(env,s.pending,false);return {handled:true,message:'前回のコメントの公開元を確認できず、再送せず除外しました'};}
     await record('創作タグ・公開元の一致を確認できず・次の巡回で別の記事を確認');return null;
   }
@@ -692,22 +768,8 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
     return {handled:true,success:true,message:result.message};
   }
   if(!result.owners?.length)return null;
-  const names=[...new Set(result.owners)].filter(n=>typeof n==='string'&&/^[\w-]{1,80}$/.test(n));
-  const offset=Math.floor(s.turn/2)%names.length;
-  const ordered=names.slice(offset).concat(names.slice(0,offset));
-  const notes=[];
-  for(const owner of ordered.slice(0,3)){
-    if(!await liveDiscovery1697(env,token))break;
-    const data=await api(env,'/api/v2/creators/'+encodeURIComponent(owner)+'/contents?kind=note&page=1');
-    if(!Array.isArray(data?.contents))continue;
-    for(const n of data.contents.slice(0,30)){
-      if(publicFiction1697(n)&&n.user.urlname===owner&&!ownIds.has(String(n.user.id)))notes.push(n);
-      if(notes.length>=settings.scan_notes)break;
-    }
-    if(notes.length>=settings.scan_notes)break;
-  }
-  await record(notes.length?'読者経由の記事候補 '+notes.length+'件・送信結果は通常巡回欄に記録':'読者の公開記事に創作タグのある候補なし');
-  return notes.length?{notes}:null;
+  await rememberReaders1699(env,result.owners,seed,returning?'returning':'literary',bump);
+  return null;
 }
 
 async function run(original,slot) {
@@ -759,21 +821,22 @@ async function run(original,slot) {
     stage='感想・読者の追加探索';
     const opportunity=await readerOpportunity1697(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
     if(opportunity?.handled){await finish(opportunity.message,opportunity.success);return true;}
-    const readerNotes=opportunity?.notes||null;
+    const readerNotes=await queuedReader1699(env,state,settings,token,ownIds,bump);
     const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
     let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
-    for (let visited=0; visited<(readerNotes?1:tags.length) && lists<settings.scan_tags; visited++) {
+    for (let visited=0; visited<tags.length+(readerNotes?1:0) && (visited===0 && readerNotes || lists<settings.scan_tags); visited++) {
       if (details>=settings.scan_notes || Date.now()-started>=90000) { limited=true; break; }
-      const tag=readerNotes?'':tags[cursor%tags.length]; if(!readerNotes)cursor++;
+      const fromReader=!!readerNotes && visited===0;
+      const tag=fromReader?'':tags[cursor%tags.length]; if(!fromReader)cursor++;
       if (waits.get(tag)>Date.now()) { bump('tag_wait'); continue; }
       const live=await sql(env,'UPDATE nh_control SET cursor=? WHERE id=1 AND token=? AND enabled=1 AND lease>?',cursor,token,Date.now()).run();
       if (!live.meta.changes) { await finish('停止または処理期限により探索を終了しました'); return true; }
       savedCursor=cursor;
-      stage='記事一覧の取得'; activeTag=tag; lists++;
+      stage=fromReader?'保存した読者の記事確認':'記事一覧の取得'; activeTag=tag; if(!fromReader)lists++;
       if(tag)await env.DB.batch(statItems(env,tag,'checks'));
-      const data=readerNotes?{notes:readerNotes}:await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
+      const data=fromReader?{notes:readerNotes}:await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
       if (!Array.isArray(data.notes)) throw new Trouble('記事一覧の形式を確認できません','response');
-      if(!readerNotes)await saveSeed1697(env,data.notes,tag,ownIds,cursor);
+      if(!fromReader)await saveSeed1697(env,data.notes,tag,ownIds,cursor);
       const notes=new Map(data.notes.filter(n=>typeof n?.key==='string' && /^n[a-z0-9]+$/.test(n.key)).map(n=>[n.key,n]));
       const keys=[...notes.keys()].slice(0,50);
       let candidates=[];
@@ -797,7 +860,7 @@ async function run(original,slot) {
         stage='記事確認'; details++;
         const note=await article(env,key);
         const author=authorOf(note);
-        if(readerNotes && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
+        if(fromReader && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
         if (!note || note.is_liked===true || ownIds.has(author)) {
           await sql(env,"INSERT OR IGNORE INTO nh_seen VALUES (?,'skip',?)",key,Date.now()).run();
           bump(!note?'missing':'own_or_liked'); continue;
@@ -827,7 +890,7 @@ async function run(original,slot) {
           sql(env,"INSERT OR IGNORE INTO nh_seen (key,status,created) SELECT ?,'pending',? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)",key,now,key,token),
           sql(env,'UPDATE nh_control SET inflight=?,lease=? WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)',key,now+LEASE,token,now,key,token),
           sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token),
-          ...(readerNotes?[sql(env,'UPDATE nh_v1697_discovery SET reader_pending=? WHERE slot=? AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=? AND inflight=?)',key,slot,token,key)]:[])
+          ...(fromReader?[sql(env,'UPDATE nh_v1697_discovery SET reader_pending=? WHERE slot=? AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=? AND inflight=?)',key,slot,token,key)]:[])
         ]);
         if (!reserved[0].meta.changes || !reserved[1].meta.changes || !reserved[3].meta.changes) { bump('reserved'); continue; }
         checkingSend=true;
@@ -839,15 +902,15 @@ async function run(original,slot) {
           sql(env,"UPDATE nh_seen SET status='liked' WHERE key=?",key),
           sql(env,"UPDATE nh_control SET inflight='',total=total+1 WHERE id=1 AND token=?",token),
           sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now()),
-          ...(readerNotes?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
+          ...(fromReader?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
         ]);
-        bump('sent');if(readerNotes)bump('reader_sent');
-        await finish('スキ確認済み：'+key+(readerNotes?'（創作記事に反応した読者経由）':'（#'+tag+'）')+'／詳細確認 '+details+'記事',true);
+        bump('sent');if(fromReader)bump('reader_sent');
+        await finish('スキ確認済み：'+key+(fromReader?'（文芸・自分の作品の読者経由）':'（#'+tag+'）')+'／詳細確認 '+details+'記事',true);
         return true;
       }
       if (limited) break;
       bump('no_candidates');
-      if(readerNotes){activeTag=null;break;}
+      if(fromReader){activeTag=null;bump('reader_fallback');continue;}
       await env.DB.batch([
         ...statItems(env,tag,'skips'),
         sql(env,'INSERT INTO nh_v15_tag_wait (slot,tag,until_at) VALUES (?,?,?) ON CONFLICT(slot,tag) DO UPDATE SET until_at=excluded.until_at',slot,tag,Date.now()+settings.empty_minutes*60000)
@@ -893,9 +956,9 @@ async function dashboard(original, settings, prefix = '') {
       FROM nh_health h JOIN nh_v13_connection c ON c.slot=?
       LEFT JOIN nh_v13_credentials k ON k.slot=c.slot WHERE h.id=1`,day(),slot,slot))
   ]);
-  const discovery=await sql(original,'SELECT slot,comments,readers,message,due,used,utc_day FROM nh_v1697_discovery ORDER BY slot').all();
+  const discovery=await sql(original,'SELECT d.slot,d.comments,d.readers,d.message,d.due,d.used,d.utc_day,(SELECT COUNT(*) FROM nh_v1699_readers q WHERE q.slot=d.slot AND q.expires>?) queued FROM nh_v1697_discovery d ORDER BY d.slot',Date.now()).all();
   blocks.push('【追加の自動巡回】感想コメントへのスキ／創作記事に反応した読者の記事探索\n'+discovery.results.map(r=>
-    'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件\n'+r.message+'\n次の追加探索：'+time(r.due)).join('\n\n')+
+    'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件／保存した読者候補 '+r.queued+'人\n'+r.message+'\n次の追加探索：'+time(r.due)).join('\n\n')+
     '\n記事スキとコメントスキの送信枠・同じ人への待機は共通です。記事の累計にはコメント分を含めません。画面確認待ちは送信成功ではありません。読者からの訪問・読了・通知到達は未計測です。');
   const [tg,stats,metrics,audit] = summary;
   const telegram=tg.results[0];
@@ -3255,9 +3318,11 @@ class Desk520 {
   }
   async ensureRecommendation(now) {
     const state=this.one('SELECT * FROM desk_recommend WHERE id=1');
-    if(state.done || state.due>now)return;
+    if(state.due>now || (state.done && state.checked>now-7*D520))return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return;
+    if(!this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return;
+    if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) || this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const binding=this.env?.BROWSER;
     if(typeof binding?.acquire!=='function'){
       this.rows("UPDATE desk_recommend SET due=?,message='ブラウザー未接続・note設定の確認待ち' WHERE id=1",now+HOUR);
