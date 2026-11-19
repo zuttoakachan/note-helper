@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.7';
+const VERSION = 'v16.9.8';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1993,6 +1993,7 @@ class Desk520 {
     this.initShelf520();
     this.initJoinPolicy520();
     this.initExpansion520();
+    this.initObservation1698();
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2275,7 +2276,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3396,6 +3397,7 @@ class Desk520 {
     if(!publication)await task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
     if(!publication)await task('人気記事の入口',()=>this.popularTick520(Date.now()));
     if(!publication)await task('スキのお礼設定',()=>this.syncReactions(Date.now()));
+    if(!publication)await task('キーワード一覧の観測',()=>this.observeEntrances1698(Date.now()));
   }
   async tickRecords() {
     const cfg=this.one('SELECT * FROM desk_cfg WHERE id=1'), now=Date.now();
@@ -3766,6 +3768,7 @@ function deskRecordText(s) {
   const val=v=>v===null || v===undefined?'欠測':String(v);
   const lines=['自動記録 '+(s.cfg.enabled?'ON':'開始前')+' ／ 最終起動 '+tm(s.cfg.tick_at),
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
+  if(s.observation)lines.push(observationText1698(s));
   if(s.join)lines.push(joinRecord520(s.join));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
   if(s.popular)lines.push('【人気記事の入口】'+s.popular.message+(s.popular.checked?' ／ '+time(s.popular.checked):''));
@@ -5625,6 +5628,240 @@ Object.assign(Desk520.prototype,{
 
 // Generated standalone browser sources. Regenerate from the functions above when editing.
 // These literals must never be replaced by runtime Function.toString().
+// Public, signed-out observations. These records never choose or change note placement.
+const OBSERVE1698 = Object.freeze({keywords:['小説','短編小説','恋愛','孤独','夜職','美容整形'],daily:12,gap:2*HOUR});
+function observationUrl1698(job) {
+  if(job.kind==='keyword' && OBSERVE1698.keywords.includes(job.subject) && ['popular','new'].includes(job.mode))
+    return 'https://note.com/tag/'+encodeURIComponent(job.subject)+(job.mode==='new'?'?mode=new':'');
+  if(job.kind==='footer' && /^n[a-z0-9]{1,64}$/.test(job.subject))return 'https://note.com/43__/n/'+job.subject;
+  throw Error('Invalid public observation');
+}
+// Serialized once at build time. No clicks, scrolls, login or author-side settings.
+function observationScreen1698(job) {
+  const unknown=reason=>({state:'unknown',reason});
+  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden="true"]') && getComputedStyle(e).visibility!=='hidden';
+  const text=e=>(e?.textContent||'').replace(/\s+/g,' ').trim();
+  const absolute=raw=>{try{const u=new URL(raw,location.href);return u.origin==='https://note.com' && !u.username && !u.password?u:null;}catch{return null;}};
+  const rawCanonical=document.querySelector('link[rel="canonical"]')?.getAttribute('href');
+  const canonical=rawCanonical?absolute(rawCanonical):null;
+  if(location.origin!=='https://note.com' || document.readyState!=='complete' || !canonical ||
+     canonical.pathname.replace(/\/$/,'')!==location.pathname.replace(/\/$/,''))return unknown('page');
+  const bodySelector='[contenteditable],.note-common-styles__textnote-body,.o-noteContentText,[data-testid="note-body"],[class*="noteBody"],[class*="NoteBody"],blockquote';
+  const h1=[...document.querySelectorAll('h1')].filter(visible);
+  if(h1.length!==1)return unknown('heading');
+  if(job.kind==='keyword') {
+    let path;try{path=decodeURIComponent(location.pathname).replace(/\/$/,'');}catch{return unknown('page');}
+    const mode=new URL(location.href).searchParams.get('mode');
+    if(path!=='/tag/'+job.subject || text(h1[0])!==job.subject ||
+       (job.mode==='new'?mode!=='new':mode!==null))return unknown('page');
+    const mains=[...document.querySelectorAll('main,[role="main"]')].filter(visible);
+    const root=mains.length===1?mains[0]:null;
+    if(!root)return unknown('list');
+    const tabs=[...root.querySelectorAll('a[href],[role="tab"]')].filter(e=>visible(e)&&['人気','新着'].includes(text(e)));
+    const selected=tabs.filter(e=>e.getAttribute('aria-selected')==='true' || ['page','true'].includes(e.getAttribute('aria-current')) || e.classList.contains('is-active'));
+    if(selected.length!==1 || text(selected[0])!==(job.mode==='new'?'新着':'人気'))return unknown('sort');
+    const cardSelector='article,[data-testid="note-card"],.m-note,.m-largeNoteWrapper,[class*="noteCard"],[class*="NoteCard"]';
+    const cards=[...root.querySelectorAll(cardSelector)].filter(e=>visible(e)&&!e.closest('aside,nav,footer,[class*="recommend" i],[data-testid*="recommend"],'+bodySelector));
+    const leaves=cards.filter(e=>!cards.some(other=>other!==e && e.contains(other)));
+    if(!leaves.length)return unknown('list');
+    const entries=[],seen=new Set();let incomplete=false;
+    for(const card of leaves.slice(0,50)) {
+      const headings=[...card.querySelectorAll('h2,h3,h4')].filter(visible);
+      if(headings.length!==1 || !text(headings[0])){incomplete=true;continue;}
+      const urls=[...new Set([...card.querySelectorAll('a[href],[data-href]')].concat(card.matches('a[href],[data-href]')?[card]:[])
+        .filter(visible).map(e=>absolute(e.getAttribute('href')||e.getAttribute('data-href')))
+        .filter(u=>u && /^\/[\w-]{1,80}\/n\/n[a-z0-9]{1,64}\/?$/.test(u.pathname)).map(u=>u.origin+u.pathname.replace(/\/$/,'')))];
+      if(urls.length!==1){incomplete=true;continue;}
+      if(seen.has(urls[0]))continue;
+      seen.add(urls[0]);entries.push({url:urls[0],title:text(headings[0]).slice(0,300)});
+    }
+    // A missing/unrecognized card is not proof that 520 is absent from this page.
+    if(!entries.length)return unknown('cards');
+    return {state:'observed',complete:!incomplete,entries,scope:'initial_cards'};
+  }
+  if(job.kind!=='footer' || location.pathname.replace(/\/$/,'')!=='/43__/n/'+job.subject || text(h1[0])==='521')return unknown('page');
+  const groups=[...document.querySelectorAll('[aria-label*="パンくず"],[aria-label*="breadcrumb" i],[class*="breadcrumb" i]')]
+    .filter(e=>visible(e) && !e.closest(bodySelector));
+  const paths=[];
+  for(const group of groups) {
+    if(group.getBoundingClientRect().top<h1[0].getBoundingClientRect().bottom)continue;
+    const links=[...group.querySelectorAll('a[href]')].filter(visible);
+    const list=links.map(a=>({u:absolute(a.getAttribute('href')),label:text(a)}));
+    if(!list.some(x=>x.u?.pathname==='/' && ['トップ','ホーム'].includes(x.label)))continue;
+    const topics=list.filter(x=>x.u && /^\/topic\/[a-z0-9_/-]+\/?$/.test(x.u.pathname) && x.label && x.label.length<=100)
+      .map(x=>({label:x.label,url:x.u.origin+x.u.pathname}));
+    if(topics.length && topics.length<=8)paths.push(topics);
+  }
+  const unique=[...new Map(paths.map(p=>[JSON.stringify(p),p])).values()];
+  return unique.length===1?{state:'observed',title:text(h1[0]).slice(0,300),topics:unique[0]}:unknown('breadcrumb');
+}
+async function readObservation1698(binding,jobs) {
+  const targets=jobs.map(observationUrl1698),results=[];
+  let socket,session,command,hold=0,denied=0,deadline;
+  try {
+    session=await binding.acquire({keepAlive:15000,recording:false,guardrails:{allowedDomains:['note.com','*.st-note.com']}});
+    const target=await binding.devtools.newTarget(session.sessionId);
+    const link=await binding.connectSession(session.sessionId,{targetId:target.id});
+    const upgraded=await link.webSocket.fetch('https://browser-binding.invalid',{headers:{Upgrade:'websocket'}});
+    socket=upgraded.webSocket;if(!socket)throw Error('browser');socket.accept();
+    command=pageCommand(socket);
+    deadline=setTimeout(()=>{try{socket.close();}catch{}},24000);
+    // This session is anonymous. No saved credential is ever read or installed.
+    await command('Network.enable');
+    await command('Network.clearBrowserCookies');
+    await command('Network.setCacheDisabled',{cacheDisabled:true});
+    socket.addEventListener('message',event=>{
+      let data;try{data=JSON.parse(event.data);}catch{return;}
+      if(data.method==='Fetch.requestPaused') {
+        const p=data.params;let u;try{u=new URL(p.request.url);}catch{}
+        const allowed=u?.protocol==='https:' && !u.username && !u.password &&
+          (u.hostname==='note.com'||/^(?:[a-z0-9-]+\.)+st-note\.com$/.test(u.hostname)) && ['GET','HEAD'].includes(p.request.method) &&
+          (p.resourceType!=='Document'||targets.includes(u.href));
+        command(allowed?'Fetch.continueRequest':'Fetch.failRequest',allowed?{requestId:p.requestId}:{requestId:p.requestId,errorReason:'BlockedByClient'}).catch(()=>{});
+      }
+      if(data.method!=='Network.responseReceived')return;
+      const response=data.params.response;
+      if(!['Document','Fetch','XHR'].includes(data.params.type) || !response.url?.startsWith('https://note.com/'))return;
+      const raw=Object.entries(response.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
+      const retry=raw===undefined?0:/^\d+$/.test(String(raw))?Number(raw)*1000:Date.parse(raw)-Date.now();
+      if(Number.isFinite(retry) && retry>0)hold=Math.max(hold,retry);
+      if([401,403,429].includes(response.status)){denied=response.status;hold=Math.max(hold,2*HOUR);}
+      if(response.status>=500){denied=response.status;hold=Math.max(hold,HOUR);}
+    });
+    await command('Fetch.enable',{patterns:[{urlPattern:'*',requestStage:'Request'}]});
+    for(const [i,job] of jobs.entries()) {
+      if(hold || denied)break;
+      await command('Page.navigate',{url:targets[i]});
+      let result=null,previous='';
+      for(let n=0;n<10 && !hold && !denied;n++) {
+        try {
+          const evaluated=await command('Runtime.evaluate',{expression:'('+BROWSER_SOURCES520.observationScreen1698+')('+JSON.stringify(job)+')',returnByValue:true,awaitPromise:false});
+          if(!evaluated.exceptionDetails)result=evaluated.result?.value;
+        }catch{result=null;}
+        const signature=JSON.stringify(result);
+        if(result?.state==='observed' && signature===previous)break;
+        previous=signature;await pause520(350);
+        // A single observation is not stable evidence until read again.
+        if(n===9 && result?.state==='observed')result=null;
+      }
+      if(hold || denied)break;
+      results.push({job,result:result||{state:'unknown',reason:'screen'}});
+    }
+  }catch { /* Only fixed diagnostics are shown. An error never becomes a negative observation. */ }
+  finally {
+    clearTimeout(deadline);try{socket?.close();}catch{}
+    if(session)await binding.closeSession(session.sessionId).catch(()=>{});
+  }
+  return {results,hold,denied};
+}
+Object.assign(Desk520.prototype,{
+  initObservation1698() {
+    if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_observe_state'"))return;
+    this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_observe_state(id INTEGER PRIMARY KEY,next INTEGER NOT NULL DEFAULT 0,day TEXT NOT NULL DEFAULT '',used INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '次の定期起動から公開ページの観測を開始します')");
+      this.rows('INSERT INTO desk_observe_state(id) VALUES(1)');
+      this.rows("CREATE TABLE desk_observe_keyword(keyword TEXT NOT NULL,mode TEXT NOT NULL,due INTEGER NOT NULL DEFAULT 0,attempted INTEGER NOT NULL DEFAULT 0,observed INTEGER NOT NULL DEFAULT 0,cards INTEGER,complete INTEGER NOT NULL DEFAULT 0,hits TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT '待機',PRIMARY KEY(keyword,mode))");
+      this.rows('CREATE INDEX desk_observe_keyword_due ON desk_observe_keyword(due,keyword,mode)');
+      this.rows("CREATE TABLE desk_observe_footer(article TEXT PRIMARY KEY,due INTEGER NOT NULL DEFAULT 0,attempted INTEGER NOT NULL DEFAULT 0,observed INTEGER NOT NULL DEFAULT 0,topics TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT '待機')");
+      this.rows('CREATE INDEX desk_observe_footer_due ON desk_observe_footer(due,article)');
+      this.rows('CREATE TABLE desk_observe_hit(keyword TEXT NOT NULL,mode TEXT NOT NULL,article TEXT NOT NULL,title TEXT NOT NULL,first_at INTEGER NOT NULL,last_at INTEGER NOT NULL,PRIMARY KEY(keyword,mode,article))');
+      this.rows('CREATE INDEX desk_observe_hit_time ON desk_observe_hit(last_at DESC)');
+      this.rows('CREATE TABLE desk_observe_log(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,subject TEXT NOT NULL,mode TEXT NOT NULL,data TEXT NOT NULL)');
+      this.rows('CREATE INDEX desk_observe_log_time ON desk_observe_log(at)');
+      for(const keyword of OBSERVE1698.keywords)for(const mode of ['popular','new'])this.rows('INSERT INTO desk_observe_keyword(keyword,mode) VALUES(?,?)',keyword,mode);
+    });
+  },
+  observationView1698() {
+    return {state:this.one('SELECT next,used,day,message FROM desk_observe_state WHERE id=1'),
+      keywords:this.rows('SELECT keyword,mode,attempted,observed,cards,complete,hits,state FROM desk_observe_keyword ORDER BY keyword,mode'),
+      footers:this.rows('SELECT f.*,a.title FROM desk_observe_footer f JOIN desk_archive a ON a.article=f.article ORDER BY f.attempted DESC,a.pub DESC LIMIT 30'),
+      hits:this.rows('SELECT keyword,mode,article,title,first_at,last_at FROM desk_observe_hit ORDER BY last_at DESC LIMIT 30')};
+  },
+  recordObservation1698(job,result,now) {
+    // Validate the browser boundary again; do not trust arbitrary returned URLs or counts.
+    let valid=result?.state==='observed',data;
+    if(job.kind==='keyword') {
+      valid=valid && Array.isArray(result.entries) && result.entries.length>0 && result.entries.length<=50 && typeof result.complete==='boolean';
+      const entries=valid?result.entries:[];
+      valid=valid && entries.every(e=>typeof e.title==='string' && e.title.length<=300 && /^https:\/\/note\.com\/[\w-]{1,80}\/n\/n[a-z0-9]{1,64}$/.test(e.url));
+      if(valid) {
+        const hits=[...new Map(entries.filter(e=>/^https:\/\/note\.com\/43__\/n\//.test(e.url) && e.title.trim()!=='521')
+          .map(e=>[e.url,{article:e.url.split('/').at(-1),title:e.title}])).values()];
+        data={cards:new Set(entries.map(e=>e.url)).size,complete:result.complete,hits};
+      }
+    } else {
+      valid=valid && Array.isArray(result.topics) && result.topics.length>0 && result.topics.length<=8 && result.topics.every(t=>
+        typeof t.label==='string' && t.label.trim() && t.label.length<=100 && /^https:\/\/note\.com\/topic\/[a-z0-9_/-]+$/.test(t.url));
+      if(valid)data={topics:result.topics};
+    }
+    this.storage.transactionSync(()=>{
+      const table=job.kind==='keyword'?'desk_observe_keyword':'desk_observe_footer';
+      const where=job.kind==='keyword'?'keyword=? AND mode=?':'article=?',args=job.kind==='keyword'?[job.subject,job.mode]:[job.subject];
+      if(!valid){this.rows('UPDATE '+table+" SET state='読み取り未確認・前回の成功記録を保持',attempted=?,due=? WHERE "+where,now,now+D520,...args);return;}
+      if(job.kind==='keyword') {
+        const state=data.hits.length?'520の記事を確認':data.complete?'確認したカード内では見つからず':'一部のカードを読み取れず・掲載の有無は未確認';
+        this.rows('UPDATE desk_observe_keyword SET observed=?,cards=?,complete=?,hits=?,state=? WHERE keyword=? AND mode=?',now,data.cards,+data.complete,JSON.stringify(data.hits),state,...args);
+        for(const hit of data.hits)this.rows('INSERT INTO desk_observe_hit(keyword,mode,article,title,first_at,last_at) VALUES(?,?,?,?,?,?) ON CONFLICT(keyword,mode,article) DO UPDATE SET title=excluded.title,last_at=excluded.last_at',job.subject,job.mode,hit.article,hit.title,now,now);
+      }else this.rows("UPDATE desk_observe_footer SET observed=?,topics=?,state='ページ下部の案内を確認' WHERE article=?",now,JSON.stringify(data.topics),job.subject);
+      this.rows('INSERT INTO desk_observe_log(at,kind,subject,mode,data) VALUES(?,?,?,?,?)',now,job.kind,job.subject,job.mode||'',JSON.stringify(data));
+    });
+  },
+  async observeEntrances1698(now) {
+    const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled delivery FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1');
+    const state=this.one('SELECT * FROM desk_observe_state WHERE id=1');
+    if(!cfg.enabled || !cfg.delivery || cfg.blocked>now || state.next>now)return;
+    const soon=now+6*M520;
+    if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon) ||
+       this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon))return;
+    const today=jstDay(now),used=state.day===today?state.used:0;
+    if(used>=OBSERVE1698.daily){this.rows('UPDATE desk_observe_state SET next=? WHERE id=1',jstStart(today)+D520+M520);return;}
+    if(typeof this.env.BROWSER?.acquire!=='function'){
+      this.rows("UPDATE desk_observe_state SET next=?,message='BROWSER未接続・公開ページを観測できません' WHERE id=1",now+6*HOUR);return;
+    }
+    // Existing catalogue supplies identities. No additional D1 reads or full-history scans.
+    this.rows("INSERT OR IGNORE INTO desk_observe_footer(article) SELECT a.article FROM desk_archive a WHERE trim(a.title)<>'521' AND NOT EXISTS(SELECT 1 FROM desk_observe_footer f WHERE f.article=a.article) ORDER BY a.pub DESC LIMIT 8");
+    const keyword=this.one('SELECT keyword,mode FROM desk_observe_keyword WHERE due<=? ORDER BY due,keyword,mode LIMIT 1',now);
+    const footer=this.one("SELECT f.article FROM desk_observe_footer f JOIN desk_archive a ON a.article=f.article WHERE f.due<=? AND trim(a.title)<>'521' ORDER BY f.due,a.pub DESC LIMIT 1",now);
+    const jobs=[...(keyword?[{kind:'keyword',subject:keyword.keyword,mode:keyword.mode}]:[]),...(footer?[{kind:'footer',subject:footer.article}]:[])];
+    if(!jobs.length){this.rows('UPDATE desk_observe_state SET next=? WHERE id=1',now+HOUR);return;}
+    this.storage.transactionSync(()=>{
+      // Reserve budgets before awaiting the browser; a restart or concurrent request cannot repeat the work.
+      this.rows("UPDATE desk_observe_state SET next=?,day=?,used=?,message='公開ページを観測中' WHERE id=1",now+OBSERVE1698.gap,today,used+1);
+      for(const job of jobs){
+        if(job.kind==='keyword')this.rows("UPDATE desk_observe_keyword SET due=?,attempted=?,state='確認中・前回の成功記録を保持' WHERE keyword=? AND mode=?",now+D520,now,job.subject,job.mode);
+        else this.rows("UPDATE desk_observe_footer SET due=?,attempted=?,state='確認中・前回の成功記録を保持' WHERE article=?",now+7*D520,now,job.subject);
+      }
+      // Observation snapshots are bounded; permanent first/last positive sightings remain separate.
+      this.rows('DELETE FROM desk_observe_log WHERE at<?',now-30*D520);
+    });
+    const read=await readObservation1698(this.env.BROWSER,jobs);
+    if(read.hold>0)this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',Date.now()+read.hold);
+    for(const job of jobs){
+      const result=read.results.find(r=>r.job.kind===job.kind && r.job.subject===job.subject && r.job.mode===job.mode)?.result;
+      this.recordObservation1698(job,result,Date.now());
+    }
+    this.rows('UPDATE desk_observe_state SET next=MAX(next,?),message=? WHERE id=1',Date.now()+read.hold,
+      read.hold?'noteの待機・応答制限を確認。次回へ延期':read.results.some(r=>r.result.state==='observed')?'今回の公開ページの観測結果を保存しました':'画面の読み取りは未確認。次回に自動再確認します');
+  }
+});
+function observationText1698(s) {
+  const v=s.observation;if(!v)return '';
+  const lines=['【キーワード一覧・ページ下部の案内の観測】'+(s.cfg.enabled && s.deliveryOn?'':'（休止中）'),v.state.message,
+    '作品を自動掲載させる機能ではありません。初期表示のうち識別できたカードを観測します。未発見は対象外・圏外を意味しません。',
+    'ログアウト状態での観測です。閲覧者による表示の違い・キーワード別のアクセス数・全体順位は計測できません。'];
+  for(const k of v.keywords){
+    lines.push(k.keyword+' ／ '+(k.mode==='new'?'新着':'人気')+' ／ '+k.state+' ／ 最終試行 '+time(k.attempted));
+    if(k.observed)lines.push('  最後に読み取れた記録 '+time(k.observed)+' ／ '+k.cards+'カード ／ 520 '+JSON.parse(k.hits).length+'作品'+(k.complete?'':'（一部未確認）'));
+  }
+  lines.push('【520の記事を一覧で確認した記録・最新30件】');
+  for(const h of v.hits)lines.push(h.title+' ／ '+h.keyword+'・'+(h.mode==='new'?'新着':'人気')+' ／ 初回 '+time(h.first_at)+' ／ 最終 '+time(h.last_at));
+  if(!v.hits.length)lines.push('実際の掲載を確認できた記録はまだありません。');
+  lines.push('【記事ページ下部の案内・最新30件】','下部リンクの表示を記録しています。キーワード一覧の掲載や、note内部の分類全体を示すものではありません。');
+  for(const f of v.footers)lines.push(f.title+' ／ '+f.state+(f.observed?' ／ 前回確認 '+time(f.observed)+' ／ '+JSON.parse(f.topics).map(t=>t.label).join(' → '):''));
+  if(!v.footers.length)lines.push('公開作品の取得・観測待ち');
+  return lines.join('\n');
+}
+
 const BROWSER_SOURCES520 = Object.freeze({
   "articleReactionForm": "function articleReactionForm(step, titles) {\n  if (location.origin !== 'https://note.com' || location.pathname.replace(/\\/$/,'') !== '/settings/reactions/like/note') return {state:'page'};\n  const visible = el => el.getClientRects().length > 0 && !el.closest('[hidden],[aria-hidden=\"true\"]');\n  const name = el => (el.getAttribute('aria-label') || el.textContent || el.value || el.title || '').trim();\n  const root = document.querySelector('[role=\"dialog\"]') || document.querySelector('main,[role=\"main\"]') || document.body;\n  if (!root || !/スキのお礼/.test(root.innerText) || !/記事にスキ/.test(root.innerText)) return {state:'page'};\n  const controls = el => [...el.querySelectorAll('button,[role=\"button\"],input[type=\"submit\"],a[href=\"#\"]')].filter(visible);\n  const selected = [...root.querySelectorAll('[role=\"tab\"][aria-selected=\"true\"],a[aria-current=\"page\"]')].filter(visible);\n  if (selected.some(el => /コメントにスキ|掲示板.*スキ/.test(name(el)))) return {state:'page'};\n  const pane = [...root.querySelectorAll('[role=\"tabpanel\"]')].filter(visible);\n  if (pane.length > 1) return {state:'page'};\n  const scope = pane[0] || root;\n  const saves = controls(root).filter(el=>/^保存(する)?$/.test(name(el)));\n  if (saves.length !== 1) return {state:'page'};\n  const fields = [...scope.querySelectorAll('textarea,input[type=\"text\"],input:not([type])')].filter(el =>\n    visible(el) && !el.closest('header,nav,[role=\"search\"]') && !el.readOnly && !el.disabled);\n  if (fields.length > 10 || fields.some(el => !/お礼|リアクション|メッセージ|ありがとう|スキ/.test(\n    [el.placeholder,el.getAttribute('aria-label'),el.name,...Array.from(el.labels || [],name)].join(' ')) &&\n    !(el.maxLength > 0 && el.maxLength <= 50) && el.tagName !== 'TEXTAREA')) return {state:'page'};\n  const add = controls(scope).filter(el => /^(?:[+＋]\\s*)?(?:(?:新し[いく]|他の|別の|もう1つの)?(?:スキの)?(?:お礼(?:メッセージ)?|メッセージ|リアクション)(?:を|の)?)?追加(?:する)?(?:[（(][^()（）]*[）)])?$/.test(name(el)));\n  if (!fields.length && add.length !== 1) return {state:'page'};\n  // Look for a selected reaction image inside each message card. Ignore site navigation and stock illustrations.\n  const media = [];\n  for (const field of fields) {\n    for (let row=field.parentElement; row && row!==root.parentElement; row=row.parentElement) {\n      if (fields.filter(f=>row.contains(f)).length !== 1) break;\n      const remove = controls(row).filter(b=>/^(?:設定した|登録した)?(?:画像|お礼画像)(?:を|の)?(?:削除|解除)(?:する)?$/.test(name(b)));\n      if (remove.length === 1) {media.push(remove[0]);break;}\n      const image = [...row.querySelectorAll('img[src]')].some(img=>visible(img) &&\n        (/^blob:|\\/uploads\\/|\\/production\\/uploads\\//.test(img.currentSrc || img.src)) &&\n        !img.closest('header,nav,a') && !/アイコン|サンプル|アバター/.test(img.alt));\n      if (image) {media.push(null);break;}\n      if (row===scope || row===root) break;\n    }\n  }\n  const limits = fields.map(el=>el.maxLength).filter(n=>n>0);\n  const lengthHint = (scope.innerText || '').match(/(\\d{1,3})\\s*(?:文字|字)以内/);\n  if(lengthHint && Number(lengthHint[1])>0)limits.push(Number(lengthHint[1]));\n  const limit = limits.length ? Math.min(...limits) : 35;\n  const values = fields.map(el=>el.value);\n  const active = values.filter(Boolean);\n  const sorted = [...titles].sort();\n  const same = active.length===titles.length && [...active].sort().every((v,i)=>v===sorted[i]);\n  if (step==='read') return {state:'ready',same:same && !media.length,limit,signature:JSON.stringify([values,media.length])};\n  if (titles.some(v=>v.length>limit)) return {state:'limit',limit};\n  if (media.length) {\n    if (!media[0] || step!=='edit') return {state:'image'};\n    media[0].click();return {state:'more'};\n  }\n  const filled = titles.every((v,i)=>values[i]===v) && values.slice(titles.length).every(v=>!v);\n  if (step==='save') {\n    if (!filled || saves[0].disabled || saves[0].getAttribute('aria-disabled')==='true') return {state:'page'};\n    saves[0].click();return {state:'sent'};\n  }\n  if (step!=='edit') return {state:'page'};\n  // Fill existing slots before adding another. Some screens enable Add only after text input.\n  for (const [i,el] of fields.entries()) {\n    const next = titles[i] || '';\n    if (el.value === next) continue;\n    const proto = el.tagName==='TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;\n    Object.getOwnPropertyDescriptor(proto,'value').set.call(el,next);\n    el.dispatchEvent(new Event('input',{bubbles:true}));\n    el.dispatchEvent(new Event('change',{bubbles:true}));\n  }\n  if (fields.length < titles.length) {\n    if (add.length!==1) return {state:'page'};\n    if (!add[0].disabled && add[0].getAttribute('aria-disabled')!=='true') add[0].click();\n    return {state:'more'};\n  }\n  return {state:'filled'};\n}",
   "readDraftCover": "async function readDraftCover(key,accountId,hashBody) {\n  if(location.origin!=='https://note.com' || !/^n[a-z0-9]{1,64}$/.test(key))return null;\n  try {\n    const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});\n    if(!r.ok)return null;\n    const n=(await r.json())?.data;\n    if(!n || n.key!==key)return null;\n    if(n.user?.urlname && n.user.urlname!=='43__' || n.user?.id && String(n.user.id)!==accountId || ['published','reserved','scheduled'].includes(n.status) ||\n       [n.scheduledPublishAt,n.scheduled_publish_at,n.publishAt,n.publish_at].some(t=>t && Date.parse(t)>Date.now()))return {unsafe:true};\n    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId)return null;\n    const full=n.is_limited!==true && n.is_paid!==true && !(Number(n.price)>0);\n    return {name:n.name,hash:full?await hashBody(n.body):null,...(Object.hasOwn(n,'eyecatch')?{cover:n.eyecatch}:{})};\n  }catch{return null;}\n}",
@@ -5632,5 +5869,6 @@ const BROWSER_SOURCES520 = Object.freeze({
   "noteJoinDOM520": "function noteJoinDOM520(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();\n  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));\n  if(fields.length!==1)return {state:'composer'};\n  const field=fields[0];\n  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);\n  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));\n  for(const card of cards) {\n    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\\/$/,'')==='/43__';}catch{return false;}});\n    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};\n  }\n  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&\n    (e.closest('[class*=\"comment\"],[class*=\"Comment\"],[data-testid*=\"comment\"]')));\n  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}\n  // An incomplete comment history cannot establish that this account has not already applied.\n  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};\n  if(step==='read')return {state:'ready'};\n  let scope=field.closest('form')||field.parentElement;\n  let buttons=[];\n  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {\n    if(scope.querySelectorAll('textarea').length!==1)break;\n    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');\n    if(buttons.length)break;\n  }\n  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};\n  if(step==='fill') {\n    if(field.value && field.value!==arg.comment)return {state:'draft'};\n    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);\n    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));\n    return {state:'filled'};\n  }\n  if(step==='send') {\n    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};\n    buttons[0].click();return {state:'clicked'};\n  }\n  return {state:'page'};\n}",
   "joinFollowDOM520": "function joinFollowDOM520(owner,action) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const canonical=document.querySelector('link[rel=canonical]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();\n  const roots=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));\n  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];\n  if(controls.length!==1)return 'missing';\n  const b=controls[0];\n  if(name(b)==='フォロー中')return 'on';\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  // This function is deliberately read-only, regardless of action.\n  return 'off';\n}",
   "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel,items=list.state?.items;\n  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !list.isLoadedCompletely())return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    complete:list.isLoadedCompletely() || (items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    await list.loadMore();return {state:'loaded'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}",
-  "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible = e => !!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const controls=root=>[...root.querySelectorAll('button,[role=\"button\"]')].filter(visible);\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item';\n  const all=[...document.querySelectorAll(rowSelector)].filter(visible);\n  // Nested replies are separate rows. Only the innermost matching container owns a control.\n  const roots=all.filter(r=>!all.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const names=[...new Set([...root.querySelectorAll('a[href]')].filter(a=>visible(a)&&local(a)).map(owner).filter(Boolean))];\n    const bodies=[...root.querySelectorAll('[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]')].filter(e=>visible(e)&&local(e));\n    const texts=[...new Set(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean))];\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text));\n    const hash=Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed');\n      const n=label(button);\n      if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)$/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  if(step==='comments')return {state:'ready',rows:rows.map(({button,...r})=>r)};\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];\n    if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible||r.liked!==false||!r.button||r.button.disabled||r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(all.length)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示)?|コメント\\s*\\d+|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    const options=controls(document).filter(b=>/^(?:スキした(?:人|ユーザー|クリエイター)(?:の一覧)?|スキの一覧|スキ一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const dialogs=[...document.querySelectorAll('[role=\"dialog\"],dialog[open]')].filter(visible);\n    const modal=dialogs.length===1 && /スキした|スキの一覧|スキ一覧/.test(dialogs[0].innerText)?dialogs[0]:null;\n    const likers=modal?[...new Set([...modal.querySelectorAll('a[href]')].filter(visible).map(owner).filter(Boolean))]:[];\n    return {state:'ready',owners:[...new Set([...rows.map(r=>r.owner),...likers])].filter(v=>v!==arg.owner).slice(0,20),comments:rows.length,likers:likers.length};\n  }\n  return {state:'missing'};\n}"
+  "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible = e => !!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const controls=root=>[...root.querySelectorAll('button,[role=\"button\"]')].filter(visible);\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item';\n  const all=[...document.querySelectorAll(rowSelector)].filter(visible);\n  // Nested replies are separate rows. Only the innermost matching container owns a control.\n  const roots=all.filter(r=>!all.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const names=[...new Set([...root.querySelectorAll('a[href]')].filter(a=>visible(a)&&local(a)).map(owner).filter(Boolean))];\n    const bodies=[...root.querySelectorAll('[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]')].filter(e=>visible(e)&&local(e));\n    const texts=[...new Set(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean))];\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text));\n    const hash=Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed');\n      const n=label(button);\n      if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)$/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  if(step==='comments')return {state:'ready',rows:rows.map(({button,...r})=>r)};\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];\n    if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible||r.liked!==false||!r.button||r.button.disabled||r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(all.length)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示)?|コメント\\s*\\d+|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    const options=controls(document).filter(b=>/^(?:スキした(?:人|ユーザー|クリエイター)(?:の一覧)?|スキの一覧|スキ一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector));\n    if(options.length!==1)return {state:'missing'};\n    options[0].click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const dialogs=[...document.querySelectorAll('[role=\"dialog\"],dialog[open]')].filter(visible);\n    const modal=dialogs.length===1 && /スキした|スキの一覧|スキ一覧/.test(dialogs[0].innerText)?dialogs[0]:null;\n    const likers=modal?[...new Set([...modal.querySelectorAll('a[href]')].filter(visible).map(owner).filter(Boolean))]:[];\n    return {state:'ready',owners:[...new Set([...rows.map(r=>r.owner),...likers])].filter(v=>v!==arg.owner).slice(0,20),comments:rows.length,likers:likers.length};\n  }\n  return {state:'missing'};\n}",
+  "observationScreen1698": "function observationScreen1698(job) {\n  const unknown=reason=>({state:'unknown',reason});\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]') && getComputedStyle(e).visibility!=='hidden';\n  const text=e=>(e?.textContent||'').replace(/\\s+/g,' ').trim();\n  const absolute=raw=>{try{const u=new URL(raw,location.href);return u.origin==='https://note.com' && !u.username && !u.password?u:null;}catch{return null;}};\n  const rawCanonical=document.querySelector('link[rel=\"canonical\"]')?.getAttribute('href');\n  const canonical=rawCanonical?absolute(rawCanonical):null;\n  if(location.origin!=='https://note.com' || document.readyState!=='complete' || !canonical ||\n     canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return unknown('page');\n  const bodySelector='[contenteditable],.note-common-styles__textnote-body,.o-noteContentText,[data-testid=\"note-body\"],[class*=\"noteBody\"],[class*=\"NoteBody\"],blockquote';\n  const h1=[...document.querySelectorAll('h1')].filter(visible);\n  if(h1.length!==1)return unknown('heading');\n  if(job.kind==='keyword') {\n    let path;try{path=decodeURIComponent(location.pathname).replace(/\\/$/,'');}catch{return unknown('page');}\n    const mode=new URL(location.href).searchParams.get('mode');\n    if(path!=='/tag/'+job.subject || text(h1[0])!==job.subject ||\n       (job.mode==='new'?mode!=='new':mode!==null))return unknown('page');\n    const mains=[...document.querySelectorAll('main,[role=\"main\"]')].filter(visible);\n    const root=mains.length===1?mains[0]:null;\n    if(!root)return unknown('list');\n    const tabs=[...root.querySelectorAll('a[href],[role=\"tab\"]')].filter(e=>visible(e)&&['人気','新着'].includes(text(e)));\n    const selected=tabs.filter(e=>e.getAttribute('aria-selected')==='true' || ['page','true'].includes(e.getAttribute('aria-current')) || e.classList.contains('is-active'));\n    if(selected.length!==1 || text(selected[0])!==(job.mode==='new'?'新着':'人気'))return unknown('sort');\n    const cardSelector='article,[data-testid=\"note-card\"],.m-note,.m-largeNoteWrapper,[class*=\"noteCard\"],[class*=\"NoteCard\"]';\n    const cards=[...root.querySelectorAll(cardSelector)].filter(e=>visible(e)&&!e.closest('aside,nav,footer,[class*=\"recommend\" i],[data-testid*=\"recommend\"],'+bodySelector));\n    const leaves=cards.filter(e=>!cards.some(other=>other!==e && e.contains(other)));\n    if(!leaves.length)return unknown('list');\n    const entries=[],seen=new Set();let incomplete=false;\n    for(const card of leaves.slice(0,50)) {\n      const headings=[...card.querySelectorAll('h2,h3,h4')].filter(visible);\n      if(headings.length!==1 || !text(headings[0])){incomplete=true;continue;}\n      const urls=[...new Set([...card.querySelectorAll('a[href],[data-href]')].concat(card.matches('a[href],[data-href]')?[card]:[])\n        .filter(visible).map(e=>absolute(e.getAttribute('href')||e.getAttribute('data-href')))\n        .filter(u=>u && /^\\/[\\w-]{1,80}\\/n\\/n[a-z0-9]{1,64}\\/?$/.test(u.pathname)).map(u=>u.origin+u.pathname.replace(/\\/$/,'')))];\n      if(urls.length!==1){incomplete=true;continue;}\n      if(seen.has(urls[0]))continue;\n      seen.add(urls[0]);entries.push({url:urls[0],title:text(headings[0]).slice(0,300)});\n    }\n    // A missing/unrecognized card is not proof that 520 is absent from this page.\n    if(!entries.length)return unknown('cards');\n    return {state:'observed',complete:!incomplete,entries,scope:'initial_cards'};\n  }\n  if(job.kind!=='footer' || location.pathname.replace(/\\/$/,'')!=='/43__/n/'+job.subject || text(h1[0])==='521')return unknown('page');\n  const groups=[...document.querySelectorAll('[aria-label*=\"パンくず\"],[aria-label*=\"breadcrumb\" i],[class*=\"breadcrumb\" i]')]\n    .filter(e=>visible(e) && !e.closest(bodySelector));\n  const paths=[];\n  for(const group of groups) {\n    if(group.getBoundingClientRect().top<h1[0].getBoundingClientRect().bottom)continue;\n    const links=[...group.querySelectorAll('a[href]')].filter(visible);\n    const list=links.map(a=>({u:absolute(a.getAttribute('href')),label:text(a)}));\n    if(!list.some(x=>x.u?.pathname==='/' && ['トップ','ホーム'].includes(x.label)))continue;\n    const topics=list.filter(x=>x.u && /^\\/topic\\/[a-z0-9_/-]+\\/?$/.test(x.u.pathname) && x.label && x.label.length<=100)\n      .map(x=>({label:x.label,url:x.u.origin+x.u.pathname}));\n    if(topics.length && topics.length<=8)paths.push(topics);\n  }\n  const unique=[...new Map(paths.map(p=>[JSON.stringify(p),p])).values()];\n  return unique.length===1?{state:'observed',title:text(h1[0]).slice(0,300),topics:unique[0]}:unknown('breadcrumb');\n}"
 });
