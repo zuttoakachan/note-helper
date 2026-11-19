@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.3';
+const VERSION = 'v16.9.4';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -5081,7 +5081,9 @@ async function tutaScreen520(step,arg={}) {
   const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden="true"]');
   const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);
   const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();
-  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,...Array.from(e.labels||[],name)].filter(Boolean).join(' ');
+  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,
+    ...(e.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),
+    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');
   const unique=xs=>xs.length===1?xs[0]:null;
   const input=(e,v)=>{
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);
@@ -5094,19 +5096,21 @@ async function tutaScreen520(step,arg={}) {
   const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));
   const captcha=all('iframe[src*="captcha"],input[name*="captcha"]');
   if(captcha.length)return {state:'challenge'};
-  if(step==='login'||step==='loginSubmit') {
+  if(['login','loginReady','loginSubmit'].includes(step)) {
     if(!/^\/(?:login)?\/?$/.test(location.pathname))return {state:'outside'};
     const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));
-    if(!email||!pass)return {state:'page'};
+    if(!email||!pass)return {state:'page',reason:'login_fields'};
     if(step==='login'){
       input(email,arg.email);input(pass,arg.password);
-      return {state:email.value===arg.email&&pass.value===arg.password?'filled':'page'};
+      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};
     }
     const submit=unique(buttons().filter(e=>/^(?:log\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));
-    if(!submit||email.value!==arg.email||!pass.value)return {state:'page'};
+    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};
+    if(!submit)return {state:'page',reason:'login_button'};
+    if(step==='loginReady')return {state:'ready'};
     submit.click();return {state:'sent'};
   }
-  if(step==='otp'||step==='otpSubmit') {
+  if(['otp','otpReady','otpSubmit'].includes(step)) {
     const field=unique(otp),root=field?.closest('[role="dialog"],dialog,form')||document;
     if(!field)return {state:'challenge'};
     if(step==='otp'){
@@ -5114,7 +5118,9 @@ async function tutaScreen520(step,arg={}) {
       input(field,arg.code);return {state:'filled'};
     }
     const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));
-    if(!submit||!/^\d{6}$/.test(field.value))return {state:'page'};
+    if(!/^\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};
+    if(!submit)return {state:'page',reason:'otp_button'};
+    if(step==='otpReady')return {state:'ready'};
     submit.click();return {state:'sent'};
   }
   if(otp.length)return {state:'otp'};
@@ -5137,9 +5143,9 @@ async function tutaScreen520(step,arg={}) {
     if(node.instance)queue.push(node.instance);
     if(Array.isArray(node.children))queue.push(...node.children);
   }
-  const model=unique([...models]);if(!model)return {state:'page'};
+  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};
   const list=model.listModel,items=list.state?.items;
-  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page'};
+  if(!Array.isArray(items) || typeof list.isLoadedCompletely!=='function')return {state:'page',reason:'list_contract'};
 
   // Locate the signed-in controller through the trusted application's own model
   // dependencies. Never infer identity from text in an email or a screen label.
@@ -5158,7 +5164,7 @@ async function tutaScreen520(step,arg={}) {
       if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});
     }
   }
-  if(wrong || !identity)return {state:'identity'};
+  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};
   if(!items.length && !list.isLoadedCompletely())return {state:'loading'};
   const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;
   const sender=address=>typeof address==='string' && /^[^@<>\s,;]+@(?:[a-z0-9-]+\.)?note\.(?:com|mu)$/i.test(address);
@@ -5197,15 +5203,46 @@ async function tutaScreen520(step,arg={}) {
   return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};
 }
 
+// Fixed, non-sensitive diagnostics survive a browser failure and a DO restart.
+const TUTA_STAGES520={browser:'ブラウザー起動',target:'ブラウザーのタブ作成',websocket:'ブラウザーとの接続',
+  network:'通信の準備',navigate:'Tutaページを開く処理',login_page:'ログイン欄の読み込み',
+  login_fill:'ログイン欄への入力',login_ready:'ログインボタンの準備待ち',login_submit:'ログインの送信',
+  mailbox:'ログイン後の受信箱・本人確認',otp_fill:'追加認証の入力',otp_ready:'追加認証ボタンの準備待ち',
+  otp_submit:'追加認証の送信',list:'受信一覧の確認',mail:'招待メールの確認',mail_open:'招待メールを開く処理',
+  mail_read:'招待メールの送信元確認',more:'受信一覧の続きを取得',storage:'招待記録の保存'};
+const TUTA_STATES520={unread:'画面の確認前',outside:'想定したTutaのページではありません',
+  page:'必要な画面を識別できません',loading:'画面の読み込みが完了していません',
+  login:'ログイン欄が表示されたままです',identity:'ログイン中の本人を確認できません',
+  otp:'追加認証の画面です',challenge:'追加認証の対応が必要です',stopped:'停止・待機・時間切れ',
+  script_error:'画面の確認処理を完了できません',invalid_result:'画面の確認結果を取得できません',
+  login_fields:'メールアドレス欄とパスワード欄を1つずつ確認できません',
+  login_values:'入力後にフォームの内容が変わりました',login_button:'ログインボタンを押せる状態と確認できません',
+  otp_values:'追加認証の入力が未確認です',otp_button:'追加認証ボタンを押せる状態と確認できません',
+  model_missing:'受信箱の内部データを取得できません',model_ambiguous:'受信箱の内部データを1つに特定できません',
+  list_contract:'受信一覧のデータ形式を確認できません',account_mismatch:'保存したアドレスとログイン中の本人が一致しません',
+  account_unconfirmed:'ログイン中の本人を内部データで確認できません'};
+function tutaDiagnostic520(result) {
+  if(!Object.hasOwn(TUTA_STAGES520,result.stage||''))return '';
+  const state=Object.hasOwn(TUTA_STATES520,result.screen||'')?result.screen:'unread';
+  const http=Number.isInteger(result.http)&&result.http>=400&&result.http<=599?' ／ HTTP '+result.http:'';
+  return '\n停止箇所：'+TUTA_STAGES520[result.stage]+'\n確認内容：'+TUTA_STATES520[state]+http+
+    '\n確認コード：TUTA4/'+result.stage+'/'+state;
+}
+
 async function readTuta520(binding,credential,callbacks) {
   let session,socket,command,blocked=0,retry=0,opened=false;
   const until=Date.now()+100000;
-  let saved=0,skipped=0,details=0,complete=false,unresolved=false,stage='browser';
+  let saved=0,skipped=0,details=0,complete=false,unresolved=false,stage='browser',lastScreen={state:'unread'};
   const inspected=new Set();
-  const report=result=>blocked||retry>0?{...result,kind:blocked===401?'auth':'hold',hold:Math.max(retry,blocked===429?2*HOUR:0)}:result;
+  // Diagnostics contain only fixed stage/state identifiers, never page text,
+  // URLs, exceptions, account addresses, mail contents or credentials.
+  const report=result=>({...result,stage,screen:lastScreen.reason||lastScreen.state,http:blocked,
+    ...(blocked||retry>0?{kind:blocked===401?'auth':'hold',hold:Math.max(retry,blocked===429?2*HOUR:0)}:{})});
   try {
     session=await binding.acquire({keepAlive:15000,recording:false,guardrails:{allowedDomains:['app.tuta.com','*.tuta.com','*.tutanota.com']}});
+    stage='target';
     const target=await binding.devtools.newTarget(session.sessionId);
+    stage='websocket';
     const link=await binding.connectSession(session.sessionId,{targetId:target.id});
     const upgrade=await link.webSocket.fetch('https://browser-binding.invalid',{headers:{Upgrade:'websocket'}});
     socket=upgrade.webSocket;if(!socket)throw Error('browser setup');socket.accept();command=pageCommand(socket);
@@ -5222,48 +5259,63 @@ async function readTuta520(binding,credential,callbacks) {
     const frame=async(step,arg={})=>{
       if(halt())return {state:'stopped'};
       const r=await command('Runtime.evaluate',{expression:'('+tutaScreen520.toString()+')('+JSON.stringify(step)+','+JSON.stringify({email:credential.email,since:Date.now()-7*D520,...arg})+')',returnByValue:true,awaitPromise:true});
-      if(r.exceptionDetails)throw Error('mail screen');return r.result.value;
+      if(r.exceptionDetails){lastScreen={state:'script_error'};throw Error('mail screen');}
+      lastScreen=r.result?.value && typeof r.result.value.state==='string'?r.result.value:{state:'page',reason:'invalid_result'};
+      return lastScreen;
     };
     const poll=async(step,arg={},tries=30)=>{
       let state={state:'page'};
       for(let n=0;n<tries&&!halt();n++) {
-        try{state=await frame(step,arg);}catch{state={state:'page'};}
-        if(!['page','loading','identity'].includes(state?.state))return state;
+        try{state=await frame(step,arg);}catch{lastScreen=state={state:'script_error'};}
+        if(!['page','loading','identity','script_error'].includes(state?.state))return state;
         await pause520(500);
       }
       return state;
     };
+    stage='network';
     await command('Network.enable');
     await command('Network.setCacheDisabled',{cacheDisabled:true});
     await command('Network.setBlockedURLs',{urls:['*://note.com/*','*://*.note.com/*']});
+    stage='navigate';
     await command('Page.navigate',{url:TUTA520_ORIGIN+'/login'});
-    let state=await poll('list',{},24);
+    stage='login_page';
+    // A fresh isolated browser may still be downloading/decrypting the app.
+    // Wait within the existing total deadline, without another login attempt.
+    let state=await poll('list',{},60);
     // Never adopt somebody else's pre-existing browser login.
     if(state?.state!=='login')return report({kind:state?.state==='challenge'?'challenge':'screen'});
+    stage='login_fill';
     if((await frame('login',{password:credential.password})).state!=='filled')return report({kind:'screen'});
-    await pause520(500);
-    opened=true;
+    stage='login_ready';
+    if((await poll('loginReady',{},20)).state!=='ready')return report({kind:'screen'});
+    if(halt())return report({kind:'stopped'});
+    stage='login_submit';opened=true;
     if((await frame('loginSubmit')).state!=='sent')return report({kind:'screen'});
+    stage='mailbox';
     state={state:'login'};
     let otpSent=false;
-    for(let n=0;n<64&&!halt();n++) {
+    for(let n=0;n<90&&!halt();n++) {
       await pause520(500);
-      try{state=await frame('list');}catch{continue;}
+      try{state=await frame('list');}catch{lastScreen=state={state:'script_error'};continue;}
       if(state.state==='ready')break;
       if(state.state==='challenge')return report({kind:'challenge'});
       if(state.state==='otp') {
         if(!credential.totp || otpSent)return report({kind:'challenge'});
         const code=await tutaTotp520(credential.totp);
+        stage='otp_fill';
         if((await frame('otp',{code})).state!=='filled')return report({kind:'challenge'});
-        await pause520(500);
+        stage='otp_ready';
+        if((await poll('otpReady',{},20)).state!=='ready')return report({kind:'challenge'});
+        if(halt())return report({kind:'stopped'});
+        stage='otp_submit';
         if((await frame('otpSubmit')).state!=='sent')return report({kind:'challenge'});
-        otpSent=true;
+        otpSent=true;stage='mailbox';
       }
     }
     if(halt())return report({kind:'timeout'});
     if(state?.state!=='ready')return report({kind:state?.state==='login'?'auth':state?.state==='otp'?'challenge':'screen'});
     for(let page=0;page<4&&!halt();page++) {
-      state=await poll('list',{},12);
+      stage='list';state=await poll('list',{},12);
       if(state?.state!=='ready')return report({kind:'screen',saved});
       const waiting=[];
       stage='storage';
@@ -5273,7 +5325,9 @@ async function readTuta520(binding,credential,callbacks) {
       for(const item of waiting) {
         if(halt()||details>=8)break;
         details++;processed++;inspected.add(item.key);
+        stage='mail_open';
         if((await frame('open',{key:item.key})).state!=='opened'){unresolved=true;continue;}
+        stage='mail_read';
         const mail=await poll('read',{key:item.key},12);
         if(halt())break;
         if(mail?.state==='mail' && mail.authenticated===true) {
@@ -5286,21 +5340,23 @@ async function readTuta520(binding,credential,callbacks) {
       }
       if(details>=8){complete=!!state.complete && processed===waiting.length;break;}
       if(state.complete){complete=true;break;}
+      stage='more';
       if(page<3 && (await frame('more')).state!=='loaded')break;
     }
     if(!callbacks.active())return report({kind:'stopped'});
     return report({kind:'ok',saved,skipped,details,complete:complete&&!unresolved});
-  } catch {return report({kind:stage==='storage'?'storage':opened?'screen':'browser',saved});}
+  } catch {return report({kind:stage==='storage'?'storage':['browser','target','websocket','network','navigate'].includes(stage)?'browser':'screen',saved});}
   finally {
     try{socket?.close();}catch{}
     if(session)await binding.closeSession(session.sessionId).catch(()=>{});
   }
 }
 
+
 const TUTA_MESSAGES520={
-  auth:'Tutaのログインに失敗しました。メールアドレスとパスワードを確認してください。',
+  auth:'Tutaのログイン成功を確認できません。入力情報・追加認証・画面の読み込みを含め、下の停止箇所を確認してください。',
   challenge:'Tutaの追加認証が必要です。認証アプリの場合はTOTP設定キーを登録できます。別端末承認・セキュリティキー・画像認証は自動通過しません。',
-  screen:'Tutaの受信箱・本人・送信元の確認方法が現在の画面と一致せず、読み取りを保留しました。',
+  screen:'Tutaの画面を確認できず、自動読み取りを保留しました。下に停止箇所を表示します。',
   browser:'Cloudflareのブラウザーを起動・接続できません。BROWSERの設定を確認してください。',
   hold:'Tutaの応答制限・待機指定に従って休止しています。',
   timeout:'Tutaの確認時間を超えたため、次回に続けます。',
@@ -5308,9 +5364,9 @@ const TUTA_MESSAGES520={
   storage:'Tutaの接続情報・招待を読み出しまたは保存できません。暗号化設定を確認してください。'
 };
 function tutaRecord520(t) {
-  return 'Tuta：'+t.message+(t.checked?'\nTuta受信箱の最終確認：'+time(t.checked):'\nTutaへの接続はまだ未確認です。')+
+  return 'Tuta：'+t.message+(t.checked?'\nTuta受信箱の最終確認：'+time(t.checked):'\n接続未確認：Tuta経由の招待取り込みはまだ成功を確認できていません。')+
     (t.last_received?'\nTutaから招待を取り込んだ日時：'+time(t.last_received):'')+
-    (t.enabled?'\n次のTuta確認：'+time(Math.max(t.due,t.hold_until,t.lease)):'' );
+    (t.enabled?'\n次の自動再試行予定：'+time(Math.max(t.due,t.hold_until,t.lease)):'' );
 }
 Object.assign(Desk520.prototype,{
   initTuta520() {
@@ -5388,7 +5444,7 @@ Object.assign(Desk520.prototype,{
       const failures=ok?0:row.failures+1;
       const delay=ok?HOUR:['auth','challenge'].includes(result.kind)?Math.min(24,2**Math.min(failures,5))*HOUR:2*HOUR;
       const message=ok?'Tuta受信箱を確認済み。今回の招待取り込み '+result.saved+'件。'+(result.skipped?'対象外・照合保留 '+result.skipped+'件。':'')+(result.complete?'直近7日の受信箱を確認しました。':'読み取り保留・上限により、直近一覧の一部だけ確認しました。'):
-        TUTA_MESSAGES520[result.kind]||TUTA_MESSAGES520.storage;
+        (TUTA_MESSAGES520[result.kind]||TUTA_MESSAGES520.storage)+tutaDiagnostic520(result);
       // Even if the owner replaced or removed credentials while the browser was
       // running, preserve server Retry-After. Release only our own lease.
       this.rows('UPDATE desk_tuta SET hold_until=MAX(hold_until,?) WHERE id=1',at+hold);
@@ -5456,7 +5512,7 @@ async function tutaRoute520(request,env) {
     const data=await response.json();
     if(!response.ok)return tutaPage520(null,response.status===400?data.error:'設定の保存・読み出しを確認できません。「接続結果を見る」で状態を確認してください。',response.status===400?400:503);
     if(!data.tuta)throw Error('Tuta status');
-    return tutaPage520(data.tuta,data.correctionMessage||'接続結果を読み込みました。');
+    return tutaPage520(data.tuta,data.correctionMessage||'保存された確認結果を表示しました。接続成功かどうかは下の記録で確認してください。');
   } catch(error) {
     return tutaPage520(null,error instanceof Input520?error.message:'作品管理の保存先に接続できません。保存済みかどうかは「接続結果を見る」で確認してください。',error instanceof Input520?400:503);
   }
