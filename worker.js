@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.15';
+const VERSION = 'v16.9.16';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -702,6 +702,11 @@ async function ownReaderSeed1699(env,state,turn) {
 async function readerOpportunity1697(env,state,settings,token,ownIds,markSending,bump) {
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
   const s=await sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first();
+  const deferred=browserWait16916(env.BROWSER);
+  if(deferred){
+    await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',deferred.message,env.SLOT).run();
+    return s.pending?{handled:true,message:'前回操作は再送せず・'+deferred.message}:null;
+  }
   const returning=!s.pending && (!s.seed || s.turn%4===3);
   if(!s.pending && ((!s.seed && !returning) || s.due>now))return null;
   const record=async message=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run();
@@ -811,6 +816,11 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
     return {commentsRead:true,stage:'comment_rows',message:'感想コメントの候補なし・作者待機・スキ済み'};
   },env.TRACE);
   if(failure)throw failure;
+  if(result.browserDeferred && !reserved){
+    await sql(env,'UPDATE nh_v1697_discovery SET due=?,used=MAX(0,used-1),turn=MAX(0,turn-?),message=? WHERE slot=? AND utc_day=? AND turn=?',Math.max(Date.now()+60000,result.retryAt),+!pending,result.message,env.SLOT,utc,s.turn+Number(!pending)).run();
+    await diagnostic16915(env,component,'wait','browser');
+    return pending?{handled:true,message:'前回操作は再送せず・'+result.message}:null;
+  }
   await record(result.message||'追加巡回の画面を確認待ち');
   await diagnostic16915(env,component,result.verified||result.recovered?'confirmed':result.readersVerified||result.commentsRead?'read':'failed',result.stage||'browser');
   if(result.code||result.hold)throw new Trouble(result.message,result.code===429?'rate':[401,403].includes(result.code)?'auth':'network',result.hold||0,result.code||0);
@@ -872,7 +882,7 @@ async function run(original,slot) {
       await finish(liked?'前回の記事のスキを確認しました。次回から候補を確認します':'前回の記事は再送せず除外しました');
       return true;
     }
-    const tags=orderFor(settings.tags,slot), started=Date.now();
+    const tags=orderFor(settings.tags,slot);
     const marks = values=>values.map(()=>'?').join(',');
     const [otherRows,waitRows]=await original.DB.batch([
       sql(scoped(original,slot==='1'?'2':'1'),'SELECT account FROM nh_control WHERE id=1'),
@@ -887,6 +897,7 @@ async function run(original,slot) {
     if(opportunity?.handled){await finish(opportunity.message,opportunity.success);return true;}
     const choice=await learningChoice16913(env,settings,token);
     const readerNotes=['tag','explore_tag'].includes(choice.mode)?null:await queuedReader1699(env,state,settings,token,ownIds,bump,choice.origin||null);
+    const started=Date.now();
     const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
     let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
     for (let visited=0; visited<tags.length+(readerNotes?1:0) && (visited===0 && readerNotes || lists<settings.scan_tags); visited++) {
@@ -1147,7 +1158,11 @@ async function wakeScheduler(env) {
   if (!response.ok) throw new Error('Scheduler unavailable');
 }
 export class NoteScheduler {
-  constructor(ctx, env) { this.ctx = ctx; this.env = env; this.busy = false; }
+  constructor(ctx, env) {
+    this.ctx=ctx;this.busy=false;
+    const browser=coordinatedBrowser16916(env.BROWSER,ctx.storage,()=>!!this.desk?.ready&&this.desk.publicationPriority16916(Date.now()));
+    this.env=new Proxy(env,{get:(target,key,receiver)=>key==='BROWSER'?browser:Reflect.get(target,key,receiver)});
+  }
   async fetch(request) {
     if (request) {
       const path = new URL(typeof request === 'string' ? request : request.url).pathname;
@@ -1169,10 +1184,7 @@ export class NoteScheduler {
           }
           return deskJson({saved:true});
         }
-        if (!this.deskTicking) {
-          this.deskTicking = this.desk.tick().finally(() => { this.deskTicking = null; });
-        }
-        await this.deskTicking;
+        await this.startDeskTick16916();
         return new Response('OK');
       }
     }
@@ -1223,6 +1235,12 @@ export class NoteScheduler {
       } catch { console.error('note-helper: publication alarm deferred'); }
       await this.ctx.storage.setAlarm(next);
       await sql(this.env,'UPDATE nh_v15_runtime SET alarm_at=? WHERE id=1',next).run();
+      // A durable-object background task survives a closed management page.
+      // Do not delay the ordinary alarm while the optional browser work runs.
+      if(typeof this.ctx.waitUntil==='function') {
+        try {this.ctx.waitUntil(this.startDeskTick16916(true).catch(()=>{}));}
+        catch {console.error('note-helper: desk fallback deferred');}
+      }
     } catch (error) {
       if (!readLimit(error)) throw new Error('note-helper: scheduler storage/runtime failure');
       const nextReset = (Math.floor(Date.now()/(24*HOUR))+1)*24*HOUR;
@@ -1547,11 +1565,12 @@ async function inNoteBrowser(binding,cookie,allowEditor,action,requestTrace=null
     }
     stage='noteの画面との通信';
     return await action({command,evaluate,blocked,blockedResult});
-  } catch {
+  } catch(error) {
+    const deferred=browserDeferred16916(error);if(deferred)return deferred;
     return denied || retry>0?{code:denied,message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:stage+'を完了できず・再確認待ち'};
   } finally {
     try {socket?.close();} catch {}
-    if(session?.sessionId)await binding.closeSession(session.sessionId).catch(()=>{});
+    if(session?.sessionId)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
 }
 
@@ -2162,6 +2181,7 @@ class Desk520 {
     this.initPipeline16913();
     this.initTraffic16913();
     this.initPublication16914();
+    this.initRuntime16916();
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2444,7 +2464,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3151,6 +3171,7 @@ class Desk520 {
     if(plain!==null && plain===matches[0].body.replace(/\r\n?/g,'\n'))this.rows('INSERT OR IGNORE INTO desk_draft_identity(seq,article) VALUES(?,?)',matches[0].seq,key);
   }
   async lookupDraftTitle(now,key=null){
+    if(this.publicationPriority16916(now))return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now)return;
     const gate=this.one('SELECT title_due FROM desk_scout_state WHERE id=1').title_due;
@@ -3162,14 +3183,17 @@ class Desk520 {
     if(!pending.length)return;
     this.rows('UPDATE desk_scout_state SET title_due=? WHERE id=1',now+4*M520);
     for(const p of pending)this.rows('UPDATE desk_link_plan SET title_due=? WHERE article=?',now+12*M520,p.article);
-    let slot;
+    let slot,base,lease;
     try{
       const a=await this.deliveryAccount();
-      if(!a || a.until>now)return;
-      slot=a.slot;
-      const env=await loadCookie(scoped(this.env,slot),a.id);
+      if(!a || a.until>Date.now() || this.publicationPriority16916(Date.now()))return;
+      slot=a.slot;base=scoped(this.env,slot);
+      lease=await acquire(base,false);if(!lease)return;
+      const env=await loadCookie(base,a.id);
       if(await account(env)!==a.id)return;
       for(const p of pending){
+        const gate=await sql(env,'SELECT token,lease FROM nh_control WHERE id=1').first();
+        if(gate?.token!==lease || gate.lease<=Date.now() || this.publicationPriority16916(Date.now()))break;
         let n;
         try{n=await api(env,'/api/v3/notes/'+p.article);}catch(e){if(e instanceof Trouble && e.code===404)continue;throw e;}
         if(n.key===p.article && n.status==='draft' && n.user?.urlname==='43__' && String(n.user.id)===a.id && text520(n.name,300))
@@ -3184,9 +3208,10 @@ class Desk520 {
           await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,slot).run();
         }
       }
-    }
+    }finally{if(lease)await release(base,lease);}
   }
   async resolveDraftDirectory(now){
+    if(browserWait16916(this.env.BROWSER))return;
     if(typeof this.env.BROWSER?.acquire!=='function')return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || this.one('SELECT due FROM desk_draft_directory WHERE id=1').due>now)return;
@@ -3196,9 +3221,14 @@ class Desk520 {
     this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',now+4*M520);
     const a=await this.deliveryAccount().catch(()=>null);
     if(!a || a.until>now)return;
-    const env=await loadCookie(scoped(this.env,a.slot),a.id);
+    const base=scoped(this.env,a.slot),lease=await acquire(base,false);
+    if(!lease)return;
+    try {
+    const env=await loadCookie(base,a.id);
+    if(this.publicationPriority16916(Date.now()))return;
     this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',now+HOUR);
     const result=await inspectDraftDirectory(this.env.BROWSER,cleanCookie(env.NOTE_SESSION),a.id,[...works,...links]);
+    if(result.browserDeferred)this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',Math.max(Date.now()+M520,result.retryAt));
     if(result.hold){
       this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',now+result.hold);
       await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',now+result.hold,a.slot).run();
@@ -3213,6 +3243,7 @@ class Desk520 {
         this.rows('UPDATE desk_link_plan SET title=? WHERE article=? AND title IS NULL AND pub IS NULL',row.title,row.article);
       }
     });
+    }finally{await release(base,lease);}
   }
   async previewDraft(key,now){
     need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
@@ -3247,6 +3278,9 @@ class Desk520 {
     if(job && this.one("SELECT 1 FROM desk_job WHERE kind='publish' AND subject=? AND (phase<>'wait' OR next>?)",job.subject,now))job=null;
     if(!job && !publicationOnly && state.mags<2)job=this.nextPlacement(now,!!state.old_first);
     if(!job)return;
+    const browser=browserPurpose16916(this.env.BROWSER,job.kind==='publish'?'publish':'normal');
+    const waiting=browserWait16916(browser,job.kind==='publish'?'publish':'normal');
+    if(waiting)return;
     const label=job.kind==='publish'?job.title:job.title+' → '+job.name;
     this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,message) VALUES(?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+15*M520);
     this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
@@ -3285,9 +3319,7 @@ class Desk520 {
       const credential=await loadCookie(env,account.id);
       const cookie=cleanCookie(credential.NOTE_SESSION);
       if(!this.canDeliver(job,Date.now()))return;
-      if(job.kind==='mag')this.rows('UPDATE desk_delivery SET mags=mags+1,old_first=? WHERE id=1',+!job.old);
-      else this.rows('UPDATE desk_delivery SET pubs=pubs+1 WHERE id=1');
-      const result=await browserDelivery(this.env.BROWSER,account.id,cookie,job,async (key,info)=>{
+      const result=await browserDelivery(browser,account.id,cookie,job,async (key,info)=>{
         // Recheck holds and the leased account just before persisting the irreversible action.
         const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',slot).first();
         const at=Date.now();
@@ -3303,8 +3335,13 @@ class Desk520 {
         return this.storage.transactionSync(()=>{
           if(job.kind==='publish' && (!info || info.cover===null || !info.title || this.publicationSent(key) || this.one('SELECT 1 FROM desk_archive WHERE article=?',key)))return false;
           if(job.kind==='mag' && !this.magazineRoom520(job.target,at))return false;
+          const currentDay=Math.floor(at/D520),usage=this.one('SELECT utc_day,pubs,mags FROM desk_delivery WHERE id=1');
+          if(usage.utc_day===currentDay && (job.kind==='publish'?usage.pubs>=4:usage.mags>=2))return false;
           const marked=this.one("UPDATE desk_job SET phase='sent',target=?,at=?,message='操作開始を記録・結果は未確認（自動再送なし）' WHERE kind=? AND subject=? AND phase='wait' RETURNING subject",job.kind==='publish'?key:job.target,at,job.kind,job.subject);
           if(!marked)return false;
+          if(usage.utc_day!==currentDay)this.rows('UPDATE desk_delivery SET utc_day=?,pubs=0,mags=0 WHERE id=1',currentDay);
+          if(job.kind==='mag')this.rows('UPDATE desk_delivery SET mags=mags+1,old_first=? WHERE id=1',+!job.old);
+          else this.rows('UPDATE desk_delivery SET pubs=pubs+1 WHERE id=1');
           attemptAt=at;
           if(job.kind==='mag'){
             this.rows('INSERT OR IGNORE INTO desk_mag_send(article,id,at,day) VALUES(?,?,?,?)',job.key,job.target,at,jstDay(at));
@@ -3325,8 +3362,13 @@ class Desk520 {
         });
       });
       message=result.message;
+      if(result.browserDeferred)retry=Math.max(M520,result.retryAt-Date.now());
       if(result.notClicked && attemptAt)this.storage.transactionSync(()=>{
         const undone=this.one("UPDATE desk_job SET phase='wait',message=? WHERE kind=? AND subject=? AND phase='sent' AND at=? RETURNING target",message,job.kind,job.subject,attemptAt);
+        if(undone){
+          const field=job.kind==='publish'?'pubs':'mags';
+          this.rows('UPDATE desk_delivery SET '+field+'=MAX(0,'+field+'-1) WHERE id=1 AND utc_day=?',Math.floor(attemptAt/D520));
+        }
         if(undone && job.kind==='mag'){
           this.rows('DELETE FROM desk_mag_send WHERE article=? AND id=? AND at=?',job.key,job.target,attemptAt);
           this.rows('DELETE FROM desk_mag_verify16913 WHERE article=? AND id=? AND started=?',job.key,job.target,attemptAt);
@@ -3367,6 +3409,7 @@ class Desk520 {
       WHERE title<>excluded.title OR pub<>excluded.pub OR seen<=excluded.seen-86400000`,key,title,pub,now);
   }
   async syncReactions(now) {
+    if(browserWait16916(this.env.BROWSER))return;
     const state=this.one('SELECT * FROM desk_reactions WHERE id=1');
     if (state.due>now) return;
     const active=()=>this.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
@@ -3431,6 +3474,7 @@ class Desk520 {
     }
   }
   async ensureRecommendation(now) {
+    if(browserWait16916(this.env.BROWSER))return;
     const state=this.one('SELECT * FROM desk_recommend WHERE id=1');
     if(state.due>now || (state.done && state.checked>now-7*D520))return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
@@ -3952,6 +3996,11 @@ function deskRecordText(s) {
     '520のRSS '+s.cfg.rss_msg+' ／ 最終成功 '+tm(s.cfg.rss_ok)];
   if(s.observation)lines.push(observationText1698(s));
   if(s.join)lines.push(joinRecord520(s.join));
+  if(s.runtime){
+    const r=s.runtime.tick,b=s.runtime.browser;
+    lines.push('【自動処理の確認】',r.message,'最終開始 '+tm(r.started)+' ／ 最終巡回完了 '+tm(r.finished)+(r.fallback?' ／ 補助起動による確認':''));
+    if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
+  }
   if(s.pipeline)lines.push(pipelineRecord16913(s.pipeline));
   if(s.traffic)lines.push(trafficRecord16913(s.traffic));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
@@ -4805,6 +4854,7 @@ Object.assign(Desk520.prototype,{
     return joinFree520(payload,html,target,n);
   },
   async joinTick520(now) {
+    if(browserWait16916(this.env.BROWSER))return;
     const cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
     if(cfg.due>now || !this.joinActive520(''))return;
     // The publication window and existing account lease take priority over participation.
@@ -5309,6 +5359,7 @@ async function browserPopular520(binding,id,cookie,mayChange,mark){
 }
 Object.assign(Desk520.prototype,{
   async popularTick520(now){
+    if(browserWait16916(this.env.BROWSER))return;
     const state=this.one('SELECT * FROM desk_popular WHERE id=1');
     if(state.due>now || !this.deliveryActive520())return;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520)||
@@ -5700,11 +5751,12 @@ async function readTuta520(binding,credential,callbacks) {
     return report({kind:'ok',saved,skipped,details,complete:complete&&!unresolved});
   } catch(error) {
     if(stage!=='storage')lastScreen={state:tutaErrorState520(error)};
+    const deferred=browserDeferred16916(error);if(deferred)return {...deferred,kind:'browser_wait',saved:0};
     return report({kind:stage==='storage'?'storage':['browser','target','websocket','network','navigate'].includes(stage)?'browser':'screen',saved});
   }
   finally {
     try{socket?.close();}catch{}
-    if(session)await binding.closeSession(session.sessionId).catch(()=>{});
+    if(session)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
 }
 
@@ -5757,6 +5809,7 @@ Object.assign(Desk520.prototype,{
     return 'Tutaの再確認を予約しました。少し待って「記録を開く」で結果を確認してください。';
   },
   async tutaTick520(now) {
+    if(browserWait16916(this.env.BROWSER))return;
     this.init();
     const row=this.one('SELECT * FROM desk_tuta WHERE id=1');
     if(!row.enabled||!row.ciphertext||row.due>now||row.hold_until>now||row.lease>now||!this.joinActive520(''))return;
@@ -5797,10 +5850,12 @@ Object.assign(Desk520.prototype,{
     } catch {result={kind:'storage'};}
     finally {
       const at=Date.now(),ok=result.kind==='ok',hold=Math.max(0,Number(result.hold)||0);
-      const failures=ok?0:row.failures+1;
-      const delay=ok?HOUR:['auth','challenge'].includes(result.kind)?Math.min(24,2**Math.min(failures,5))*HOUR:2*HOUR;
+      const waiting=result.kind==='browser_wait';
+      const failures=ok?0:waiting?row.failures:row.failures+1;
+      const delay=waiting?Math.max(M520,result.retryAt-at):ok?HOUR:['auth','challenge'].includes(result.kind)?Math.min(24,2**Math.min(failures,5))*HOUR:2*HOUR;
       const message=ok?'Tuta受信箱を確認済み。今回の招待取り込み '+result.saved+'件。'+(result.skipped?'対象外・照合保留 '+result.skipped+'件。':'')+(result.complete?'直近7日の受信箱を確認しました。':'読み取り保留・上限により、直近一覧の一部だけ確認しました。'):
-        (TUTA_MESSAGES520[result.kind]||TUTA_MESSAGES520.storage)+tutaDiagnostic520(result);
+        waiting?result.message:(TUTA_MESSAGES520[result.kind]||TUTA_MESSAGES520.storage)+tutaDiagnostic520(result);
+      if(waiting)this.rows('UPDATE desk_tuta SET used=MAX(0,used-1) WHERE id=1 AND generation=? AND token=?',row.generation,token);
       // Even if the owner replaced or removed credentials while the browser was
       // running, preserve server Retry-After. Release only our own lease.
       this.rows('UPDATE desk_tuta SET hold_until=MAX(hold_until,?) WHERE id=1',at+hold);
@@ -6016,7 +6071,7 @@ async function readObservation1698(binding,jobs) {
   }catch { /* Only fixed diagnostics are shown. An error never becomes a negative observation. */ }
   finally {
     clearTimeout(deadline);try{socket?.close();}catch{}
-    if(session)await binding.closeSession(session.sessionId).catch(()=>{});
+    if(session)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
   return {results,hold,denied};
 }
@@ -6073,6 +6128,7 @@ Object.assign(Desk520.prototype,{
     });
   },
   async observeEntrances1698(now) {
+    if(browserWait16916(this.env.BROWSER))return;
     const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled delivery FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1');
     const state=this.one('SELECT * FROM desk_observe_state WHERE id=1');
     if(!cfg.enabled || !cfg.delivery || cfg.blocked>now || state.next>now)return;
@@ -6401,6 +6457,8 @@ async function outreachOpportunity16910(env,state,settings,token,ownIds,markSend
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
   const [states,discoveries]=await env.DB.batch([sql(env,'SELECT * FROM nh_v16910_state WHERE slot=?',env.SLOT),sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT)]);
   const s=states.results[0],d=discoveries.results[0];
+  const deferred=browserWait16916(env.BROWSER);
+  if(deferred)return s.pending?{handled:true,message:'前回操作は再送せず・'+deferred.message}:null;
   if(d.pending || (!s.pending && d.due>now))return null;
   let job=s.pending?await sql(env,'SELECT * FROM nh_v16910_actions WHERE key=? AND slot=?',s.pending,env.SLOT).first():null;
   if(s.pending && !job)throw new Trouble('追加操作の確認記録を読み出せません','config');
@@ -6463,6 +6521,12 @@ async function outreachOpportunity16910(env,state,settings,token,ownIds,markSend
     if(key){reserved={...next,key};markSending();}return !!key;
   }),()=>guard(async()=>await liveDiscovery1697(env,token) && (!['member','board'].includes(kind)||job.recover||!!env.MEMBER_GATE16910?.())),urls=>guard(()=>unseenBoardPosts16912(env,urls,job.owner)));
   if(failure)throw failure;
+  if(result.browserDeferred && !reserved){
+    await sql(env,'UPDATE nh_v1697_discovery SET due=?,used=MAX(0,used-1),turn=MAX(0,turn-?) WHERE slot=? AND utc_day=? AND turn=?',Math.max(Date.now()+60000,result.retryAt),+!job.recover,env.SLOT,utc,d.turn+Number(!job.recover)).run();
+    if(job.recover)await sql(env,'UPDATE nh_v16910_actions SET verifications=MAX(0,verifications-1) WHERE key=?',job.key).run();
+    await record(result.message);await diagnostic16915(env,kind,'wait','browser');
+    return job.recover?{handled:true,message:'前回操作は再送せず・'+result.message}:null;
+  }
   if(result.followChanged)await sql(env,"UPDATE nh_v16910_state SET member_blocked=1,member_message='新しいフォローを検出・追加参加を停止。既存フォローは変更しません'").run();
   await record(result.message||'追加操作の確認待ち');
   await diagnostic16915(env,kind,result.confirmed?'confirmed':result.read?'read':'failed',result.stage||'browser');
@@ -6983,6 +7047,7 @@ Object.assign(Desk520.prototype,{
     });
   },
   async trafficTick16913(now){
+    if(browserWait16916(this.env.BROWSER))return;
     const state=this.one('SELECT due FROM desk_traffic16913 WHERE id=1');
     const active=()=>!!this.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
     if(state.due>now || !active() || this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) ||
@@ -7127,6 +7192,135 @@ Object.assign(Desk520.prototype,{
       UNION ALL SELECT w.scheduled FROM desk_work_schedule w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled>? AND w.scheduled<=?
         AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=CAST(w.seq AS TEXT) AND j.phase<>'wait'))`,now,now+120000,now,now+120000);
     return row?.at||null;
+  }
+});
+
+// One browser admission record per scheduler. No credentials or provider error
+// text are persisted. Cloudflare capacity waits never become note Retry-After.
+class BrowserWait16916 extends Error {
+  constructor(reason,at) { super('browser deferred');this.reason=reason;this.at=at; }
+}
+const BROWSER_WAIT16916={spacing:'前のブラウザー起動との間隔待ち',busy:'別のブラウザー処理の終了待ち',publication:'予約作品の公開を優先して待機中',daily:'Cloudflareのブラウザー日次枠の更新待ち',rate:'Cloudflareのブラウザー回数制限・再試行待ち',startup:'Cloudflareのブラウザー起動を確認できず・再試行待ち',storage:'ブラウザーの予約記録を確認できず・再試行待ち'};
+function browserDeferred16916(error) {
+  return error instanceof BrowserWait16916?{browserDeferred:true,browserReason:error.reason,retryAt:error.at,message:BROWSER_WAIT16916[error.reason]||BROWSER_WAIT16916.startup}:null;
+}
+function browserWait16916(binding,purpose='normal') {
+  try {return typeof binding?.available16916==='function'?binding.available16916(purpose):null;}
+  catch {return browserDeferred16916(new BrowserWait16916('storage',Date.now()+240000));}
+}
+function browserPurpose16916(binding,purpose) {
+  return typeof binding?.purpose16916==='function'?binding.purpose16916(purpose):binding;
+}
+function boundedClose16916(work) {
+  let timer;
+  return Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('close timeout')),5000);})]).finally(()=>clearTimeout(timer));
+}
+function coordinatedBrowser16916(raw,storage,priority=()=>false) {
+  if(typeof raw?.acquire!=='function'||raw.available16916)return raw;
+  let ready=false;
+  const sessions=new Map();
+  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
+  const one=(q,...a)=>rows(q,...a)[0];
+  const init=()=>{
+    if(ready)return;
+    storage.transactionSync(()=>{
+      rows("CREATE TABLE IF NOT EXISTS desk_browser16916(id INTEGER PRIMARY KEY,next_at INTEGER NOT NULL DEFAULT 0,hold_until INTEGER NOT NULL DEFAULT 0,lease INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',started INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,sessions INTEGER NOT NULL DEFAULT 0)");
+      rows('INSERT OR IGNORE INTO desk_browser16916(id) VALUES(1)');
+    });ready=true;
+  };
+  const available=purpose=>{
+    init();const now=Date.now(),s=one('SELECT * FROM desk_browser16916 WHERE id=1');
+    let reason='',at=0;
+    if(s.hold_until>now){reason=Object.hasOwn(BROWSER_WAIT16916,s.reason)?s.reason:'startup';at=s.hold_until;}
+    else if(s.lease>now){reason='busy';at=s.lease;}
+    else if(s.next_at>now){reason='spacing';at=s.next_at;}
+    else if(purpose!=='publish'&&priority()){reason='publication';at=now+60000;}
+    return reason?browserDeferred16916(new BrowserWait16916(reason,at)):null;
+  };
+  const binding=purpose=>({
+    available16916:(kind=purpose)=>available(kind),purpose16916:binding,
+    state16916:()=>{init();return one('SELECT next_at,hold_until,lease,started,closed,reason,attempts,sessions FROM desk_browser16916 WHERE id=1');},
+    devtools:raw.devtools,
+    connectSession:(...args)=>raw.connectSession(...args),
+    async acquire(options){
+      const wait=available(purpose);if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
+      const at=Date.now(),token=crypto.randomUUID();
+      // Reserve synchronously before yielding. An interrupted isolate leaves a
+      // finite lease, while the provider's 15-second keepAlive closes its session.
+      rows("UPDATE desk_browser16916 SET next_at=?,lease=?,token=?,started=?,attempts=attempts+1 WHERE id=1",at+21000,at+4*60000,token,at);
+      try {
+        const session=await raw.acquire(options);
+        if(typeof session?.sessionId!=='string'||!session.sessionId)throw Error('missing browser session');
+        sessions.set(session.sessionId,token);
+        rows("UPDATE desk_browser16916 SET sessions=sessions+1,reason='' WHERE id=1 AND token=?",token);
+        return session;
+      }catch(error){
+        const text=errorText(error);
+        const daily=/browser.*time.*limit.*(?:today|day)|daily.*browser.*limit/i.test(text);
+        const rate=Number(error?.status??error?.statusCode??error?.code)===429||/\b429\b|too many|rate.?limit|concurrent.*limit/i.test(text);
+        const reason=daily?'daily':rate?'rate':'startup';
+        const rawRetry=error?.retryAfter??error?.retry_after??error?.headers?.get?.('Retry-After');
+        const seconds=typeof rawRetry==='number'||typeof rawRetry==='string'&&/^\d+$/.test(rawRetry)?Number(rawRetry):NaN;
+        const date=typeof rawRetry==='string'&&!Number.isFinite(seconds)?Date.parse(rawRetry):NaN;
+        const until=Math.max(Date.now()+60000,daily?(Math.floor(Date.now()/86400000)+1)*86400000+5000:0,
+          Number.isFinite(seconds)&&seconds>=0?Date.now()+seconds*1000:0,Number.isFinite(date)?date:0);
+        rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=? WHERE id=1 AND token=?",until,reason,token);
+        throw new BrowserWait16916(reason,until);
+      }
+    },
+    async closeSession(id){
+      const token=sessions.get(id);let closed=false;
+      try {await boundedClose16916(()=>raw.closeSession(id));closed=true;}
+      finally {
+        sessions.delete(id);
+        if(token)rows("UPDATE desk_browser16916 SET lease=0,token='',closed=?,next_at=MAX(next_at,?) WHERE id=1 AND token=?",Date.now(),closed?0:Date.now()+21000,token);
+      }
+    }
+  });
+  return binding('normal');
+}
+
+Object.assign(Desk520.prototype,{
+  initRuntime16916(){
+    if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_runtime16916'"))return;
+    this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_runtime16916(id INTEGER PRIMARY KEY,started INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL DEFAULT 0,lease INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',fallback INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '定期処理の確認待ち')");
+      this.rows('INSERT INTO desk_runtime16916(id) VALUES(1)');
+    });
+  },
+  publicationPriority16916(now){
+    const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled delivery FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1');
+    if(!cfg?.enabled||!cfg.delivery||cfg.blocked>now)return false;
+    const args=[now-5*M520,now+6*M520];
+    return !!this.one(`SELECT 1 FROM desk_link_plan l WHERE l.pub IS NULL AND l.scheduled BETWEEN ? AND ?
+      AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=l.article AND j.phase<>'wait') LIMIT 1`,...args)||
+      !!this.one(`SELECT 1 FROM desk_work_schedule w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled BETWEEN ? AND ?
+      AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=CAST(w.seq AS TEXT) AND j.phase<>'wait') LIMIT 1`,...args);
+  },
+  runtimeView16916(){
+    return {tick:this.one('SELECT started,finished,due,lease,fallback,message FROM desk_runtime16916 WHERE id=1'),browser:this.env.BROWSER?.state16916?.()||null};
+  }
+});
+Object.assign(NoteScheduler.prototype,{
+  startDeskTick16916(fallback=false){
+    if(this.deskTicking)return this.deskTicking;
+    this.desk ||= new Desk520(this.ctx.storage,this.env);this.desk.init();
+    const now=Date.now(),state=this.desk.one('SELECT * FROM desk_runtime16916 WHERE id=1');
+    if(!this.desk.one('SELECT enabled FROM desk_cfg WHERE id=1')?.enabled || state.due>now || state.lease>now ||
+       (fallback&&state.started>now-10*M520))return Promise.resolve();
+    const token=crypto.randomUUID();
+    this.desk.rows("UPDATE desk_runtime16916 SET started=?,lease=?,due=?,token=?,fallback=?,message=? WHERE id=1",now,now+15*M520,now+2*M520,token,+fallback,fallback?'定期起動の間隔が空いたため補助起動中':'定期処理中');
+    const work=Promise.resolve().then(()=>this.desk.tick()).then(()=>{
+      this.desk.rows("UPDATE desk_runtime16916 SET finished=?,message='定期処理を1巡しました。各機能の成否は個別の記録に表示します' WHERE id=1 AND token=?",Date.now(),token);
+    },()=>{
+      this.desk.rows("UPDATE desk_runtime16916 SET message='定期処理を完了できず・次回に自動再確認',due=MAX(due,?) WHERE id=1 AND token=?",Date.now()+2*M520,token);
+    }).finally(()=>{
+      try {this.desk.rows("UPDATE desk_runtime16916 SET lease=0,token='' WHERE id=1 AND token=?",token);}
+      finally {if(this.deskTicking===work)this.deskTicking=null;}
+    });
+    this.deskTicking=work;
+    this.ctx.waitUntil?.(work.catch(()=>{}));
+    return work;
   }
 });
 
