@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.13';
+　const VERSION = 'v16.9.14';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -72,7 +72,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v16.9.13-ready';
+const READY = 'v16.9.14-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -1899,9 +1899,21 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     if(identity?.id!==accountId || identity.name!=='43__')return {message:'520本人のログインを確認待ち'};
     let finalStep;
     if(job.kind==='publish'){
-      let draft, url=page;
+      let draft, metadata, url=page;
+      const readMetadata=key=>evaluate('('+BROWSER_SOURCES520.readDraftCover+')('+JSON.stringify(key)+','+JSON.stringify(accountId)+',('+BROWSER_SOURCES520.draftBodyHash+'))');
+      if(job.key){
+        if(!/^n[a-z0-9]{1,64}$/.test(job.key))return {message:'登録された下書きIDを確認できず・公開保留'};
+        const listed=await frame('findDraft',{...arg,byLink:true});
+        if(['reserved','ambiguous'].includes(listed?.state))return {message:'予約・公開済みまたは同名の候補あり・公開保留'};
+        metadata=await readMetadata(job.key);
+        if(blocked())return blockedResult();
+        if(metadata?.unsafe)return {message:'公開済み・予約済みまたは所有者の不一致を確認・公開保留'};
+        if(!metadata || !text520(metadata.name,300) || !/^[0-9a-f]{64}$/.test(metadata.hash||''))
+          return {message:'登録した下書きの本人・保存済み本文を確認できず・公開保留'};
+        draft={key:job.key,url:'https://editor.note.com/notes/'+job.key+'/edit/'};
+      }
       const visited=new Set();
-      for(let i=0;i<4 && url && !visited.has(url);i++){
+      for(let i=0;!job.key && i<4 && url && !visited.has(url);i++){
         visited.add(url);
         if(i)await navigate(url);
         // Wait for this exact page's article list to mount before reading its next link.
@@ -1922,7 +1934,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       if(!/^n[a-z0-9]{1,64}$/.test(draft.key) || !['https://editor.note.com','https://note.com'].includes(editor.origin) ||
           editor.pathname.replace(/\/$/,'')!=='/notes/'+draft.key+'/edit')return {message:'本人の編集ページを確認待ち'};
       // Read the existing draft's explicit cover field while still on note.com's own domain.
-      const metadata=await evaluate('('+BROWSER_SOURCES520.readDraftCover+')('+JSON.stringify(draft.key)+','+JSON.stringify(accountId)+',('+BROWSER_SOURCES520.draftBodyHash+'))');
+      metadata ||= await readMetadata(draft.key);
       if(blocked())return blockedResult();
       if(metadata?.unsafe)return {message:'公開済み・予約済みまたは所有者の不一致を確認・公開保留'};
       await navigate(editor.href);
@@ -2088,6 +2100,7 @@ class Desk520 {
     this.initObservation1698();
     this.initPipeline16913();
     this.initTraffic16913();
+    this.initPublication16914();
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2336,7 +2349,7 @@ class Desk520 {
   }
   scheduleRecords(){
     return {linkPlans:this.rows("SELECT l.article,COALESCE(l.title,(SELECT title FROM desk_work WHERE draft=l.article AND draft<>'')) title,l.scheduled,l.pub,l.result,p.confirmed,j.phase,j.message FROM desk_link_plan l LEFT JOIN desk_snapshot p ON p.article=l.article LEFT JOIN desk_job j ON j.kind='publish' AND j.subject=l.article ORDER BY l.scheduled"),
-      works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.key AS draft,w.paused,w.link_at,w.article,w.pub,c.article AS attemptedArticle,c.result AS coverResult,p.confirmed,m.url magurl,m.name AS magazine FROM desk_work_schedule w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_snapshot p ON p.article=c.article LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq')};
+      works:this.rows('SELECT w.seq,w.title,w.d,w.t,w.locked,w.genre,w.chars,w.suggested,w.key AS draft,w.paused,w.link_at,w.article,w.pub,c.article AS attemptedArticle,c.result AS coverResult,p.confirmed,j.phase AS jobPhase,j.message AS jobMessage,m.url magurl,m.name AS magazine FROM desk_work_schedule w LEFT JOIN desk_work_cover c ON c.seq=w.seq LEFT JOIN desk_snapshot p ON p.article=c.article LEFT JOIN desk_job j ON j.kind=\'publish\' AND j.subject=CAST(w.seq AS TEXT) LEFT JOIN desk_mag m ON m.url=w.magazine ORDER BY w.seq')};
   }
   magazineProgress(now,eligible) {
     const counts=this.one(`SELECT COUNT(*) found,
@@ -3016,7 +3029,8 @@ class Desk520 {
       AND NOT EXISTS(SELECT 1 FROM desk_archive a WHERE a.title=w.title)
       ORDER BY w.scheduled,w.seq LIMIT 1`,Math.max(now-5*M520,start),now,subject,subject,subject,now);
     if(!row || row.title.trim()==='521')return null;
-    return {kind:'publish',subject:String(row.seq),key:row.key||'',target:row.key||'',title:row.title,body:row.body,scheduled:row.scheduled};
+    const {key,conflict}=this.publicationTarget16914(row);
+    return {kind:'publish',subject:String(row.seq),key,target:key,title:row.title,body:row.body,scheduled:row.scheduled,conflict};
   }
   eligiblePlacement(key,now){
     const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
@@ -3045,7 +3059,7 @@ class Desk520 {
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return false;
     const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now):job.link?this.dueLink(now,job.key):this.dueManuscript(now,job.subject);
-    return !!fresh && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title && (job.kind!=='publish' || job.scheduled===fresh.scheduled);
+    return !!fresh && !fresh.conflict && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title && (job.kind!=='publish' || job.scheduled===fresh.scheduled);
   }
   async deliveryAccount(){
     const numeric=u=>u?.urlname==='43__' && /^[1-9]\d{0,19}$/.test(String(u.id))?String(u.id):'';
@@ -3072,10 +3086,8 @@ class Desk520 {
     if(!at || this.one('SELECT 1 FROM desk_work_schedule WHERE key=?',key))return;
     const matches=this.rows('SELECT seq,body FROM desk_work_schedule WHERE key IS NULL AND pub IS NULL AND title=? AND scheduled=? LIMIT 2',n.name,at);
     if(matches.length!==1 || this.one("SELECT 1 FROM desk_link_plan WHERE article<>? AND scheduled=? AND pub IS NULL AND (title=? OR title IS NULL) LIMIT 1",key,at,n.name))return;
-    // Only compare complete, ordinary saved paragraphs; other formats use the authenticated draft directory.
-    if(typeof n.body!=='string' || n.body.length>500000 || !/^(?:<p>(?:[^<>]|<br\s*\/?>)*<\/p>)+$/i.test(n.body))return;
-    const lines=[...n.body.matchAll(/<p>([\s\S]*?)<\/p>/gi)].map(m=>/^<br\s*\/?>$/i.test(m[1])?'':xmlValue520(m[1].replace(/<br\s*\/?>/gi,'\n')));
-    if(lines.join('\n')===matches[0].body.replace(/\r\n?/g,'\n'))this.rows('INSERT OR IGNORE INTO desk_draft_identity(seq,article) VALUES(?,?)',matches[0].seq,key);
+    const plain=plainDraft16914(n.body);
+    if(plain!==null && plain===matches[0].body.replace(/\r\n?/g,'\n'))this.rows('INSERT OR IGNORE INTO desk_draft_identity(seq,article) VALUES(?,?)',matches[0].seq,key);
   }
   async lookupDraftTitle(now,key=null){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
@@ -3179,6 +3191,7 @@ class Desk520 {
     this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
     let message='通信を確認待ち',slot,lease,env,attemptAt=0,retry=job.kind==='mag'?D520:M520;
     try{
+      if(job.conflict){message=job.conflict;return;}
       const account=await this.deliveryAccount();
       if(!account){message='520の登録を確認待ち';return;}
       if(account.until>Date.now()){
@@ -3925,6 +3938,7 @@ function deskRecordText(s) {
     lines.push(w.seq+'　'+w.title+'　'+w.chars+'字',w.d+'　'+(w.t||w.suggested||'時刻未定')+(w.locked?'（note予約済み・本人登録）':w.suggested?'（比較データからの時刻）':''),
       w.pub?'公開確認 '+tm(w.pub):w.paused?'予約取り消し済み':!w.locked && (w.t||w.suggested) && Date.now()>Date.parse(w.d+'T'+(w.t||w.suggested)+':00+09:00')+5*M520?'自動公開の時間枠終了・公開結果は確認待ち':'RSSでの公開確認待ち',
       w.magazine?'条件に合う1誌 '+w.magazine+' ／ 誌面での掲載は確認待ち':s.mags.length?'確認済みの条件で該当する誌なし':'条件を確認できた掲載先なし');
+    if(w.jobMessage)lines.push('公開処理 ／ '+w.jobMessage);
     if(w.coverResult)lines.push('見出し画像 ／ '+w.coverResult);
     for(const m of s.placements.filter(m=>m.seq===w.seq)) lines.push('誌面RSSで掲載確認 '+m.name+' ／ '+tm(m.observed));
     for(const p of s.samples.filter(p=>p.seq===w.seq)) lines.push((p.age===1?'24時間':'7日')+'後 '+(p.value===null?p.state:p.value+'スキ')+' ／ '+(p.at?'観測 '+tm(p.at):'予定 '+tm(p.due)));
@@ -3958,15 +3972,15 @@ function publicationLinks(records){
     const w=byArticle.get(p.article);
     if(w)included.add(w.seq);
     const published=!!(p.pub||w?.pub),sent=['sent','seen','confirmed'].includes(p.phase)||!!w?.attemptedArticle;
-    const state=p.confirmed||w?.confirmed?'noteで公開中を確認':published?'公開一覧で確認':sent?'公開操作済み・確認中':w?.locked?'note側で予約済み（本人登録）':Date.now()>p.scheduled+5*M520?'時間枠終了・保留':'公開予定';
-    add(p.article,p.title||w?.title,p.scheduled,'',published,state,w?.coverResult||p.result||p.message,!sent&&!published&&!w?.locked);
+    const state=p.confirmed||w?.confirmed?'noteで公開中を確認':published?(sent?'公開操作後に公開一覧で確認':'公開確認・ツールの公開操作記録なし'):sent?'公開操作済み・確認中':w?.locked?'note側で予約済み（本人登録）':Date.now()>p.scheduled+5*M520?'時間枠終了・保留':'公開予定';
+    add(p.article,p.title||w?.title,p.scheduled,'',published,state,w?.coverResult||p.result||p.message||w?.jobMessage,!sent&&!published&&!w?.locked);
   }
   for(const w of works){
     if(included.has(w.seq))continue;
     const clock=w.t||w.suggested,at=clock?Date.parse(w.d+'T'+clock+':00+09:00'):null;
-    const state=w.confirmed?'noteで公開中を確認':w.pub?'公開一覧で確認':w.paused?'予約取り消し済み':w.locked?'note予約済み（登録時の指定）':w.attemptedArticle?'公開操作済み・確認中':at&&at+5*M520<Date.now()?'時間枠終了・保留':'登録済み';
+    const state=w.confirmed?'noteで公開中を確認':w.pub?(['sent','seen','confirmed'].includes(w.jobPhase)?'公開操作後に公開一覧で確認':'公開確認・ツールの公開操作記録なし'):w.paused?'予約取り消し済み':w.locked?'note予約済み（登録時の指定）':w.attemptedArticle?'公開操作済み・確認中':at&&at+5*M520<Date.now()?'時間枠終了・保留':'登録済み';
     const key=w.article||w.attemptedArticle||w.draft;
-    add(key,w.title,at,w.d+' 時刻未定',!!w.pub,state,w.coverResult||(!key?'本人の下書き一覧からリンクを確認中':''),!!key&&!!at&&!w.pub&&!w.locked&&!w.attemptedArticle&&!w.paused);
+    add(key,w.title,at,w.d+' 時刻未定',!!w.pub,state,w.coverResult||w.jobMessage||(!key?'本人の下書き一覧からリンクを確認中':''),!!key&&!!at&&!w.pub&&!w.locked&&!w.attemptedArticle&&!w.paused);
   }
   return rows.sort((a,b)=>a.order-b.order);
 }
@@ -6932,6 +6946,62 @@ function trafficRecord16913(row) {
   }
   lines.push('PVは記事が開かれた回数で、人数・読了数ではありません。自分の閲覧も含まれます。集計には遅れがあり、当日を含む期間は途中です。note.comの流入内訳から個別のスキ・共同誌の効果は判定できません。');
   return lines.join('\n');
+}
+
+// Reconcile only an unambiguous link at the manuscript's own title and time.
+// This chooses where to inspect; the editor must still match the complete manuscript before publishing.
+Object.assign(Desk520.prototype, {
+  publicationTarget16914(work) {
+    if(work.key)return {key:work.key,conflict:''};
+    const links=this.rows('SELECT article FROM desk_link_plan WHERE pub IS NULL AND title=? AND scheduled=? LIMIT 2',work.title,work.scheduled);
+    if(!links.length)return {key:'',conflict:''};
+    if(links.length!==1)return {key:'',conflict:'同じ日時・タイトルの共有リンクが複数あるため公開を保留'};
+    const key=links[0].article;
+    if(this.one('SELECT 1 FROM desk_work_schedule WHERE seq<>? AND (key=? OR (pub IS NULL AND key IS NULL AND title=? AND scheduled=?)) LIMIT 1',work.seq,key,work.title,work.scheduled))
+      return {key:'',conflict:'同じ下書きに対応する完成稿を1件に特定できず公開を保留'};
+    return {key,conflict:''};
+  },
+  initPublication16914() {
+    if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_link_title16914'"))return;
+    this.rows('CREATE INDEX desk_link_title16914 ON desk_link_plan(title,scheduled) WHERE pub IS NULL');
+  }
+});
+
+// Read ordinary saved paragraphs with note's HTML attributes and inline formatting.
+// Preserve spaces, line breaks and empty paragraphs. Unsupported content has no plain-text proof.
+function plainDraft16914(html) {
+  if(typeof html!=='string' || html.length>500000)return null;
+  const parts=[],stack=[];
+  let end=0,line='',children=0,soleBreak=false;
+  for(const token of html.matchAll(/<\/?[a-z][a-z0-9]*(?:\s+(?:[^"'<>]|"[^"]*"|'[^']*')*)?\s*\/?>|[^<]+/gi)) {
+    if(token.index!==end)return null;
+    const value=token[0];end=token.index+value.length;
+    if(value[0]!=='<') {
+      if(!stack.length){if(value.trim())return null;continue;}
+      if(/&(?!amp;|lt;|gt;|quot;|apos;|nbsp;|#(?:x[\da-f]+|\d+);)[a-z0-9#]+;/i.test(value))return null;
+      if(stack.length===1){children++;soleBreak=false;}
+      line+=xmlValue520(value.replace(/&nbsp;/gi,'\u00a0'));
+      continue;
+    }
+    const name=/^<\/?([a-z0-9]+)/i.exec(value)[1].toLowerCase(),closing=value.startsWith('</');
+    if(closing) {
+      if(stack.pop()!==name)return null;
+      if(!stack.length){parts.push(soleBreak&&children===1?'':line);line='';children=0;soleBreak=false;}
+      continue;
+    }
+    if(!stack.length) {
+      if(!['p','div'].includes(name)||value.endsWith('/>'))return null;
+      stack.push(name);continue;
+    }
+    if(stack.length===1){children++;soleBreak=name==='br'&&children===1;}
+    if(name==='br') {
+      if(!/ProseMirror-trailingBreak/.test(attr161(value,'class')))line+='\n';
+      continue;
+    }
+    if(!['span','strong','em','b','i','s','u','a','code'].includes(name)||value.endsWith('/>'))return null;
+    stack.push(name);
+  }
+  return end===html.length && !stack.length && parts.length?parts.join('\n'):null;
 }
 
 const BROWSER_SOURCES520 = Object.freeze({
