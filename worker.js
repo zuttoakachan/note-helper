@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.19';
+const VERSION = 'v16.9.20';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -27,7 +27,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>note-helper ${VERSION}</title>
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
-<h1>note-helper ${VERSION}</h1><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
+<h1>note-helper ${VERSION}</h1><p><a href="/test">今すぐ本番テスト・結果を見る</a></p><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
 <p>創作記事の感想コメントへのスキと、創作記事に反応した読者の公開記事を自動で探索します。追加探索は30分以上空け、各アカウント1日12回まで。送信枠と同じ人への待機を記事巡回と共有します。成功件数と確認待ちは状態欄に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
@@ -1118,6 +1118,7 @@ export default {
   async fetch(request, original) {
     const url = new URL(request.url);
     if (url.pathname === '/tuta' || url.pathname === '/tuta/') return tutaRoute520(request,original);
+    if (url.pathname === '/test' || url.pathname === '/test/') return productionTestRoute16920(request,original);
     if (url.pathname === '/520') return deskRoute(request,original);
     if (url.pathname === '/' && request.method === 'GET') return page(undefined,url.searchParams.get('account') === '2' ? '2' : '1');
     if (url.pathname !== '/control' || request.method !== 'POST') return reply('Not found',false,404);
@@ -1261,12 +1262,20 @@ export class NoteScheduler {
         const publicationAt=this.desk.publicationAlarm16915(Date.now());
         if(publicationAt)next=Math.min(next,publicationAt);
       } catch { console.error('note-helper: publication alarm deferred'); }
+      try {const testAt=this.desk?.productionTestAlarm16920();if(testAt)next=Math.min(next,testAt);}
+      catch {console.error("note-helper: production test schedule deferred");}
       await this.ctx.storage.setAlarm(next);
       await sql(this.env,'UPDATE nh_v15_runtime SET alarm_at=? WHERE id=1',next).run();
       // A durable-object background task survives a closed management page.
       // Do not delay the ordinary alarm while the optional browser work runs.
       if(typeof this.ctx.waitUntil==='function') {
-        try {this.ctx.waitUntil(this.startDeskTick16916(true).catch(()=>{}));}
+        try {
+          if(this.desk.productionTestActive16920()){
+            // Use a separate alarm invocation from an ordinary account run so
+            // its request budget is not combined with the production probe.
+            if(!due)await this.desk.pumpProductionTest16920();
+          }else this.ctx.waitUntil(this.startDeskTick16916(true).catch(()=>{}));
+        }
         catch {console.error('note-helper: desk fallback deferred');}
       }
     } catch (error) {
@@ -2211,6 +2220,7 @@ class Desk520 {
     this.initPublication16914();
     this.initRuntime16916();
     this.initDistribution16918();
+    this.initProductionTest16920();
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2220,6 +2230,16 @@ class Desk520 {
       const now=Date.now();
       let correctionMessage='';
       switch(input.action) {
+        case 'production_test_start':
+          need520(SLOTS.includes(input.slot),'アカウントを選んでください。');
+          this.startProductionTest16920(input.slot);
+          await this.wakeProductionTest16920();
+          if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.pumpProductionTest16920().catch(()=>{}));
+          return deskJson(this.productionTestView16920());
+        case 'production_test_status':
+          await this.wakeProductionTest16920();
+          if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.pumpProductionTest16920().catch(()=>{}));
+          return deskJson(this.productionTestView16920());
         case 'plans': return deskJson({publicationLinks:publicationLinks(this.scheduleRecords())});
         case 'status':
           if(typeof ctx?.waitUntil==='function')ctx.waitUntil(this.resolveDraftDirectory(now).catch(()=>{}));
@@ -3273,19 +3293,21 @@ class Desk520 {
       return '公開せずに確認 ／ '+result.message;
     }finally{await release(env,lease);}
   }
-  async dispatchUnlocked16915(now,publicationOnly=false){
+  async dispatchUnlocked16915(now,publicationOnly=false,probe=null){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     const state=this.one('SELECT * FROM desk_delivery WHERE id=1');
-    if(!cfg.enabled || !state.enabled || cfg.blocked>now || state.due>now || typeof this.env?.BROWSER?.acquire!=='function')return;
+    if(!cfg.enabled || !state.enabled || cfg.blocked>now || (!probe && state.due>now) || typeof this.env?.BROWSER?.acquire!=='function')return;
+    if(probe && this.publicationPriority16916(now))return;
     const day=Math.floor(now/D520);
     if(state.utc_day!==day){this.rows('UPDATE desk_delivery SET utc_day=?,pubs=0,mags=0 WHERE id=1',day);state.pubs=0;state.mags=0;}
-    let job=state.pubs<4?this.duePublication(now):null;
+    let job=!probe && state.pubs<4?this.duePublication(now):null;
     if(job && this.one("SELECT 1 FROM desk_job WHERE kind='publish' AND subject=? AND (phase<>'wait' OR next>?)",job.subject,now))job=null;
     if(!job && !publicationOnly && state.mags<DISTRIBUTION16918.placements)job=this.nextPlacement(now,!!state.old_first);
     if(!job)return;
     const browser=browserPurpose16916(this.env.BROWSER,job.kind==='publish'?'publish':'normal');
     const waiting=browserWait16916(browser,job.kind==='publish'?'publish':'normal');
     if(waiting)return;
+    probe?.capture?.({article:job.key,id:job.target,name:job.name,title:job.title,fresh:true});
     const label=job.kind==='publish'?job.title:job.title+' → '+job.name;
     this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,article,message) VALUES(?,?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+15*M520,job.kind==='mag'?job.key:'');
     this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
@@ -4137,7 +4159,7 @@ function deskPage(records=null,message='',status=200,editing='') {
   const nonce=crypto.randomUUID().replaceAll('-','');
   const html=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>520 作品管理 ${VERSION}</title><style>body{font:16px system-ui;max-width:740px;margin:24px auto;padding:0 16px;color:#232629;line-height:1.6}label,fieldset,details,section{display:block;margin:12px 0}input:not([type=checkbox]),textarea,select{width:100%;box-sizing:border-box;font:inherit;padding:8px}button,summary{font:inherit;padding:9px;cursor:pointer}button{margin:6px 5px 6px 0}p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:12px}#msg{font-weight:600}img{max-width:100%;max-height:190px}small{display:block}</style></head><body>
-<p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><a href="/">スキ回り・質問箱・0円参加の結果を確認</a><h1>520 作品管理</h1><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
+<p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><a href="/">スキ回り・質問箱・0円参加の結果を確認</a><h1>520 作品管理</h1><p><a href="/test">今すぐ本番テスト</a></p><small>${VERSION}</small><p>43__ 専用・日本時間。公開確認と計測には公開情報を使います。</p>
 <form method="post" action="/520" id="readform"><label>管理用の鍵<input id="key" name="key" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <button id="load" type="submit">記録を開く</button><button id="basic" type="submit" hidden>簡易表示で開く</button>
 <details id="planform"${selected?' open':''}><summary>下書きの共有リンクで予約</summary>
@@ -4863,23 +4885,25 @@ Object.assign(Desk520.prototype,{
     const n=(await this.publicRead('https://note.com/api/v3/notes/'+target.article,'json'))?.data;
     return joinFree520(payload,html,target,n);
   },
-  async joinTick520(now) {
+  async joinTickUnlocked16920(now,probe=null) {
     if(browserWait16916(this.env.BROWSER))return;
     const cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
-    if(cfg.due>now || !this.joinActive520(''))return;
+    if((!probe && cfg.due>now) || !this.joinActive520(''))return;
     // The publication window and existing account lease take priority over participation.
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) ||
       this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const applicationRoom=(this.one('SELECT applications FROM desk_join_budget WHERE day=?',jstDay(now))?.applications||0)<DISTRIBUTION16918.applications &&
       this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next<=now;
-    const rows=this.rows(`SELECT j.* FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE j.due<=? AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')
-      AND (j.phase<>'wait' OR ? OR EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait'))
+    const rows=this.rows(`SELECT j.* FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE (j.due<=? OR ?) AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')
+      AND (j.phase<>'wait' OR ? OR EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait')) AND (?='' OR j.id=?)
       ORDER BY EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') DESC,
-      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 1`,now,+applicationRoom);
+      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 1`,now,+!!probe,+applicationRoom,probe?.target||'',probe?.target||'');
     const row=rows[0];
     if(!row)return;
+    if(probe?.verify && !['sent','applied','accepting','joined'].includes(row.phase))return;
     const target=this.joinTarget520(row.id);
     if(!target)return;
+    probe?.capture?.({id:row.id,phase:row.phase,name:target.name});
     const today=jstDay(now),used=cfg.day===today?cfg.used:0;
     if(used>=DISTRIBUTION16918.checks){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
     this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+15*M520);
@@ -4942,6 +4966,7 @@ Object.assign(Desk520.prototype,{
             attempt=marker;return true;
           });
         },live);
+      probe?.result?.(result);
       message=result.message;due=Date.now()+(result.noFollow?30*D520:attempt||result.prepared?4*M520:kind==='check'||kind==='verify'?6*HOUR:2*HOUR);
       this.storage.transactionSync(()=>{
         if(!this.joinActive520(target.id))return;
@@ -6899,9 +6924,10 @@ Object.assign(Desk520.prototype,{
       this.match(at);this.planArchive(at);
     });
   },
-  async verifyPlacement16913(now){
+  async verifyPlacement16913(now,selected=null){
     if(!this.pipelineActive16913())return;
-    const p=this.one('SELECT * FROM desk_mag_verify16913 WHERE done=0 AND due<=? ORDER BY due,article LIMIT 1',now);
+    const p=selected?this.one('SELECT * FROM desk_mag_verify16913 WHERE article=? AND id=? AND done<>1',selected.article,selected.id):
+      this.one('SELECT * FROM desk_mag_verify16913 WHERE done=0 AND due<=? ORDER BY due,article LIMIT 1',now);
     if(!p)return;
     const job=this.one("SELECT phase FROM desk_job WHERE kind='mag' AND article=? AND target=?",p.article,p.id);
     if(job?.phase==='confirmed' || this.one('SELECT 1 FROM desk_ref WHERE article=? AND id=?',p.article,p.id)){
@@ -6910,7 +6936,7 @@ Object.assign(Desk520.prototype,{
     if(!job || !['sent','seen'].includes(job.phase)){
       this.rows("UPDATE desk_mag_verify16913 SET done=2,message='追加操作の記録がないため確認対象外' WHERE article=? AND id=?",p.article,p.id);return;
     }
-    if(p.attempts>=8 || now-p.started>7*D520){
+    if(!selected && (p.attempts>=8 || now-p.started>7*D520)){
       this.rows("UPDATE desk_mag_verify16913 SET done=2,message='追加結果は未確認。個別の再確認枠を終了・再送なし。通常の誌面確認は継続' WHERE article=? AND id=?",p.article,p.id);return;
     }
     const imported=this.one('SELECT url,name FROM desk_import WHERE id=?',p.id);
@@ -7220,11 +7246,11 @@ function plainDraft16914(html) {
 }
 
 Object.assign(Desk520.prototype,{
-  async dispatch(now,publicationOnly=false){
+  async dispatch(now,publicationOnly=false,probe=null){
     // Cron and the alarm can arrive together. A single in-memory operation plus
     // durable job/account leases prevent duplicate publication across restarts.
-    if(this.deliveryTask16915)return this.deliveryTask16915;
-    const work=this.dispatchUnlocked16915(now,publicationOnly);
+    if(this.deliveryTask16915)return probe?undefined:this.deliveryTask16915;
+    const work=this.dispatchUnlocked16915(now,publicationOnly,probe);
     this.deliveryTask16915=work;
     try{return await work;}finally{if(this.deliveryTask16915===work)this.deliveryTask16915=null;}
   },
@@ -7433,6 +7459,7 @@ Object.assign(NoteScheduler.prototype,{
   startDeskTick16916(fallback=false){
     if(this.deskTicking)return this.deskTicking;
     this.desk ||= new Desk520(this.ctx.storage,this.env);this.desk.init();
+    if(this.desk.productionTestActive16920())return this.desk.pumpProductionTest16920();
     const now=Date.now(),state=this.desk.one('SELECT * FROM desk_runtime16916 WHERE id=1');
     if(!this.desk.one('SELECT enabled FROM desk_cfg WHERE id=1')?.enabled || state.due>now || state.lease>now ||
        (fallback&&state.started>now-10*M520))return Promise.resolve();
@@ -7657,6 +7684,317 @@ function discoveryStatus16919(r,state,now){
   if(r.aux_due>now)message='追加探索だけエラー後の再確認待ち。詳細は「追加機能と通常巡回の状態」に表示';
   const next=!state?.enabled?'自動運転は停止中':due>now?time(due)+'以降':r.due?'次の通常巡回で確認':'元記事の取得待ち';
   return message+'\n本日の共通探索枠 '+used+'/12回（成功件数ではありません）\n次の追加探索：'+next;
+}
+
+// A bounded, authenticated production check. Each durable phase runs once;
+// write receipts are stored before invoking the existing idempotent pipelines.
+const TEST_STEPS16920=['追加機能の読み取り','参加申請・招待','申請結果の確認','共同誌への掲載','掲載結果の確認'];
+const TEST_LABELS16920={ok:'確認済み',wait:'未実行・保留',unknown:'操作済み・結果未確認',error:'エラー',running:'処理中'};
+Object.assign(Desk520.prototype,{
+  initProductionTest16920(){
+    if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_test16920'"))return;
+    this.storage.transactionSync(()=>{
+      this.rows(`CREATE TABLE desk_test16920(id INTEGER PRIMARY KEY,token TEXT NOT NULL DEFAULT '',slot TEXT NOT NULL DEFAULT '1',
+        phase INTEGER NOT NULL DEFAULT 5,started INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0,
+        due INTEGER NOT NULL DEFAULT 0,lease INTEGER NOT NULL DEFAULT 0,next_test INTEGER NOT NULL DEFAULT 0,
+        results TEXT NOT NULL DEFAULT '[]',target TEXT NOT NULL DEFAULT '{}')`);
+      this.rows('INSERT INTO desk_test16920(id) VALUES(1)');
+    });
+  },
+  productionTestActive16920(){return !!this.one("SELECT 1 FROM desk_test16920 WHERE id=1 AND token<>'' AND phase<5 AND finished=0");},
+  productionTestView16920(){
+    const r=this.one('SELECT * FROM desk_test16920 WHERE id=1');
+    return {version:VERSION,slot:r.slot,started:r.started,finished:r.finished,active:!!r.token&&r.phase<5&&!r.finished,
+      step:TEST_STEPS16920[r.phase]||'',due:r.due,nextTest:r.next_test,results:JSON.parse(r.results)};
+  },
+  startProductionTest16920(slot){
+    const now=Date.now();
+    return this.storage.transactionSync(()=>{
+      const r=this.one('SELECT * FROM desk_test16920 WHERE id=1');
+      // Repeated form submissions and an interrupted client never enqueue twice.
+      if(r.phase<5 && r.token && !r.finished || r.next_test>now)return false;
+      this.rows("UPDATE desk_test16920 SET token=?,slot=?,phase=0,started=?,finished=0,due=?,lease=0,next_test=?,results='[]',target='{}' WHERE id=1",
+        crypto.randomUUID(),slot,now,now,now+5*M520);
+      return true;
+    });
+  },
+  testResult16920(token,key,label,state,message){
+    const r=this.one('SELECT results FROM desk_test16920 WHERE id=1 AND token=?',token);
+    if(!r)return;
+    const items=JSON.parse(r.results).filter(v=>v.key!==key);
+    items.push({key,label,state,message:String(message).slice(0,1800),at:Date.now()});
+    this.rows('UPDATE desk_test16920 SET results=? WHERE id=1 AND token=?',JSON.stringify(items),token);
+  },
+  testTarget16920(token,key,value){
+    const r=this.one('SELECT target FROM desk_test16920 WHERE id=1 AND token=?',token);
+    if(!r)return;
+    this.rows('UPDATE desk_test16920 SET target=? WHERE id=1 AND token=?',JSON.stringify({...JSON.parse(r.target),[key]:value}),token);
+  },
+  productionTestAlarm16920(){
+    const r=this.one('SELECT phase,token,finished,due,lease FROM desk_test16920 WHERE id=1');
+    return r?.token && r.phase<5 && !r.finished?Math.max(Date.now()+1000,r.due,r.lease):null;
+  },
+  async wakeProductionTest16920(){
+    const next=this.productionTestAlarm16920();
+    if(!next || typeof this.storage.setAlarm!=='function')return;
+    const old=await this.storage.getAlarm();
+    if(old===null || old>next)await this.storage.setAlarm(next);
+  },
+  async pumpProductionTest16920(){
+    if(this.testTask16920)return this.testTask16920;
+    const work=this.advanceProductionTest16920();this.testTask16920=work;
+    try{return await work;}finally{if(this.testTask16920===work)this.testTask16920=null;}
+  },
+  async advanceProductionTest16920(){
+    const now=Date.now(),r=this.one('SELECT * FROM desk_test16920 WHERE id=1');
+    if(!r.token || r.phase>=5 || r.finished || r.due>now)return;
+    if(r.lease){
+      if(r.lease>now)return;
+      this.testResult16920(r.token,'interrupted','テストの実行記録','error','前回の処理完了を確認できません。操作は自動で繰り返しません。記録済みの申請・掲載は通常の結果確認で追跡します。');
+      this.rows('UPDATE desk_test16920 SET phase=5,finished=?,lease=0 WHERE id=1 AND token=?',now,r.token);return;
+    }
+    // Give an in-progress regular desk task time to finish; do not run two
+    // independent browser pipelines against the same account at once.
+    const deskRun=this.one('SELECT lease FROM desk_runtime16916 WHERE id=1');
+    const wait=browserWait16916(this.env.BROWSER);
+    if(r.phase<4 && (deskRun.lease>now || wait && ['busy','spacing','publication'].includes(wait.browserReason))){
+      if(now-r.started<10*M520){
+        this.rows('UPDATE desk_test16920 SET due=? WHERE id=1 AND token=?',Math.min(now+30000,Math.max(now+1000,wait?.retryAt||deskRun.lease)),r.token);
+        await this.wakeProductionTest16920();return;
+      }
+      this.testResult16920(r.token,'busy','テストの待機','wait','別の処理が続いているため今回のテストを終了しました。新しい送信はしていません。');
+      this.rows('UPDATE desk_test16920 SET phase=5,finished=? WHERE id=1 AND token=?',now,r.token);return;
+    }
+    const locked=this.one('UPDATE desk_test16920 SET lease=? WHERE id=1 AND token=? AND phase=? AND lease=0 RETURNING id',now+4*M520,r.token,r.phase);
+    if(!locked)return;
+    // Persist the recovery wake before any external action.
+    await this.wakeProductionTest16920();
+    let end=false;
+    try{
+      if(r.phase===0)await this.testReaders16920(r);
+      else if(r.phase===1)await this.testJoin16920(r);
+      else if(r.phase===2)await this.testJoinProof16920(r);
+      else if(r.phase===3)await this.testPlacement16920(r);
+      else await this.testPlacementProof16920(r);
+    }catch(error){
+      const code=readLimit(error)?'daily_quota':auxDetail16919(error);
+      this.testResult16920(r.token,'phase_'+r.phase,TEST_STEPS16920[r.phase],'error',
+        error instanceof Trouble?error.message:readLimit(error)?quotaMessage:'処理を完了できません。確認コード TEST20/'+r.phase+'/'+code+'。保存済みの操作は再送しません。');
+      end=readLimit(error) || r.phase===0 && /storage|table|column|binding|constraint|quota/.test(code);
+    }finally{
+      const phase=end?5:r.phase+1,at=Date.now();
+      this.rows('UPDATE desk_test16920 SET phase=?,finished=?,lease=0,due=? WHERE id=1 AND token=? AND phase=?',phase,phase>=5?at:0,at+1000,r.token,r.phase);
+      await this.wakeProductionTest16920();
+    }
+  },
+  async testReaders16920(r){
+    await prepare(this.env);
+    let env={...scoped(this.env,r.slot),TRACE:{calls:0}},lease;
+    const put=(key,label,state,message)=>this.testResult16920(r.token,key,label,state,message);
+    await sql(env,'CREATE TABLE IF NOT EXISTS nh_v16920_probe(slot TEXT PRIMARY KEY,token TEXT NOT NULL,at INTEGER NOT NULL)').run();
+    await sql(env,'INSERT INTO nh_v16920_probe(slot,token,at) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET token=excluded.token,at=excluded.at',r.slot,r.token,Date.now()).run();
+    const probe=await sql(env,'SELECT token FROM nh_v16920_probe WHERE slot=?',r.slot).first();
+    if(probe?.token!==r.token)throw Error('D1_ERROR: probe readback mismatch');
+    const discovery=await auxReadWrite16919(env,'discovery_read',()=>sql(env,'SELECT seed,seed_owner,pending,turn,attempt_token FROM nh_v1697_discovery WHERE slot=?',r.slot).first());
+    await auxReadWrite16919(env,'aux_read',()=>sql(env,'SELECT failed_at,operation,detail,recovered_at FROM nh_v16917_aux WHERE slot=?',r.slot).first());
+    if(!discovery)throw Error('D1_ERROR: missing auxiliary row');
+    put('storage','追加機能の保存・読み取り','ok','検証用の値を書き込み、同じ値を読み戻しました。追加探索の保存項目も読み取れました。');
+    const state=await sql(env,`SELECT c.*,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id
+      JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1`,r.slot).first();
+    if(!state?.enabled || !state.account){put('identity','note本人確認','wait','選んだアカウントは停止中または未登録です。設定は変更していません。');return;}
+    const hold=Math.max(state.lease,state.hold_until,state.kind?state.next_at:0);
+    if(hold>Date.now()){put('identity','note本人確認','wait',time(hold)+'まで既存の処理・待機があるため実行しませんでした。');return;}
+    if(state.inflight || discovery.pending){put('identity','note本人確認','wait','前回の送信結果が未確認です。通常の再確認を優先し、新しい操作は行いません。');return;}
+    lease=await acquire(env,false);
+    if(!lease){put('identity','note本人確認','wait','別の処理中のため、今回は本人確認を実行しませんでした。');return;}
+    try{
+      env=await loadCookie(env,state.account);
+      if(await account(env)!==state.account)throw new Trouble('保存済みのnote本人と一致しません','mismatch');
+      put('identity','note本人確認','ok','アカウント '+r.slot+' の現在のログインを確認しました。');
+      let seed={key:discovery.seed,owner:discovery.seed_owner};
+      if(!/^n[a-z0-9]{1,64}$/.test(seed.key) || !/^[\w-]{1,80}$/.test(seed.owner))seed=await ownReaderSeed1699(env,state,discovery.turn);
+      if(!seed){put('source','読み取り対象','wait','確認に使える公開記事がまだありません。通常の記事探索で取得後に試せます。');return;}
+      const source=await article(env,seed.key);
+      if(!source || source.key!==seed.key || source.status!=='published' || source.user?.urlname!==seed.owner){put('source','読み取り対象','wait','保存された記事の公開状態・作者が一致しません。別の記事の取得待ちです。');return;}
+      if(typeof env.BROWSER?.acquire!=='function'){put('browser','note画面の読み取り','error','BROWSERの設定がありません。');return;}
+      const result=await productionReaderProbe16920(env,state.account,seed);
+      if(result.code || result.hold){
+        await sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+Math.max(result.hold||0,2*HOUR),r.slot).run();
+        put('browser','note画面の読み取り','wait',result.message);return;
+      }
+      if(!result.identity){put('browser','note画面の読み取り',result.browserDeferred?'wait':'error',result.message||'記事画面で本人を確認できません。');return;}
+      put('comments','コメント欄の読み取り',result.comments?'ok':'error',result.comments?'本文・作者・スキ状態を読み取れました。確認できたコメント '+result.commentCount+'件。スキは送信していません。':'コメント欄の形式を確認できません。TEST20/comments/comment_rows');
+      put('readers','スキした読者の読み取り',result.readers?'ok':'error',result.readers?'読者一覧を読み取れました。取得できた範囲で '+result.owners.length+'人。':'読者一覧の形式を確認できません。TEST20/readers/liker_list');
+      if(result.readers){
+        let saved=0;
+        await rememberReaders1699(env,result.owners,seed,'literary',(_,n)=>saved+=n);
+        put('candidates','読者候補の保存','ok',saved+'人の候補を保存・更新しました。上限・既存の作者待機は維持します。');
+        await diagnostic16915(env,'readers','read','liker_list');
+      }
+      if(result.comments)await diagnostic16915(env,'comments','read','comment_rows');
+      if(env.TRACE.diagnosticFault16919)put('diagnostic','確認記録の保存','error','読み取りはできましたが、診断記録の保存に失敗しました。TEST20/diagnostic/'+env.TRACE.diagnosticFault16919);
+    }catch(error){
+      if(error instanceof Trouble && (error.retry || ['auth','rate','mismatch'].includes(error.kind)))
+        await sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+Math.max(error.retry||0,2*HOUR),r.slot).run();
+      throw error;
+    }finally{await release(env,lease);}
+  },
+  async joinTick520(now,probe=null){
+    if(this.joinTask16920)return;
+    const work=this.joinTickUnlocked16920(now,probe);this.joinTask16920=work;
+    try{return await work;}finally{if(this.joinTask16920===work)this.joinTask16920=null;}
+  },
+  async testJoin16920(r){
+    const now=Date.now(),cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
+    if(!this.joinActive520('')){this.testResult16920(r.token,'application','参加申請・招待','wait','自動申請・作品管理が休止中、またはnote指定の待機中です。');return;}
+    if(this.publicationPriority16916(now)){this.testResult16920(r.token,'application','参加申請・招待','wait','予約公開の時間帯のため公開処理を優先しました。');return;}
+    const waiting=browserWait16916(this.env.BROWSER);
+    if(waiting){this.testResult16920(r.token,'application','参加申請・招待','wait',waiting.message+' ／ '+time(waiting.retryAt)+' 以降に再確認できます。');return;}
+    if(cfg.day===jstDay(now)&&cfg.used>=DISTRIBUTION16918.checks){this.testResult16920(r.token,'application','参加申請・招待','wait','本日の本人画面確認枠を使い切っています。翌日に再開します。');return;}
+    if(typeof this.env.BROWSER?.acquire!=='function'){this.testResult16920(r.token,'application','参加申請・招待','error','BROWSERの設定がありません。');return;}
+    let chosen,result;
+    await this.joinTick520(now,{capture:value=>{chosen=value;this.testTarget16920(r.token,'join',value);},result:value=>{result=value;}});
+    if(!chosen){
+      const gap=this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next;
+      const reason=cfg.day===jstDay(now)&&cfg.used>=DISTRIBUTION16918.checks?'本日の本人画面確認枠を使い切っています。':
+        gap>now?'次の新規申請は '+time(gap)+' 以降です。':'現在申請できる募集先・受信済み招待がありません。';
+      this.testResult16920(r.token,'application','参加申請・招待','wait',reason+' テストによる送信はありません。');return;
+    }
+    const j=this.one('SELECT phase,proof,message FROM desk_join WHERE id=?',chosen.id);
+    const confirmed=result?.joined===true || result?.existing===true;
+    this.testResult16920(r.token,'application','参加申請・招待',confirmed?'ok':['sent','accepting'].includes(j.phase)?'unknown':'wait',chosen.name+' ／ '+j.message+
+      (j.phase==='sent'?'。送信操作を記録しましたが、申請の到達はまだ未確認です。再送はしません。':''));
+  },
+  async testJoinProof16920(r){
+    const target=JSON.parse(this.one('SELECT target FROM desk_test16920 WHERE id=1 AND token=?',r.token).target).join;
+    if(!target){this.testResult16920(r.token,'application_proof','申請結果の確認','wait','確認対象の申請・招待がありません。');return;}
+    const before=this.one('SELECT phase,proof FROM desk_join WHERE id=?',target.id);
+    if(before?.phase==='joined' && before.proof>=r.started){
+      this.testResult16920(r.token,'application_proof','申請結果の確認','ok',target.name+' ／ 今回の本人画面で共同運営者としての参加を確認しました。');return;
+    }
+    let result;
+    await this.joinTick520(Date.now(),{target:target.id,verify:true,result:value=>{result=value;}});
+    const j=this.one('SELECT phase,message FROM desk_join WHERE id=?',target.id);
+    this.testResult16920(r.token,'application_proof','申請結果の確認',result?.joined||result?.existing?'ok':['sent','accepting','applied'].includes(j?.phase)?'unknown':'wait',
+      target.name+' ／ '+(result?.message||j?.message||'本人画面を再確認できませんでした。')+
+      (result?.existing?'。希望コメントの存在を確認しました。相手からの招待は待機中です。':''));
+  },
+  async testPlacement16920(r){
+    const now=Date.now();
+    if(!this.pipelineActive16913()){this.testResult16920(r.token,'placement','共同誌への掲載','wait','自動公開・共同誌への追加が休止中、またはnote指定の待機中です。');return;}
+    // First resolve an existing unknown operation. Never re-add it to test.
+    const pending=this.one("SELECT article,target id,label FROM desk_job WHERE kind='mag' AND phase IN ('sent','seen') ORDER BY at LIMIT 1");
+    if(pending){this.testTarget16920(r.token,'mag',{...pending,fresh:false});this.testResult16920(r.token,'placement','共同誌への掲載','unknown','以前の掲載操作が未確認のため、その結果を先に調べます。新しく追加しません。');return;}
+    const waiting=browserWait16916(this.env.BROWSER);
+    if(waiting){this.testResult16920(r.token,'placement','共同誌への掲載','wait',waiting.message+' ／ '+time(waiting.retryAt)+' 以降に再確認できます。');return;}
+    if(typeof this.env.BROWSER?.acquire!=='function'){this.testResult16920(r.token,'placement','共同誌への掲載','error','BROWSERの設定がありません。');return;}
+    await this.handoffJoined16913(now);
+    this.planArchive(Date.now());
+    let chosen;
+    await this.dispatch(Date.now(),false,{capture:value=>{chosen=value;this.testTarget16920(r.token,'mag',value);}});
+    if(!chosen){
+      const gate=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next;
+      const used=this.one('SELECT utc_day,mags FROM desk_delivery WHERE id=1');
+      const reason=this.publicationPriority16916(Date.now())?'予約公開の時間帯です。':gate>Date.now()?'次の追加は '+time(gate)+' 以降です。':
+        used.utc_day===Math.floor(now/D520)&&used.mags>=DISTRIBUTION16918.placements?'本日の掲載枠を使い切っています。':
+        '現在の条件・編集権限・作品の待機時間を満たす掲載対象がありません。';
+      this.testResult16920(r.token,'placement','共同誌への掲載','wait',reason+' 掲載操作は行っていません。');return;
+    }
+    const j=this.one("SELECT phase,message FROM desk_job WHERE kind='mag' AND article=? AND target=?",chosen.article,chosen.id);
+    this.testResult16920(r.token,'placement','共同誌への掲載',j?.phase==='confirmed'?'ok':['sent','seen'].includes(j?.phase)?'unknown':'wait',chosen.title+' → '+chosen.name+' ／ '+(j?.message||'操作は未実行です。'));
+  },
+  async testPlacementProof16920(r){
+    const target=JSON.parse(this.one('SELECT target FROM desk_test16920 WHERE id=1 AND token=?',r.token).target).mag;
+    if(!target){this.testResult16920(r.token,'proof','掲載結果の確認','wait','今回確認する掲載操作がありません。掲載成功は未確認です。');return;}
+    if(!this.pipelineActive16913()){this.testResult16920(r.token,'proof','掲載結果の確認','wait','作品管理の停止・note指定の待機により、結果確認を保留しました。');return;}
+    const pending=this.one("SELECT phase FROM desk_job WHERE kind='mag' AND article=? AND target=?",target.article,target.id);
+    if(!pending || pending.phase==='wait'){this.testResult16920(r.token,'proof','掲載結果の確認','wait','掲載操作が実行されていないため、掲載成功は未確認です。');return;}
+    // Only an exact article × magazine public read may confirm this test.
+    await this.verifyPlacement16913(Date.now(),target);
+    const proof=this.one('SELECT observed FROM desk_ref WHERE article=? AND id=?',target.article,target.id);
+    const j=this.one("SELECT phase,message FROM desk_job WHERE kind='mag' AND article=? AND target=?",target.article,target.id);
+    const v=this.one('SELECT message FROM desk_mag_verify16913 WHERE article=? AND id=?',target.article,target.id);
+    this.testResult16920(r.token,'proof','掲載結果の確認',proof?'ok':'unknown',proof?
+      (target.fresh?'今回の操作後に':'以前の操作について')+'、同じ作品・同じ誌への掲載を公開情報で確認しました。確認日時 '+time(proof.observed)+' ／ 記事 '+target.article+' ／ 誌 '+target.id:
+      (v?.message||j?.message||'掲載状態を読み取れませんでした。')+'。掲載成功とは数えず、通常の結果確認を続けます。');
+  }
+});
+async function productionReaderProbe16920(env,id,seed){
+  return inNoteBrowser(env.BROWSER,cleanCookie(env.NOTE_SESSION),false,async io=>{
+    const {command,evaluate,blocked,blockedResult}=io;
+    await command('Page.navigate',{url:'https://note.com/'+seed.owner+'/n/'+seed.key});
+    let who;
+    for(let i=0;i<6&&!blocked();i++){try{who=await evaluate(noteIdentityJS);if(who?.id)break;}catch{}await pause520(250);}
+    if(blocked())return blockedResult();
+    if(who?.id!==id)return {message:'記事画面で保存済みの本人を確認できません。'};
+    const read=step=>evaluate('('+BROWSER_SOURCES520.readerScreen1697+')('+JSON.stringify(step)+','+JSON.stringify(seed)+')');
+    const poll=async(step,valid)=>{
+      let prev='';
+      for(let i=0;i<12&&!blocked();i++){const value=await read(step),next=JSON.stringify(value);if(valid(value)&&next===prev)return value;prev=next;await pause520(250);}
+      return {state:'loading'};
+    };
+    const ready=await poll('ready',v=>v?.state==='ready');
+    if(blocked())return blockedResult();
+    if(ready.state!=='ready')return {message:'記事画面の読み込みを確認できません。TEST20/article_page'};
+    await evaluate('window.scrollTo(0,document.documentElement.scrollHeight)');
+    await read('openComments');
+    const comments=await poll('comments',v=>v?.state==='ready'&&(v.rows?.length>0||v.empty===true));
+    if(blocked())return blockedResult();
+    // These are read-only native list openers. No like/comment/follow action.
+    await read('openLikers');
+    const readers=await poll('readers',v=>v?.state==='ready'&&v.likesRead===true);
+    if(blocked())return blockedResult();
+    return {identity:true,comments:comments.state==='ready'&&(comments.rows?.length>0||comments.empty===true),commentCount:comments.rows?.length||0,
+      readers:readers.state==='ready'&&readers.likesRead===true,owners:readers.likeOwners||[]};
+  },env.TRACE);
+}
+async function productionTestRoute16920(request,env){
+  if(request.method==='GET')return productionTestPage16920();
+  if(request.method!=='POST')return reply('Method not allowed',false,405);
+  const json=request.headers.get('Accept')?.includes('application/json');
+  const fail=(message,status)=>json?deskJson({error:message},status):productionTestPage16920(null,message,status);
+  if(request.headers.get('Origin')!==new URL(request.url).origin)return fail('操作画面を開き直してください。',403);
+  if(!env.ADMIN_KEY || !env.SCHEDULER)return fail('ADMIN_KEY・SCHEDULERの設定を確認してください。',503);
+  try{
+    const f=new URLSearchParams(await read520body(request,20000));
+    if(f.get('key')!==env.ADMIN_KEY)return fail('管理用の鍵が違います。',403);
+    if(!['run','status'].includes(f.get('action')))return fail('操作を選んでください。',400);
+    const slot=f.get('account')||'1';if(!SLOTS.includes(slot))return fail('アカウントを選んでください。',400);
+    const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:f.get('action')==='run'?'production_test_start':'production_test_status',slot})}));
+    if(!res.ok)return fail('テストの記録に接続できません。処理を開始済みの場合は「結果を確認」で確認してください。',503);
+    const view=await res.json();
+    return json?deskJson(view):productionTestPage16920(view);
+  }catch{return fail('接続・保存を確認できません。「結果を確認」で保存済みの結果を確認してください。',503);}
+}
+function productionTestText16920(v){
+  if(!v?.started)return 'テストの記録はまだありません。';
+  return ['開始 '+time(v.started)+' ／ 読み取り対象：アカウント '+v.slot,
+    v.active?'処理中：'+v.step+'（自動で続けます）':'テスト終了。各項目の結果を確認してください。',
+    ...v.results.map(r=>'【'+r.label+'】'+(TEST_LABELS16920[r.state]||'未確認')+'\n'+r.message+'\n'+time(r.at)),
+    '次の新しいテスト：'+time(v.nextTest)+' 以降'].join('\n\n');
+}
+function productionTestPage16920(view=null,message='',status=200){
+  const nonce=crypto.randomUUID().replaceAll('-','');
+  return new Response(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>今すぐ本番テスト ${VERSION}</title><style>body{font:17px system-ui;max-width:740px;margin:24px auto;padding:0 18px;line-height:1.7}input,select,button{font:inherit;padding:12px;box-sizing:border-box}input,select{width:100%}label{display:block;margin:12px 0}button{margin:8px 6px 8px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}</style>
+<h1>今すぐ本番テスト</h1><p>note-helper ${VERSION}</p><p><a href="/">スキ回り</a> ／ <a href="/520">520 作品管理</a></p>
+<p>追加機能の保存・本人確認・読者一覧を読み取り、520の参加申請または招待確認を最大1誌、公開済み作品の共同誌への追加を最大1件試します。掲載先の公開表示まで確認します。</p>
+<p>実際に参加希望コメント・招待承認・掲載を行う場合があります。無料・募集条件・編集権限を確認し、既存の送信間隔・回数制限・停止設定を守ります。記事の新規公開、スキ送信、フォローはこのテストでは行いません。</p>
+<form method="post" action="/test" id="testform"><label>管理用の鍵（ADMIN_KEY）<input type="password" name="key" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+<label>追加機能の読み取りを試すアカウント<select name="account"><option value="1"${view?.slot==='2'?'':' selected'}>1</option><option value="2"${view?.slot==='2'?' selected':''}>2</option></select></label>
+<button name="action" value="run">今すぐテスト</button><button name="action" value="status">結果を確認</button></form>
+<p id="message" role="status">${esc(message)}</p><pre id="testresult">${esc(productionTestText16920(view))}</pre>
+<p>1回のテストは通常数分です。処理中は結果を自動表示します。画面を閉じても保存された順番で続けます。申請の相手方承認、閲覧数、スキ返しは保証できません。Tutaの受信接続は今回のテスト対象外です。</p>
+<script nonce="${nonce}">(()=>{const f=document.getElementById('testform'),out=document.getElementById('testresult'),msg=document.getElementById('message');let busy=false,timer;
+const tm=n=>n?new Date(n).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}):'未記録';
+const states=${JSON.stringify(TEST_LABELS16920)};
+async function send(action){if(busy)return;busy=true;clearTimeout(timer);try{const data=new URLSearchParams(new FormData(f));data.set('action',action);
+const res=await fetch('/test',{method:'POST',headers:{Accept:'application/json'},body:data});if(!res.headers.get('Content-Type')?.includes('application/json'))throw Error('応答を確認できません。「結果を確認」を押してください。');const s=await res.json();if(!res.ok)throw Error(s.error);
+out.textContent=!s.started?'テストの記録はまだありません。':['開始 '+tm(s.started)+' ／ 読み取り対象：アカウント '+s.slot,s.active?'処理中：'+s.step+'（自動で続けます）':'テスト終了。各項目の結果を確認してください。',...s.results.map(r=>'【'+r.label+'】'+(states[r.state]||'未確認')+'\\n'+r.message+'\\n'+tm(r.at)),'次の新しいテスト：'+tm(s.nextTest)+' 以降'].join('\\n\\n');
+msg.textContent=s.active?'テスト中です。結果は自動で表示します。':'保存された結果を表示しました。';if(s.active)timer=setTimeout(()=>send('status'),4000);
+}catch(e){msg.textContent=e.message||'通信を確認できません。「結果を確認」を押してください。';}finally{busy=false;}}
+f.addEventListener('submit',e=>{e.preventDefault();if(f.reportValidity())send(e.submitter?.value||'status');});})();</script></html>`,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
+    'Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"}});
 }
 
 const BROWSER_SOURCES520 = Object.freeze({
