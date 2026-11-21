@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.16';
+const VERSION = 'v16.9.17';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -72,7 +72,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v16.9.15-ready';
+const READY = 'v16.9.17-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -138,6 +138,7 @@ async function prepare(original) {
   schema.push(...outreachSchema16910.map(q=>db.prepare(q)));
   schema.push(...learningSchema16913.map(q=>db.prepare(q)));
   schema.push(...diagnosticSchema16915.map(q=>db.prepare(q)));
+  schema.push(...auxSchema16917.map(q=>db.prepare(q)));
   schema.push(...boardSchema16912.map(q=>db.prepare(q)));
   await db.batch(schema);
   const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
@@ -156,6 +157,21 @@ async function prepare(original) {
   if (!names.has('v15-authors')) {
     items.push(db.prepare("INSERT INTO nh_v15_authors (author,last_at,slot,token) SELECT author,MAX(last_at),'history','history' FROM nh_v14_authors WHERE NOT EXISTS (SELECT 1 FROM nh_migrations WHERE name='v15-authors') GROUP BY author ON CONFLICT(author) DO UPDATE SET last_at=MAX(nh_v15_authors.last_at,excluded.last_at)"),
       db.prepare("INSERT OR IGNORE INTO nh_migrations VALUES ('v15-authors')"));
+  }
+  // Repair only the exact pre-send internal-failure signatures. Auth/rate,
+  // server holds, active leases, stopped accounts and uncertain writes survive.
+  for(const slot of SLOTS){
+    const env=scoped(original,slot),now=Date.now();
+    items.push(sql(env,`UPDATE nh_control SET next_at=MAX(checked+(SELECT interval_seconds*1000 FROM nh_v15_settings WHERE id=1),?),
+      message='追加探索の内部エラーによる休止を修正・通常巡回の予約待ち'
+      WHERE id=1 AND enabled=1 AND lease<=? AND inflight='' AND next_at>?
+      AND EXISTS(SELECT 1 FROM nh_health WHERE id=1 AND kind='storage')
+      AND EXISTS(SELECT 1 FROM nh_v13_connection WHERE slot=? AND hold_until<=?)
+      AND EXISTS(SELECT 1 FROM nh_v1697_discovery WHERE slot=? AND pending='')
+      AND EXISTS(SELECT 1 FROM nh_v16910_state WHERE slot=? AND pending='')
+      AND message IN (?,?)`,now,now,now,slot,now,slot,slot,
+      '自動再確認待ち：感想・読者の追加探索／接続・保存・内部処理に失敗しました。操作結果を確認できません。',
+      '自動再確認待ち：質問箱・0円参加・掲示板の追加探索／接続・保存・内部処理に失敗しました。操作結果を確認できません。'));
   }
   items.push(sql(original,'INSERT OR IGNORE INTO nh_migrations (name) VALUES (?)',READY));
   await db.batch(items);
@@ -850,8 +866,10 @@ async function run(original,slot) {
   let env = {...baseEnv,TRACE:trace}, stage = 'ログイン確認', activeTag = null, settings;
   let checkingSend = false;
   const bump = (reason,n=1) => { counts[reason]=(counts[reason]||0)+n; };
-  const metrics = () => [...metricItems(env,{...counts,requests:trace.calls}),...learningPersist16913(env)];
+  const metrics = () => metricItems(env,{...counts,requests:trace.calls});
   const finish = async (message,success=false) => {
+    await auxiliaryWrites16917(env,'metrics',()=>learningPersist16913(env));
+    if(trace.auxFault)message+='／追加機能だけ保留（AUX17/'+trace.auxFault.component+'/'+trace.auxFault.reason+'）';
     await env.DB.batch([
       ...metrics(),
       ...statItems(env,activeTag,success ? 'sent' : 'skips'),
@@ -872,14 +890,14 @@ async function run(original,slot) {
       const before=await sql(env,'SELECT status FROM nh_seen WHERE key=?',state.inflight).first();
       const add=liked && before?.status!=='liked';
       const items=[
-        ...learningConfirmed16913(env,state.inflight,liked),
         sql(env,'INSERT INTO nh_seen VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET status=excluded.status',state.inflight,liked?'liked':'uncertain',Date.now()),
         sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=?",+add,token),
         sql(env,"UPDATE nh_v1697_discovery SET readers=readers+?,reader_pending='',message=? WHERE slot=? AND reader_pending=?",+add,liked?'前回の読者経由の記事スキを確認':'前回の読者経由の記事は再送せず除外',slot,state.inflight)
       ];
       if (add) { items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,state.inflight,day(),Date.now())); bump('recovered'); }
       await env.DB.batch(items);
-      await finish(liked?'前回の記事のスキを確認しました。次回から候補を確認します':'前回の記事は再送せず除外しました');
+      await auxiliaryWrites16917(env,'confirmed',()=>learningConfirmed16913(env,state.inflight,liked));
+      await finish(liked?'前回の記事のスキを確認しました。次回から候補を確認します':'前回の記事は再送せず除外しました',liked);
       return true;
     }
     const tags=orderFor(settings.tags,slot);
@@ -890,13 +908,15 @@ async function run(original,slot) {
     ]);
     const ownIds=new Set([state.account,otherRows.results[0].account].filter(Boolean));
     stage='質問箱・0円参加・掲示板の追加探索';
-    const extra=await outreachOpportunity16910(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
+    const extra=await auxiliary16917(env,token,'outreach',()=>checkingSend,()=>outreachOpportunity16910(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump));
     if(extra?.handled){await finish(extra.message,extra.success);return true;}
     stage='感想・読者の追加探索';
-    const opportunity=await readerOpportunity1697(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump);
+    const opportunity=await auxiliary16917(env,token,'readers',()=>checkingSend,()=>readerOpportunity1697(env,state,settings,token,ownIds,()=>{checkingSend=true;},bump));
     if(opportunity?.handled){await finish(opportunity.message,opportunity.success);return true;}
-    const choice=await learningChoice16913(env,settings,token);
-    const readerNotes=['tag','explore_tag'].includes(choice.mode)?null:await queuedReader1699(env,state,settings,token,ownIds,bump,choice.origin||null);
+    stage='巡回先の選択';
+    const choice=await auxiliary16917(env,token,'selection',()=>checkingSend,()=>learningChoice16913(env,settings,token),{mode:'normal'});
+    stage='保存した読者の記事確認';
+    const readerNotes=['tag','explore_tag'].includes(choice.mode)?null:await auxiliary16917(env,token,'queue',()=>checkingSend,()=>queuedReader1699(env,state,settings,token,ownIds,bump,choice.origin||null));
     const started=Date.now();
     const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
     let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
@@ -913,7 +933,7 @@ async function run(original,slot) {
       if(tag)await env.DB.batch(statItems(env,tag,'checks'));
       const data=fromReader?{notes:readerNotes}:await api(env,'/api/v3/hashtags/'+encodeURIComponent(tag)+'/notes?order=new&page=1');
       if (!Array.isArray(data.notes)) throw new Trouble('記事一覧の形式を確認できません','response');
-      if(!fromReader)await saveSeed1697(env,data.notes,tag,ownIds,cursor);
+      if(!fromReader)await auxiliary16917(env,token,'seed',()=>checkingSend,()=>saveSeed1697(env,data.notes,tag,ownIds,cursor));
       const notes=new Map(data.notes.filter(n=>typeof n?.key==='string' && /^n[a-z0-9]+$/.test(n.key)).map(n=>[n.key,n]));
       const keys=[...notes.keys()].slice(0,50);
       let candidates=[];
@@ -967,22 +987,25 @@ async function run(original,slot) {
           sql(env,"INSERT OR IGNORE INTO nh_seen (key,status,created) SELECT ?,'pending',? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)",key,now,key,token),
           sql(env,'UPDATE nh_control SET inflight=?,lease=? WHERE id=1 AND token=? AND enabled=1 AND lease>? AND EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?)',key,now+LEASE,token,now,key,token),
           sql(env,'INSERT INTO nh_v14_authors (slot,author,last_at,token) SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM nh_shared WHERE key=? AND token=?) ON CONFLICT(slot,author) DO UPDATE SET last_at=excluded.last_at,token=excluded.token',slot,author,now,token,key,token),
-          ...learningReserve16913(env,key,note,learningSource16913(tag,env.TRACE?.readerOrigin),token),
           ...(fromReader?[sql(env,'UPDATE nh_v1697_discovery SET reader_pending=? WHERE slot=? AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=? AND inflight=?)',key,slot,token,key)]:[])
         ]);
         if (!reserved[0].meta.changes || !reserved[1].meta.changes || !reserved[3].meta.changes) { bump('reserved'); continue; }
         checkingSend=true;
+        await auxiliaryWrites16917(env,'contact',()=>learningReserve16913(env,key,note,learningSource16913(tag,env.TRACE?.readerOrigin),token));
+        // A diagnostic/learning write may have awaited D1. Check the lease and
+        // stop/server hold once more immediately before the actual POST.
+        if(!await liveDiscovery1697(env,token))throw new Trouble('停止・待機・処理期限のため送信を保留。再送せず確認します');
         stage='スキ送信';
         await api(env,'/api/v3/notes/'+key+'/likes',true,referer);
         stage='送信後の確認';
         if ((await article(env,key))?.is_liked!==true) throw new Trouble('送信結果は未確認。再送せず次回に確認します');
         await env.DB.batch([
-          ...learningConfirmed16913(env,key,true),
           sql(env,"UPDATE nh_seen SET status='liked' WHERE key=?",key),
           sql(env,"UPDATE nh_control SET inflight='',total=total+1 WHERE id=1 AND token=?",token),
           sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now()),
           ...(fromReader?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
         ]);
+        await auxiliaryWrites16917(env,'confirmed',()=>learningConfirmed16913(env,key,true));
         bump('sent');if(fromReader)bump('reader_sent');
         await finish('スキ確認済み：'+key+(fromReader?'（文芸・自分の作品の読者経由）':'（#'+tag+'）')+'／詳細確認 '+details+'記事',true);
         return true;
@@ -1009,8 +1032,9 @@ async function run(original,slot) {
     const h=await sql(env,'SELECT * FROM nh_health WHERE id=1').first();
     const errors=Number(h.errors)+1, rates=Number(h.rate_fail)+(kind==='rate'?1:0);
     const serverWait=error instanceof Trouble?error.retry:0;
-    const wait=Math.max(retryRead ? settings.interval_seconds*1000 : 2*HOUR,serverWait);
-    const message=(retryRead ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error);
+    const wait=Math.max(retryRead ? (settings?.interval_seconds*1000 || INTERVAL) : 2*HOUR,serverWait);
+    const message=(retryRead ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error)+
+      (!(error instanceof Trouble)?'（RUN17/'+auxReason16917(error)+'）':'');
     bump('errors');
     await env.DB.batch([
       ...metrics(), ...statItems(env,activeTag,'errors'),
@@ -1058,6 +1082,7 @@ async function dashboard(original, settings, prefix = '') {
   if (!schedule.runtime.heartbeat) warnings.push('v15の予約処理はまだ記録されていません。状態確認後、数分たってから再確認してください。');
   blocks.push('【動作設定】\nタグ：'+settings.tags.length+'個\n各アカウント：'+settings.interval_seconds+'秒以上の間隔\n同じ作者：2垢共通で'+settings.author_hours+'時間\n2垢ON時の処理開始間隔：'+settings.interval_seconds/2+'秒以上\n探索上限：'+settings.scan_tags+'タグ・記事詳細'+settings.scan_notes+'件\n候補なしのタグ：'+settings.empty_minutes+'分待ち\n予約処理の最終確認：'+time(schedule.runtime.heartbeat)+'\n次の予約予定：'+time(schedule.runtime.alarm_at)+(warnings.length?'\n\n【確認事項】\n'+warnings.join('\n'):''));
   blocks.push('Telegram通知：' + (original.TELEGRAM_BOT_TOKEN && telegram.paired ? '連携済み' : '未設定') + '\n' + telegram.message + '\n最終通知成功：' + time(telegram.last_sent)+'\n通知対象はログイン・アクセス拒否・暗号化設定の問題。429の回数制限は通知せず休止します。');
+  blocks.push(await auxRecord16917(original));
   for (const [i,s] of schedule.states.entries()) {
     const h = summary[4+i].results[0], slot=s.slot, now=Date.now(), next=s.eligible;
     const verified = h.ok === 1 && h.connection_checked >= s.checked;
@@ -6769,7 +6794,7 @@ async function learningChoice16913(env,settings,token) {
   const state=env.TRACE?.learning;
   if(!state)return {mode:'normal'};
   state.used=true;
-  const plan=JSON.parse(state.plan);
+  const plan=learningPlan16917(state.plan);
   const winner=plan.find(r=>r.sent>=10 && r.responded>=2 && (r.source.startsWith('tag:')?settings.tags.includes(r.source.slice(4)):['reader:returning','reader:literary'].includes(r.source)));
   if(!winner)return {mode:'normal'};
   // 1 in 4 slots is ordinary exploration. Its independent original cursor
@@ -6779,20 +6804,39 @@ async function learningChoice16913(env,settings,token) {
 }
 async function runSnapshot16913(env) {
   const now=Date.now();
-  // One existing D1 round trip also reads the small cached policy. Aggregation
-  // runs at most hourly; normal execution never scans the contacts history.
-  const [setting,control,learning,scores]=await env.DB.batch([
+  const core=()=>[
     sql(env,'SELECT a.tags,a.author_hours,b.interval_seconds,b.scan_tags,b.scan_notes,b.empty_minutes FROM nh_v14_settings a JOIN nh_v15_settings b ON b.id=a.id WHERE a.id=1'),
-    sql(env,'SELECT * FROM nh_control WHERE id=1'),
-    sql(env,'SELECT * FROM nh_v16913_learning WHERE slot=?',env.SLOT),
-    sql(env,`SELECT source,SUM(sent) sent,SUM(responded) responded FROM nh_v16913_scores
-      WHERE slot=? AND day>=? AND EXISTS(SELECT 1 FROM nh_v16913_learning WHERE slot=? AND due<=?) GROUP BY source`,env.SLOT,day(27),env.SLOT,now)
-  ]);
-  const row=setting.results[0],tags=JSON.parse(row.tags);
+    sql(env,'SELECT * FROM nh_control WHERE id=1')
+  ];
+  let results;
+  try {
+    // Four bounded queries as before. Learning and its gate share one point read.
+    results=await env.DB.batch([...core(),
+      sql(env,`SELECT l.*,COALESCE(a.due,0) aux_due FROM nh_v16913_learning l LEFT JOIN nh_v16917_aux a ON a.slot=l.slot WHERE l.slot=?`,env.SLOT),
+      sql(env,`SELECT source,SUM(sent) sent,SUM(responded) responded FROM nh_v16913_scores
+        WHERE slot=? AND day>=? AND EXISTS(SELECT 1 FROM nh_v16913_learning WHERE slot=? AND due<=?)
+        AND NOT EXISTS(SELECT 1 FROM nh_v16917_aux WHERE slot=? AND due>?) GROUP BY source`,env.SLOT,day(27),env.SLOT,now,env.SLOT,now)
+    ]);
+  }catch(error){
+    if(auxFatal16917(error))throw error;
+    // Core settings/identity still have to be read successfully. Never guess.
+    results=await env.DB.batch(core());
+    await auxFault16917(env,'snapshot',error);
+  }
+  const row=results[0].results[0],tags=JSON.parse(row.tags);
   if(!Array.isArray(tags)||!tags.length)throw new Trouble('タグ設定を確認してください','config');
-  const state=learning.results[0];
-  env.TRACE.learning={...state,refresh:state.due<=now,plan:state.due<=now?JSON.stringify(rankLearning16913(scores.results)):state.plan};
-  return {settings:{...row,tags},state:control.results[0]};
+  if(results.length===4){
+    try {
+      const state=results[2].results[0];
+      if(!state)throw new TypeError('missing learning row');
+      env.TRACE.auxUntil=Number(state.aux_due)||0;
+      if(env.TRACE.auxUntil>now)return {settings:{...row,tags},state:results[1].results[0]};
+      const plan=state.due<=now?rankLearning16913(results[3].results):learningPlan16917(state.plan);
+      learningPlan16917(plan);
+      env.TRACE.learning={...state,refresh:state.due<=now,plan:JSON.stringify(plan)};
+    }catch(error){await auxFault16917(env,'snapshot',error);}
+  }
+  return {settings:{...row,tags},state:results[1].results[0]};
 }
 function learningPersist16913(env) {
   const state=env.TRACE?.learning;
@@ -6809,7 +6853,8 @@ function learningPersist16913(env) {
 async function learningRecord16913(env,settings) {
   const rows=await sql(env,'SELECT * FROM nh_v16913_learning ORDER BY slot').all();
   return '【反応に応じた巡回先の調整】\n'+rows.results.map(r=>{
-    const plan=JSON.parse(r.plan),learned=plan.some(p=>p.sent>=10&&p.responded>=2 &&
+    let plan;try{plan=learningPlan16917(r.plan);}catch{plan=[];}
+    const learned=plan.some(p=>p.sent>=10&&p.responded>=2 &&
       (p.source.startsWith('tag:')?settings.tags.includes(p.source.slice(4)):['reader:returning','reader:literary'].includes(p.source)));
     return 'アカウント '+r.slot+'：'+(learned?'観測できた反応をもとに優先・4回に1回は通常探索':'比較用の記録を収集中・通常探索')+
       '\n自分の記事の読者を最後に確認：'+time(r.observed)+'\n'+plan.slice(0,8).map(p=>
@@ -7194,6 +7239,88 @@ Object.assign(Desk520.prototype,{
     return row?.at||null;
   }
 });
+
+// Optional discovery and learning cannot veto a proven ordinary article like.
+// The only persistent gate has two primary-key rows. Never store exception text.
+const auxSchema16917=[
+  `CREATE TABLE IF NOT EXISTS nh_v16917_aux(slot TEXT PRIMARY KEY,due INTEGER NOT NULL DEFAULT 0,failed_at INTEGER NOT NULL DEFAULT 0,component TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '')`,
+  `INSERT OR IGNORE INTO nh_v16917_aux(slot) VALUES('1'),('2')`
+];
+const AUX_COMPONENTS16917={snapshot:'巡回先の学習データ',outreach:'質問箱・参加・掲示板',readers:'感想・読者の探索',selection:'巡回先の選択',queue:'保存した読者の確認',seed:'追加探索の候補保存',contact:'反応比較用の送信記録',confirmed:'反応比較用の成功記録',metrics:'巡回先の学習記録'};
+function auxReason16917(error){
+  if(error instanceof TypeError)return 'type';
+  if(error instanceof SyntaxError)return 'format';
+  if(/D1_ERROR|D1_EXEC_ERROR|D1_TYPE_ERROR/i.test(errorText(error)))return 'storage';
+  if(error instanceof Trouble)return error.kind==='network'?'network':error.kind==='response'?'response':'internal';
+  return 'internal';
+}
+function auxFatal16917(error){
+  return readLimit(error) || error instanceof Trouble &&
+    (error.retry>0 || [401,403,429].includes(error.code) || ['auth','rate','config','mismatch'].includes(error.kind));
+}
+async function auxFault16917(env,component,error){
+  const trace=env.TRACE;
+  if(!trace || trace.auxFault)return;
+  component=Object.hasOwn(AUX_COMPONENTS16917,component)?component:'snapshot';
+  const fault={component,reason:auxReason16917(error),due:Date.now()+2*HOUR};
+  trace.auxFault=fault;trace.auxUntil=fault.due;trace.learning=null;
+  try {
+    await sql(env,'UPDATE nh_v16917_aux SET due=MAX(due,?),failed_at=?,component=?,reason=? WHERE slot=?',fault.due,Date.now(),component,fault.reason,env.SLOT).run();
+    if(['snapshot','selection'].includes(component))await sql(env,'UPDATE nh_v16913_learning SET due=? WHERE slot=?',fault.due,env.SLOT).run();
+  }catch(storageError){
+    if(readLimit(storageError))throw storageError;
+    // Failure to record diagnostics must not turn a read-only feature into a
+    // veto. The core action/lease ledgers are independently required below.
+    console.warn('note-helper: optional diagnostics unavailable');
+  }
+}
+async function auxSafety16917(env,token){
+  const row=await sql(env,`SELECT c.enabled,c.token,c.lease,c.inflight,n.hold_until,
+    d.slot discovery_slot,d.pending comment_pending,o.slot outreach_slot,o.pending outreach_pending
+    FROM nh_control c JOIN nh_v13_connection n ON n.slot=?
+    LEFT JOIN nh_v1697_discovery d ON d.slot=n.slot LEFT JOIN nh_v16910_state o ON o.slot=n.slot WHERE c.id=1`,env.SLOT).first();
+  if(!row || row.discovery_slot!==env.SLOT || row.outreach_slot!==env.SLOT)
+    throw new Trouble('追加操作の確認記録を読み出せません','config');
+  return {live:row.enabled===1 && row.token===token && row.lease>Date.now() && row.hold_until<=Date.now(),
+    pending:!!(row.inflight||row.comment_pending||row.outreach_pending)};
+}
+async function auxiliary16917(env,token,component,isSending,work,fallback=null){
+  if(env.TRACE?.auxUntil>Date.now()){
+    const safe=await auxSafety16917(env,token);
+    if(safe.live && !safe.pending && !isSending())return fallback;
+  }
+  try {return await work();}
+  catch(error){
+    if(auxFatal16917(error)||isSending())throw error;
+    // A batch may have committed before its response was lost. Read the
+    // authoritative ledgers again; any uncertainty blocks a second action.
+    const safe=await auxSafety16917(env,token);
+    if(!safe.live||safe.pending)throw error;
+    await auxFault16917(env,component,error);
+    return fallback;
+  }
+}
+async function auxiliaryWrites16917(env,component,make){
+  if(env.TRACE?.auxUntil>Date.now())return;
+  try {const items=make();if(items.length)await env.DB.batch(items);}
+  catch(error){if(auxFatal16917(error))throw error;await auxFault16917(env,component,error);}
+}
+function learningPlan16917(value){
+  const rows=typeof value==='string'?JSON.parse(value):value;
+  if(!Array.isArray(rows) || rows.some(r=>!r || typeof r.source!=='string' || r.source.length>120 ||
+    !Number.isSafeInteger(r.sent)||r.sent<0 || !Number.isSafeInteger(r.responded)||r.responded<0))
+    throw new TypeError('invalid cached learning plan');
+  return rows;
+}
+async function auxRecord16917(env){
+  const rows=await sql(env,'SELECT * FROM nh_v16917_aux ORDER BY slot').all();
+  const reasons={type:'読み取ったデータの型',format:'保存データの形式',storage:'補助データの読み書き',network:'追加読み取りの通信',response:'追加読み取りの応答',internal:'追加機能の内部処理'};
+  return '【追加機能と通常巡回の状態】\n'+rows.results.map(r=>
+    'アカウント '+r.slot+'：'+(!r.failed_at?'追加機能の内部エラー記録なし':
+      (r.due>Date.now()?'追加機能だけ再確認待ち':'追加機能の再確認時刻に到達')+'／'+(AUX_COMPONENTS16917[r.component]||'追加機能')+'／'+(reasons[r.reason]||'内部処理')+
+      '\n確認コード：AUX17/'+r.component+'/'+r.reason+'／最終記録 '+time(r.failed_at)+'／再確認 '+time(r.due))
+  ).join('\n\n')+'\n通常の記事巡回は各アカウントの状態欄で確認してください。ログイン拒否・回数制限・note指定の待機・送信結果不明は引き続き共通で待機します。';
+}
 
 // One browser admission record per scheduler. No credentials or provider error
 // text are persisted. Cloudflare capacity waits never become note Retry-After.
