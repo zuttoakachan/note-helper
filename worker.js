@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.22';
+const VERSION = 'v16.9.23';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -29,6 +29,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1><p><a href="/test">今すぐ本番テスト・結果を見る</a></p><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
 <p>創作記事の感想コメントへのスキと、創作記事に反応した読者の公開記事を自動で探索します。追加探索は30分以上空け、各アカウント1日12回まで。送信枠と同じ人への待機を記事巡回と共有します。成功件数と確認待ちは状態欄に表示します。</p>
+<p>同じ読者が別の自作にもスキした記録を巡回先の比較に使います。対応した企画は条件を確認して自動応募し、公開結果まで確認します。詳細は「520の作品管理・記録」で確認できます。</p>
 <p>公開作品の内容が近い別作者の作品を最大10本比較し、3作品以上に共通して反応した読者と、継続して他者の作品を紹介する作者を優先します。材料が足りない間は従来の巡回を続けます。比較状況は「520の作品管理・記録」に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
@@ -2249,7 +2250,7 @@ class Desk520 {
     this.initRuntime16916();
     this.initDistribution16918();
     this.initProductionTest16920();
-    this.networkTry16922(()=>this.initNetwork16922());
+    this.networkTry16922(()=>{this.initNetwork16922();this.initRepeat16923();this.initContest16923();});
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2542,7 +2543,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3675,6 +3676,7 @@ class Desk520 {
     await task('公開後の本文・見出し画像',()=>this.verifyLinkCover(Date.now()));
     await task('下書きタイトル',()=>this.lookupDraftTitle(Date.now()));
     await task('下書き一覧',()=>this.resolveDraftDirectory(Date.now()));
+    if(!publication)await task('企画への自動応募',()=>this.contestTick16923(Date.now()));
     if(!publication)await task('作品と読者の比較情報',()=>this.networkTick16922(Date.now()));
     await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
     if(!publication)await task('参加先の募集確認',()=>this.expandJoin520(Date.now()));
@@ -4064,6 +4066,8 @@ function deskRecordText(s) {
     if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
   }
   if(s.audience)lines.push(networkRecord16922(s.audience));
+  if(s.repeat)lines.push(repeatRecord16923(s.repeat));
+  if(s.contests)lines.push(contestRecord16923(s.contests));
   if(s.pipeline)lines.push(pipelineRecord16913(s.pipeline));
   if(s.traffic)lines.push(trafficRecord16913(s.traffic));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
@@ -6820,6 +6824,7 @@ async function learningObserve16913(env,owners,article,identity) {
   if(!names.length)return;
   const matches=await sql(env,`SELECT * FROM nh_v16913_contacts WHERE slot=? AND owner IN (${names.map(()=>'?').join(',')})
     AND account=? AND status='confirmed' AND confirmed<? AND confirmed>=? ORDER BY confirmed DESC,key LIMIT 100`,env.SLOT,...names,identity.id,pub,pub-14*D520).all();
+  networkCall16922(env,'repeat',matches.results,article);
   const seen=new Set();
   for(const contact of matches.results){
     if(seen.has(contact.owner))continue;
@@ -6843,7 +6848,7 @@ async function learningChoice16913(env,settings,token) {
   const state=env.TRACE?.learning;
   if(!state)return {mode:'normal'};
   state.used=true;
-  const plan=learningPlan16917(state.plan);
+  const plan=repeatRank16923(learningPlan16917(state.plan),networkCall16922(env,'repeatCounts')||[]);
   const winner=plan.find(r=>r.sent>=10 && r.responded>=2 && (r.source.startsWith('tag:')?settings.tags.includes(r.source.slice(4)):['reader:returning','reader:literary','reader:overlap','reader:curator'].includes(r.source)));
   if(!winner)return {mode:'normal'};
   // 1 in 4 slots is ordinary exploration. Its independent original cursor
@@ -8328,6 +8333,8 @@ Object.assign(Desk520.prototype,{
     const desk=this,bridge={call(method,slot,identity,...args){return desk.networkTry16922(()=>{
       if(desk.one('SELECT fault_until FROM desk_network16922 WHERE id=1').fault_until>Date.now())return null;
       const row=desk.networkIdentity16922(slot,identity);if(!row)return null;
+      if(method==='repeat')return desk.repeatObserve16923(slot,identity,...args);
+      if(method==='repeatCounts')return desk.repeatCounts16923(slot,identity);
       if(method==='corpus')return desk.networkCorpus16922(slot,identity,...args);
       if(method==='seed')return desk.networkSeeds16922(slot,identity,...args);
       if(method==='note'){if(args[0]?.user?.urlname===identity.owner)desk.networkCorpus16922(slot,identity,[args[0]],true);else desk.networkWork16922(args[0],true);return null;}
@@ -8471,7 +8478,451 @@ function networkRecord16922(v){
     '\n比較候補・掲載先の選択は送信や掲載の成功ではありません。公開一覧の一部を比較しており、新規訪問・読了・掲載による効果は未確認です。資料が足りない場合は従来の巡回と掲載先選択を継続します。';
 }
 
+// Repeat reactions are observed public likes on distinct, later-published own
+// works. They do not measure reading, traffic attribution or causal conversion.
+Object.assign(Desk520.prototype,{
+  initRepeat16923(){
+    if(this.repeatReady16923)return;
+    this.rows(`CREATE TABLE IF NOT EXISTS desk_repeat16923(
+      slot TEXT NOT NULL,account TEXT NOT NULL,reader TEXT NOT NULL,source TEXT NOT NULL,
+      contact TEXT NOT NULL,confirmed INTEGER NOT NULL,works TEXT NOT NULL,seen INTEGER NOT NULL,
+      PRIMARY KEY(slot,account,reader))`);
+    this.rows('CREATE INDEX IF NOT EXISTS desk_repeat_age16923 ON desk_repeat16923(seen)');
+    this.repeatReady16923=true;
+  },
+  repeatObserve16923(slot,identity,contacts,article){
+    this.initRepeat16923();
+    const now=Date.now(),pub=Date.parse(article?.publishAt||article?.publish_at||article?.publishedAt);
+    if(!SLOTS.includes(slot)||!identity?.id||!networkOwner16922(identity.owner)||
+      article?.user?.urlname!==identity.owner||String(article.user?.id)!==identity.id||article.status!=='published'||
+      !/^n[a-z0-9]{1,64}$/.test(article.key||'')||!Number.isFinite(pub)||pub>now||pub<=now-14*D520)return;
+    const seen=new Set();
+    this.storage.transactionSync(()=>{
+      this.rows('DELETE FROM desk_repeat16923 WHERE seen<?',now-45*D520);
+      for(const c of contacts.slice(0,100)){
+        if(seen.size>=20)break;
+        if(c.slot!==slot||c.account!==identity.id||c.status!=='confirmed'||c.confirmed>=pub||c.confirmed<pub-14*D520||
+          !networkOwner16922(c.owner)||c.owner===identity.owner||seen.has(c.owner)||typeof c.source!=='string'||c.source.length>120)continue;
+        seen.add(c.owner);
+        let old=this.one('SELECT * FROM desk_repeat16923 WHERE slot=? AND account=? AND reader=?',slot,identity.id,c.owner);
+        // Keep the first observed contact/source for the entire cohort window;
+        // another outgoing like must not steal credit for the same returning reader.
+        if(old && old.confirmed<now-28*D520){this.rows('DELETE FROM desk_repeat16923 WHERE slot=? AND account=? AND reader=?',slot,identity.id,c.owner);old=null;}
+        if(old && (pub<=old.confirmed||pub>old.confirmed+14*D520))continue;
+        if(!old && this.one('SELECT COUNT(*) n FROM desk_repeat16923').n>=2048)continue;
+        const works=networkJSON16922(old?.works||'[]').filter(w=>w.pub>(old?.confirmed||c.confirmed));
+        if(!works.some(w=>w.key===article.key))works.push({key:article.key,pub});
+        const value=JSON.stringify(works.sort((a,b)=>a.pub-b.pub||a.key.localeCompare(b.key)).slice(0,12));
+        this.rows(`INSERT INTO desk_repeat16923(slot,account,reader,source,contact,confirmed,works,seen) VALUES(?,?,?,?,?,?,?,?)
+          ON CONFLICT(slot,account,reader) DO UPDATE SET works=excluded.works,seen=excluded.seen`,
+          slot,identity.id,c.owner,old?.source||c.source,old?.contact||c.key,old?.confirmed||c.confirmed,value,now);
+      }
+    });
+  },
+  repeatCounts16923(slot,identity){
+    this.initRepeat16923();
+    if(!identity?.id)return [];
+    const out=new Map();
+    for(const r of this.rows('SELECT source,works FROM desk_repeat16923 WHERE slot=? AND account=? AND confirmed>=?',slot,identity.id,Date.now()-28*D520)){
+      const works=networkJSON16922(r.works),distinct=new Set(works.map(w=>w.key));
+      const n=out.get(r.source)||{source:r.source,observed:0,repeat:0};
+      if(distinct.size)n.observed++;
+      if(distinct.size>=2)n.repeat++;
+      out.set(r.source,n);
+    }
+    return [...out.values()].sort((a,b)=>b.repeat-a.repeat||b.observed-a.observed||a.source.localeCompare(b.source));
+  },
+  repeatView16923(){
+    return this.networkTry16922(()=>{
+      this.initRepeat16923();
+      return this.rows('SELECT slot,account,owner FROM desk_audience16922').map(r=>({slot:r.slot,
+        rows:this.repeatCounts16923(r.slot,{id:r.account,owner:r.owner})}));
+    },[]);
+  }
+});
+function repeatRank16923(plan,counts){
+  const stats=new Map((counts||[]).map(x=>[x.source,x]));
+  return plan.map(p=>({...p,repeat:Math.min(p.sent,stats.get(p.source)?.repeat||0)}))
+    .sort((a,b)=>{
+      const eligible=r=>r.sent>=10&&r.responded>=2&&r.repeat>=2;
+      return +eligible(b)-+eligible(a)||(eligible(a)&&eligible(b)?(b.repeat+1)/(b.sent+20)-(a.repeat+1)/(a.sent+20):0)||
+        (b.responded+1)/(b.sent+20)-(a.responded+1)/(a.sent+20)||a.source.localeCompare(b.source);
+    });
+}
+function repeatRecord16923(accounts){
+  return '【別の自作にも反応した読者】\n'+(accounts||[]).map(a=>'アカウント '+a.slot+'：'+
+    (a.rows.length?a.rows.slice(0,8).map(r=>r.source+' ／ 後日公開した1作以上にスキ '+r.observed+'人、2作以上にスキ '+r.repeat+'人').join('\n'):'観測記録を収集中')).join('\n')+
+    '\n送信を確認した後、14日以内に公開した別々の自作への公開スキを比較します。1経路10送信・2人以上の複数作への反応で優先。4回に1回は従来の探索を維持。読了・再訪・送信の効果を断定するものではありません。';
+}
+
+// Opportunities use a durable read/validate/write/verify pipeline. A discovered
+// announcement is never permission to enter. Unknown rules stay out of writes.
+const CONTEST16923={pages:12,entries:2,gap:30*M520,writeGap:2*HOUR,maxRules:64,maxEntries:256,
+  seed:{owner:'kakitsubataayame',id:'n9b601ce1183b',url:'https://note.com/kakitsubataayame/n/n9b601ce1183b'}};
+function contestOwner16923(s){return typeof s==='string'&&/^[\w-]{1,80}$/.test(s)&&!['api','settings','search','hashtag','tag'].includes(s);}
+function contestTags16923(n){
+  if(!Array.isArray(n?.hashtags)||n.hashtags.length>30)return null;
+  const names=n.hashtags.map(t=>typeof t==='string'?t:t?.hashtag?.name??t?.name);
+  if(names.some(t=>typeof t!=='string'||!t.trim()||t.length>120))return null;
+  return [...new Set(names.map(t=>t.replace(/^#/,'').trim()))].sort();
+}
+function contestRule16923(n,now=Date.now()){
+  const hold=reason=>({ok:false,reason});
+  if(n?.status!=='published'||typeof n.body!=='string'||n.body.length>250000||n.is_limited===true||n.is_paid===true||n.isLimited===true||n.isPaid===true||n.hasPaywall===true||n.isPreview===true||Number(n.price)>0)return hold('募集本文の全体を確認待ち');
+  // This organizer's reviewed exception expressly permits a missing title/body
+  // hashtag when the work appears in the hashtag listing. Other contests must
+  // not inherit that exception. Past publication permission is NOT inferred.
+  if(n.key!==CONTEST16923.seed.id||n.user?.urlname!==CONTEST16923.seed.owner)return hold('募集条件・応募方法を自動で確定できないため見送り');
+  const text=words161(n.body).normalize('NFKC').replace(/\s+/g,'');
+  const required=['■お題■『2』','■参加資格■共同運営マガジンnote文芸部のメンバーであること',
+    'お一人さま2作品まで','1作品1万字まで','無料記事限定','当マガジン投稿可能ジャンル全て',
+    '2026年11月21日(土)13:00','2026年12月20日(日)23:59',
+    'どこかに記載漏れがあっても、下記のハッシュタグ検索一覧に記事が反映されさえすればOKです',
+    '#note文芸部年末コンテスト2026'];
+  if(required.some(t=>!text.includes(t)))return hold('既知の募集条件が変更・未確認のため見送り');
+  const section=label=>text.match(new RegExp('■'+label+'■([^■]*)'))?.[1].replace(/[・●]/g,'');
+  if(section('参加資格')!=='共同運営マガジンnote文芸部のメンバーであること'||
+    section('投稿について')!=='お一人さま2作品まで1作品1万字まで無料記事限定過度なアフィリエイト等はご遠慮ください'||
+    section('投稿ジャンル')!=='当マガジン投稿可能ジャンル全て')return hold('応募資格・投稿条件の本文が対応した要項と一致しません');
+  const extra=/(?:年齢|国籍|居住|年生|歳以上|歳以下|職業限定|個人情報|住所|電話番号|要項を追記|条件を追記|変更しました|追加要件|生成AI|AI生成|AI補助|人工知能|未発表|未公開|初出|二重応募|重複応募|併願|商業化|受賞歴|受賞済|著作権.{0,12}譲渡|同意書|応募フォーム|専用フォーム|DMで|メールで|[1-9][0-9]*円|参加費|有料会員|追加条件|条件変更|募集終了|中止|延期|訂正|改定)/i;
+  if(extra.test(text))return hold('追加の応募条件・変更があるため自動応募を保留');
+  const start=Date.parse('2026-11-21T13:00:00+09:00'),end=Date.parse('2026-12-20T23:59:00+09:00')+60000;
+  if(now<start||now>=end)return hold(now<start?'募集開始前':'募集期間終了');
+  return {ok:true,kind:'community-tag',title:'note文芸部年末コンテスト2026',tag:'note文芸部年末コンテスト2026',
+    member:'m32620a9cd50d',start,end,max:2,chars:10000,previous:false,theme:'2',
+    reason:'公開要項の例外によりタグ欄で参加可能。募集開始後に公開した作品のみ照合。制作方法の限定記載なし（AIの明示許諾ではありません）'};
+}
+async function contestSnapshot16923(n,account){
+  if(n?.status!=='published'||n.user?.urlname!=='43__'||String(n.user?.id)!==account||!/^n[a-z0-9]{1,64}$/.test(n.key||'')||
+    typeof n.name!=='string'||!n.name.trim()||n.name.trim()==='521'||typeof n.body!=='string'||n.body.length>250000||
+    n.is_limited===true||n.isLimited===true||n.is_paid===true||n.isPaid===true||n.price!==0||n.hasPaywall===true||n.isPreview===true||n.hasAvailableCirclePlans===true||!Object.hasOwn(n,'eyecatch'))return null;
+  const tags=contestTags16923(n),hash=await draftBodyHash(n.body),cover=coverId(n.eyecatch),pub=Date.parse(n.publishAt||n.publish_at||n.publishedAt);
+  if(!tags||!hash||cover===null||!Number.isFinite(pub)||pub>Date.now())return null;
+  return {key:n.key,title:n.name,hash,cover,tags,pub,account};
+}
+function contestFits16923(n,p){
+  const pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt),chars=publishedChars162(n);
+  if(!p?.ok||!Number.isFinite(pub)||pub<p.start||pub>=p.end||chars===null||chars>p.chars||chars<1)return false;
+  if(/(?:amzn\.to|amazon\.[^\s"<>]+[?&]tag=|a\.r10\.to|hb\.afl\.rakuten|[?&](?:affiliate|aff_id|a8mat)=)/i.test(n.body))return false;
+  // This is a conservative literal topic match, not a claim about literary merit.
+  return /(?:2人|二人|ふたり|2つ|二つ|ふたつ|2度|二度|2年|二年)/.test(words161(n.body));
+}
+function contestSame16923(a,b,tag,added=false){
+  if(!a||!b||a.key!==b.key||a.account!==b.account||a.title!==b.title||a.hash!==b.hash||a.cover!==b.cover||a.pub!==b.pub)return false;
+  const want=[...new Set([...a.tags,...(added?[tag]:[])])].sort();
+  return JSON.stringify(want)===JSON.stringify(b.tags);
+}
+Object.assign(Desk520.prototype,{
+  initContest16923(){
+    if(this.contestReady16923)return;
+    if(!this.one("SELECT 1 FROM sqlite_master WHERE name='desk_contest16923'"))this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_contest16923(id INTEGER PRIMARY KEY,day TEXT DEFAULT '',used INTEGER DEFAULT 0,writes INTEGER DEFAULT 0,due INTEGER DEFAULT 0,next_write INTEGER DEFAULT 0,scout INTEGER DEFAULT 0,message TEXT DEFAULT '企画の募集条件を自動確認待ち')");
+      this.rows('INSERT INTO desk_contest16923(id) VALUES(1)');
+      this.rows("CREATE TABLE desk_contest_rule16923(id TEXT PRIMARY KEY,owner TEXT NOT NULL,url TEXT NOT NULL,title TEXT DEFAULT '',hash TEXT DEFAULT '',policy TEXT DEFAULT '',due INTEGER DEFAULT 0,checked INTEGER DEFAULT 0,cursor INTEGER DEFAULT 0,message TEXT DEFAULT '募集本文を確認待ち')");
+      this.rows('CREATE INDEX desk_contest_rule_due16923 ON desk_contest_rule16923(due,id)');
+      this.rows("CREATE TABLE desk_contest_entry16923(contest TEXT NOT NULL,article TEXT NOT NULL,account TEXT NOT NULL,rule_hash TEXT NOT NULL,policy TEXT NOT NULL,before_json TEXT NOT NULL,phase TEXT NOT NULL,at INTEGER NOT NULL,due INTEGER NOT NULL,checks INTEGER DEFAULT 0,message TEXT NOT NULL,PRIMARY KEY(contest,article))");
+      this.rows('CREATE INDEX desk_contest_entry_due16923 ON desk_contest_entry16923(phase,due)');
+      this.rows('CREATE UNIQUE INDEX desk_contest_work16923 ON desk_contest_entry16923(article)');
+      const s=CONTEST16923.seed;this.rows('INSERT INTO desk_contest_rule16923(id,owner,url,title) VALUES(?,?,?,?)',s.id,s.owner,s.url,'note文芸部年末コンテスト2026');
+    });
+    this.contestReady16923=true;
+  },
+  contestActive16923(now=Date.now()){
+    return this.pipelineActive16913()&&!this.publicationPriority16916(now)&&!!this.one('SELECT 1 FROM desk_directory WHERE id=1 AND enabled=1');
+  },
+  contestDiscover16923(path,format,value){
+    this.initContest16923();
+    const found=[];
+    if(format==='json'&&/^https:\/\/note\.com\/api\/v3\/notes\/n[a-z0-9]+$/.test(path)){
+      const n=value?.data;if(n?.status==='published'&&/コンテスト|公募|お題企画|作品募集/.test(n.name||'')&&contestOwner16923(n.user?.urlname))
+        found.push({id:n.key,owner:n.user.urlname,url:'https://note.com/'+n.user.urlname+'/n/'+n.key,title:n.name});
+    }else if(format==='html'&&path==='https://note.com/contests'){
+      for(const a of anchors161(value)){
+        if(!/応募概要|募集要項/.test(a.label))continue;
+        const l=noteLink161(a.href,path,'article');if(l)found.push({...l,title:a.label});
+      }
+    }else if(format==='issue'){
+      const items=Array.isArray(value)?value:value?.items;
+      for(const x of (items||[]).slice(0,30))if(/コンテスト|作品募集|お題企画/.test(x.title||'')){
+        const l=noteLink161(x.link,path,'article');if(l)found.push({...l,title:x.title});
+      }
+    }
+    for(const f of found.slice(0,8)){
+      if(this.one('SELECT COUNT(*) n FROM desk_contest_rule16923').n>=CONTEST16923.maxRules)break;
+      if(!/^n[a-z0-9]{1,64}$/.test(f.id||'')||!contestOwner16923(f.owner))continue;
+      this.rows('INSERT OR IGNORE INTO desk_contest_rule16923(id,owner,url,title) VALUES(?,?,?,?)',f.id,f.owner,f.url,String(f.title||'').slice(0,300));
+    }
+  },
+  async contestRead16923(path,format='json'){
+    if(!this.contestActive16923())throw new Error('contest paused');
+    const now=Date.now(),day=jstDay(now),s=this.one('SELECT * FROM desk_contest16923 WHERE id=1'),b=this.one('SELECT * FROM desk_scout_budget WHERE id=1');
+    const used=s.day===day?s.used:0,shared=b.day===day?b.used:0;
+    if(used>=CONTEST16923.pages||shared>=192)throw new Error('contest read budget');
+    this.storage.transactionSync(()=>{
+      this.rows('UPDATE desk_contest16923 SET day=?,used=?,writes=CASE WHEN day=? THEN writes ELSE 0 END WHERE id=1',day,used+1,day);
+      this.rows('UPDATE desk_scout_budget SET day=?,used=? WHERE id=1',day,shared+1);
+      this.rows('UPDATE desk_scout_state SET due=MAX(due,?) WHERE id=1',now+6*M520);
+    });
+    return this.publicRead(path,format);
+  },
+  async contestCensus16923(account,tag){
+    const entries=new Set(),seen=new Set();
+    for(let page=1;page<=4;page++){
+      const d=(await this.contestRead16923('https://note.com/api/v2/creators/43__/contents?kind=note&page='+page))?.data;
+      if(!Array.isArray(d?.contents)||d.contents.length>100||(d.page!=null&&Number(d.page)!==page))return null;
+      for(const n of d.contents){
+        if(n.status!=='published')return null;
+        if(n.user?.urlname!=='43__'||String(n.user.id)!==account||!/^n[a-z0-9]{1,64}$/.test(n.key||'')||seen.has(n.key))return null;
+        seen.add(n.key);
+        const tags=contestTags16923(n);if(!tags)return null;
+        if(tags.includes(tag))entries.add(n.key);
+      }
+      if((d.isLastPage??d.is_last_page)===true)return [...entries];
+      if((d.isLastPage??d.is_last_page)!==false||!d.contents.length)return null;
+    }
+    return null;
+  },
+  contestReserve16923(rule,policy,before,manual){
+    const now=Date.now(),today=jstDay(now);
+    if(!this.contestActive16923(now)||now>=policy.end||!this.joinProof520(policy.member,now)||!Array.isArray(manual))return false;
+    return this.storage.transactionSync(()=>{
+      const state=this.one('SELECT * FROM desk_contest16923 WHERE id=1'),live=this.one('SELECT * FROM desk_contest_rule16923 WHERE id=?',rule.id);
+      if(!live||live.hash!==rule.hash||live.checked<now-10*M520||state.next_write>now||state.used>=CONTEST16923.pages||
+        (state.day===today&&state.writes>=CONTEST16923.entries)||this.one('SELECT COUNT(*) n FROM desk_contest_entry16923').n>=CONTEST16923.maxEntries||
+        this.one('SELECT 1 FROM desk_contest_entry16923 WHERE article=?',before.key))return false;
+      const known=new Set([...manual,...this.rows('SELECT article FROM desk_contest_entry16923 WHERE contest=?',rule.id).map(r=>r.article)]);
+      if(known.has(before.key)||known.size>=policy.max)return false;
+      // Persist before the first tag mutation: even an autosave or lost browser
+      // response consumes the entry and cannot cause a duplicate edit later.
+      this.rows(`INSERT INTO desk_contest_entry16923(contest,article,account,rule_hash,policy,before_json,phase,at,due,message)
+        VALUES(?,?,?,?,?,?,'sent',?,?,'応募操作を開始・反映確認待ち（自動再送なし）')`,rule.id,before.key,before.account,rule.hash,JSON.stringify(policy),JSON.stringify(before),now,now+5*M520);
+      this.rows('UPDATE desk_contest16923 SET writes=CASE WHEN day=? THEN writes+1 ELSE 1 END,day=?,next_write=?,message=? WHERE id=1',today,today,now+CONTEST16923.writeGap,'応募操作を開始・公開結果を確認待ち');
+      return true;
+    });
+  },
+  async contestVerify16923(row){
+    const now=Date.now(),before=JSON.parse(row.before_json),p=JSON.parse(row.policy);
+    // Only read-back is permitted after an attempted edit, including after restart.
+    this.rows('UPDATE desk_contest_entry16923 SET due=?,checks=checks+1 WHERE contest=? AND article=?',now+Math.min(24,2**Math.min(5,row.checks))*HOUR,row.contest,row.article);
+    const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+row.article))?.data;
+    const after=await contestSnapshot16923(n,row.account);
+    if(!after){this.rows('UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=?','応募先記事の公開状態を確認待ち。再送しません',row.contest,row.article);return;}
+    const preserved=contestSame16923({...before,tags:after.tags},after,p.tag);
+    if(!preserved){
+      this.rows("UPDATE desk_contest_entry16923 SET phase='changed',message='応募操作後に本文・タイトル・画像等の変更を検出。自動操作を保留' WHERE contest=? AND article=?",row.contest,row.article);
+      return;
+    }
+    if(!contestSame16923(before,after,p.tag,true)){
+      this.rows('UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=?','応募タグまたは既存タグの保存結果を確認待ち。再送しません',row.contest,row.article);return;
+    }
+    const html=await this.contestRead16923('https://note.com/hashtag/'+encodeURIComponent(p.tag)+'?f=new','html');
+    const listed=anchors161(html).some(a=>{const l=noteLink161(a.href,'https://note.com','article');return l?.owner==='43__'&&l.id===row.article;});
+    this.rows('UPDATE desk_contest_entry16923 SET phase=?,message=? WHERE contest=? AND article=?',listed?'listed':'sent',
+      listed?'応募タグ・募集一覧への掲載と作品内容の維持を確認。受賞・主催者の受理判定は未確認':'応募タグと作品内容の維持を確認。募集一覧への掲載は未確認（自動再送なし）',row.contest,row.article);
+  },
+  async contestTick16923(now){
+    this.initContest16923();
+    const state=this.one('SELECT * FROM desk_contest16923 WHERE id=1');
+    if(!this.contestActive16923(now)||state.due>now)return;
+    this.rows('UPDATE desk_contest16923 SET due=? WHERE id=1',now+CONTEST16923.gap);
+    if(this.one("SELECT 1 FROM desk_contest_entry16923 WHERE phase='changed'")){
+      this.rows("UPDATE desk_contest16923 SET message='応募後の作品変更を検出したため、新しい応募は保留中' WHERE id=1");return;
+    }
+    const pending=this.one("SELECT * FROM desk_contest_entry16923 WHERE phase='sent' AND due<=? AND checks<12 ORDER BY due LIMIT 1",now);
+    if(pending){await this.contestVerify16923(pending);return;}
+    if(state.scout<=now){
+      this.rows('UPDATE desk_contest16923 SET scout=? WHERE id=1',now+D520);
+      await this.contestRead16923('https://note.com/contests','html');return;
+    }
+    const rule=this.one('SELECT * FROM desk_contest_rule16923 WHERE due<=? ORDER BY due,id LIMIT 1',now);if(!rule)return;
+    this.rows('UPDATE desk_contest_rule16923 SET due=? WHERE id=?',now+D520,rule.id);
+    const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+rule.id))?.data;
+    const p=n?.key===rule.id&&n.user?.urlname===rule.owner?contestRule16923(n,now):{ok:false,reason:'募集元の本人・記事が一致しません'};
+    const hash=typeof n?.body==='string'?await draftBodyHash(n.body):null;
+    const message=reason=>{
+      this.rows('UPDATE desk_contest_rule16923 SET message=? WHERE id=?',reason,rule.id);
+      this.rows('UPDATE desk_contest16923 SET message=? WHERE id=1',reason);
+    };
+    if(rule.hash&&hash!==rule.hash){message('募集本文が変更されたため、この企画の自動応募を保留');return;}
+    this.rows('UPDATE desk_contest_rule16923 SET hash=?,policy=?,checked=?,message=? WHERE id=?',hash||'',JSON.stringify(p),now,p.reason,rule.id);
+    rule.hash=hash;
+    if(!p.ok||!hash){message(p.reason);return;}
+    if(!this.joinProof520(p.member,now)){message('共同誌の参加確認待ち。既存の参加処理が確認できた後に自動で再照合');return;}
+    const taken=this.one('SELECT COUNT(*) n FROM desk_contest_entry16923 WHERE contest=?',rule.id).n;
+    if(taken>=p.max){message('この企画の応募上限に到達（結果未確認の操作も含む）');return;}
+    if(state.next_write>now||(state.day===jstDay(now)&&state.writes>=CONTEST16923.entries))return;
+    const magazines=this.eligibleMags(now).filter(m=>noteLink161(m.url)?.id===p.member);
+    if(!magazines.length){message('参加済み共同誌の最新の投稿条件・編集権限を確認待ち');return;}
+    const options=this.rows(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.pub>=? AND a.pub<? AND a.verified>?
+      AND NOT EXISTS(SELECT 1 FROM desk_contest_entry16923 e WHERE e.article=a.article)
+      ORDER BY a.pub DESC,a.article LIMIT 24`,p.start,p.end,now-8*D520).filter(a=>this.archiveFits(a,magazines,now).length);
+    if(!options.length){message('募集開始後に公開した、条件の合う自作を待機中');return;}
+    const work=options[rule.cursor%options.length];
+    this.rows('UPDATE desk_contest_rule16923 SET cursor=cursor+1,due=? WHERE id=?',now+2*HOUR,rule.id);
+    const account=await this.deliveryAccount();
+    if(!account||account.until>Date.now()){message('520の本人確認・既存の待機終了を確認待ち');return;}
+    const own=(await this.contestRead16923('https://note.com/api/v3/notes/'+work.article))?.data;
+    if(!contestFits16923(own,p)){message('「'+work.title+'」は題材・字数・公開時期の照合対象外。次の作品を自動確認');return;}
+    const before=await contestSnapshot16923(own,account.id);
+    if(!before||before.key!==work.article){message('本文・画像・タグ全体の保存状態を確認待ち');return;}
+    const manual=await this.contestCensus16923(account.id,p.tag);
+    if(!manual){message('既存の応募件数を全件確認できず保留');return;}
+    if(manual.includes(before.key)||new Set([...manual,...this.rows('SELECT article FROM desk_contest_entry16923 WHERE contest=?',rule.id).map(r=>r.article)]).size>=p.max){message('手動応募を含む応募済み作品・応募上限を確認');return;}
+    const binding=browserPurpose16916(this.env.BROWSER,'normal');
+    if(browserWait16916(binding,'normal')){message('既存のブラウザー処理の終了を待機中');return;}
+    let lease,env=scoped(this.env,account.slot);
+    try{
+      lease=await acquire(env,false);if(!lease)return;
+      const credentials=await loadCookie(env,account.id),cookie=cleanCookie(credentials.NOTE_SESSION);
+      const mayAct=async()=>{
+        const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,c.enabled,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',account.slot).first();
+        const at=Date.now();
+        return !!live&&!!live.enabled&&live.account===account.id&&live.token===lease&&live.lease>at&&live.hold_until<=at&&(!live.kind||live.next_at<=at)&&this.contestActive16923(at)&&at<p.end&&this.joinProof520(p.member,at)&&this.archiveFits(work,this.eligibleMags(at).filter(m=>noteLink161(m.url)?.id===p.member),at).length>0;
+      };
+      if(!await mayAct())return;
+      const result=await contestBrowser16923(binding,cookie,before,p,async()=>await mayAct()&&this.contestReserve16923(rule,p,before,manual),mayAct,plainDraft16914(own.body),async()=>{const fresh=(await this.contestRead16923("https://note.com/api/v3/notes/"+before.key))?.data;const saved=await contestSnapshot16923(fresh,account.id);return contestSame16923(before,saved,p.tag)||contestSame16923(before,saved,p.tag,true);});
+      message(result.message);
+      this.rows("UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=? AND phase='sent'",result.message,rule.id,before.key);
+      if(result.hold||[401,403,429].includes(result.code)){
+        const until=Date.now()+Math.max(result.hold||0,HOUR);
+        this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
+        await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,account.slot).run();
+      }
+    }finally{if(lease)await release(env,lease);}
+  },
+  contestView16923(){
+    try{this.initContest16923();return {state:this.one('SELECT * FROM desk_contest16923 WHERE id=1'),
+      rules:this.rows('SELECT title,url,message FROM desk_contest_rule16923 ORDER BY checked DESC LIMIT 8'),
+      entries:this.rows('SELECT article,phase,message FROM desk_contest_entry16923 ORDER BY at DESC LIMIT 12')};}catch{return null;}
+  }
+});
+function contestRecord16923(v){
+  if(!v)return '【企画への自動応募】記録を確認待ち';
+  return '【企画への自動応募】\n'+v.state.message+'\n'+v.rules.map(r=>r.title+'：'+r.message+'\n'+r.url).join('\n')+
+    (v.entries.length?'\n'+v.entries.map(e=>'https://note.com/43__/n/'+e.article+'\n'+e.message).join('\n'):'\n応募操作の記録はまだありません。')+
+    '\n募集元を自動探索し、対応済みの条件・参加資格・作品との一致を確認した場合だけ応募します。現在の自動操作はnote文芸部年末コンテスト2026のタグ応募に対応。他の企画・有料応募・外部フォーム・未確定の条件は見送り。最大2応募/日・2時間間隔。本文・タイトル・見出し画像・既存タグを照合。応募一覧への反映と受賞は別に表示します。';
+}
+
+// Static standalone browser source, independent of bundler helper names.
+function contestScreen16923(step,arg){
+  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||
+    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};
+  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden="true"]');
+  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);
+  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();
+  const one=xs=>xs.length===1?xs[0]:null;
+  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));
+  const dialogs=all(document,'[role=dialog],dialog');
+  if(dialogs.length){
+    const dialog=one(dialogs),text=dialog?.innerText||'';
+    const ok=dialog&&button(dialog,['OK']);
+    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};
+    if(step==='confirm'){ok.click();return {state:'confirmed'};}
+    return {state:'confirmation'};
+  }
+  if(step==='settings'){
+    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};
+    go.click();return {state:'opened'};
+  }
+  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};
+  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));
+  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};
+  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);
+  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));
+  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||
+    all(document,'input[type="datetime-local"],[name*="schedul"][type=hidden]').some(e=>e.value))return {state:'settings'};
+  const expected=[...new Set(arg.tags)].sort();
+  const values=[];
+  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name="hashtags[]"]')){
+    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';
+    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\s*$/,'').replace(/^#/,'').trim();
+    if(clean&&!/\n/.test(clean))values.push(clean);
+  }
+  for(const el of all(document,'[aria-label]')){
+    const label=el.getAttribute('aria-label')||'';
+    const m=/^ハッシュタグ\s*#?(.+?)(?:\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());
+  }
+  const actual=[...new Set(values)].sort();
+  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;
+  if(!tags)return {state:'tags'};
+  if(step==='ready'||step==='updatedReady')return {state:'ready'};
+  if(step==='add'){
+    if(tags.includes(arg.tag))return {state:'already'};
+    if(tags.length>=10)return {state:'tag_limit'};
+    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};
+    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));
+    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+    return {state:'added'};
+  }
+  if(step==='update'){submit.click();return {state:'clicked'};}
+  return {state:'unknown'};
+}
+async function contestBrowserRead16923(key){
+  if(location.origin!=='https://note.com'||!/^n[a-z0-9]{1,64}$/.test(key))return null;
+  const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
+  if(!r.ok)return null;
+  const n=(await r.json())?.data;return n?.key===key?n:null;
+}
+async function contestBrowser16923(binding,cookie,before,p,mark,mayAct,plain,beforeUpdate){
+  if(typeof plain!=='string')return {message:'本文の表示形式を厳密に照合できず応募保留'};
+  return inNoteBrowser(binding,cookie,true,async({command,evaluate,blocked,blockedResult})=>{
+    const end=Date.now()+35000;
+    const poll=async(fn,accept)=>{
+      for(let i=0;i<12&&!blocked()&&Date.now()<end;i++){
+        try{const v=await fn();if(accept(v))return v;}catch{}
+        await pause520(200);
+      }
+      return null;
+    };
+    const arg={key:before.key,title:before.title,body:plain,tag:p.tag,tags:before.tags};
+    const screen=(step,extra={})=>evaluate('('+BROWSER_SOURCES520.contestScreen16923+')('+JSON.stringify(step)+','+JSON.stringify({...arg,...extra})+')');
+    await command('Page.navigate',{url:'https://note.com/43__/n/'+before.key});
+    const who=await poll(()=>evaluate(noteIdentityJS),x=>!!x?.id);
+    if(blocked())return blockedResult();
+    if(who?.id!==before.account||who.name!=='43__')return {message:'応募するアカウント本人のログインを確認待ち'};
+    const saved=await evaluate('('+BROWSER_SOURCES520.contestBrowserRead16923+')('+JSON.stringify(before.key)+')');
+    if(!contestSame16923(before,await contestSnapshot16923(saved,before.account),p.tag))return {message:'作品の保存状態が変わったため応募保留'};
+    if(!await mayAct())return {message:'停止・待機・期限の条件により応募保留'};
+    await command('Page.navigate',{url:'https://editor.note.com/notes/'+before.key+'/edit/'});
+    const draft=()=>evaluate('('+nativeScreenJS+')("draft",'+JSON.stringify(arg)+')');
+    if(!await poll(draft,x=>x==='ready'))return blocked()?blockedResult():{message:'編集画面の本文・タイトルが一致せず応募保留'};
+    const img=await evaluate('('+nativeScreenJS+')("linkCover",'+JSON.stringify(arg)+')');
+    if(!img||coverId(img.src)!==before.cover)return {message:'編集画面の見出し画像が一致せず応募保留'};
+    if((await screen('settings'))?.state!=='opened')return {message:'公開設定の画面を確認待ち'};
+    const ready=await poll(()=>screen('ready'),x=>x?.state==='ready');
+    if(!ready)return blocked()?blockedResult():{message:'無料設定・既存タグ・更新ボタンを確認できず応募保留'};
+    if(before.tags.includes(p.tag))return {message:'応募タグ設定済み。重ねて操作しません'};
+    if(blocked()||!await mayAct()||!await mark())return blocked()?blockedResult():{message:'応募上限・停止・期限を再確認して保留'};
+    // From here onward the ledger is irrevocably attempted. Never retry an edit
+    // after a crash, timeout, unexpected screen or lost response.
+    if((await screen('add'))?.state!=='added')return {message:'タグ入力操作の結果を確認待ち。自動再送しません'};
+    const changed=await poll(()=>screen('updatedReady',{tags:[...before.tags,p.tag]}),x=>['ready','confirmation'].includes(x?.state));
+    if(changed?.state==='confirmation'){
+      if(!await mayAct()||blocked())return blocked()?blockedResult():{message:'応募確認の前に停止・期限を確認して保留'};
+      if((await screen('confirm',{tags:[...before.tags,p.tag]}))?.state!=='confirmed')return {message:'応募確認画面を確認待ち。自動再送しません'};
+    }
+    if(!await poll(()=>screen('updatedReady',{tags:[...before.tags,p.tag]}),x=>x?.state==='ready'))return blocked()?blockedResult():{message:'追加タグと既存タグの一致を確認待ち。自動再送しません'};
+    if(blocked()||!await mayAct())return blocked()?blockedResult():{message:'更新前に停止・期限を確認して保留'};
+    if(typeof beforeUpdate!=='function'||!await beforeUpdate())return {message:'更新直前の保存済み作品の一致を確認できず保留。自動再送しません'};
+    if(blocked()||!await mayAct())return blocked()?blockedResult():{message:'更新直前に停止・待機・期限を確認して保留'};
+    const result=await screen('update',{tags:[...before.tags,p.tag]});
+    return {message:result?.state==='clicked'?'応募の更新操作済み。別の読み取りでタグ・作品内容・募集一覧を自動確認します':'更新操作の結果が未確認。自動再送しません'};
+  });
+}
+
+const contestOriginalRead16923=Desk520.prototype.publicRead;
+Desk520.prototype.publicRead=async function(path,format){
+  const result=await contestOriginalRead16923.call(this,path,format);
+  try{this.contestDiscover16923(path,format,result);}catch{}
+  return result;
+};
+
 const BROWSER_SOURCES520 = Object.freeze({
+  "contestScreen16923": "function contestScreen16923(step,arg){\n  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||\n    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();\n  const one=xs=>xs.length===1?xs[0]:null;\n  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));\n  const dialogs=all(document,'[role=dialog],dialog');\n  if(dialogs.length){\n    const dialog=one(dialogs),text=dialog?.innerText||'';\n    const ok=dialog&&button(dialog,['OK']);\n    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};\n    if(step==='confirm'){ok.click();return {state:'confirmed'};}\n    return {state:'confirmation'};\n  }\n  if(step==='settings'){\n    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};\n    go.click();return {state:'opened'};\n  }\n  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};\n  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));\n  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};\n  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);\n  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));\n  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||\n    all(document,'input[type=\"datetime-local\"],[name*=\"schedul\"][type=hidden]').some(e=>e.value))return {state:'settings'};\n  const expected=[...new Set(arg.tags)].sort();\n  const values=[];\n  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name=\"hashtags[]\"]')){\n    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';\n    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\\s*$/,'').replace(/^#/,'').trim();\n    if(clean&&!/\\n/.test(clean))values.push(clean);\n  }\n  for(const el of all(document,'[aria-label]')){\n    const label=el.getAttribute('aria-label')||'';\n    const m=/^ハッシュタグ\\s*#?(.+?)(?:\\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());\n  }\n  const actual=[...new Set(values)].sort();\n  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;\n  if(!tags)return {state:'tags'};\n  if(step==='ready'||step==='updatedReady')return {state:'ready'};\n  if(step==='add'){\n    if(tags.includes(arg.tag))return {state:'already'};\n    if(tags.length>=10)return {state:'tag_limit'};\n    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\n    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};\n    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));\n    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));\n    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));\n    return {state:'added'};\n  }\n  if(step==='update'){submit.click();return {state:'clicked'};}\n  return {state:'unknown'};\n}",
+  "contestBrowserRead16923": "async function contestBrowserRead16923(key){\n  if(location.origin!=='https://note.com'||!/^n[a-z0-9]{1,64}$/.test(key))return null;\n  const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});\n  if(!r.ok)return null;\n  const n=(await r.json())?.data;return n?.key===key?n:null;\n}",
+
   "trafficScreen16913": "function trafficScreen16913(step='read') {\n  if(location.origin!=='https://note.com' || !/^\\/dashboard\\/?$/.test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const root=document.querySelector('main,[role=\"main\"]')||document.body;\n  if(!root)return {state:'loading'};\n  const clean=t=>(t||'').normalize('NFKC').replace(/[\\u200b\\u200e\\u200f]/g,'').trim();\n  const all=s=>[...root.querySelectorAll(s)].filter(visible);\n  const text=clean(root.innerText),header=text.split(/直近1[ヶかケ]月のまとめ|あなたへの提案|記事の流入元/)[0];\n  if(!/アクセス状況/.test(text) || !/インプレッション/.test(header) || !/ページビュー/.test(header))return {state:'layout'};\n  if(/この期間のデータはありません|集計中|読み込み中/.test(header))return {state:'loading'};\n  const stamps=[...header.matchAll(/(\\d{4})[\\/年.-](\\d{1,2})[\\/月.-](\\d{1,2})日?\\s*(?:〜|～|~|–|−|—|-|から)\\s*(?:(\\d{4})[\\/年.-])?(\\d{1,2})[\\/月.-](\\d{1,2})日?/g)];\n  const dates=[...new Set(stamps.map(m=>JSON.stringify([m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0'),(m[4]||m[1])+'-'+m[5].padStart(2,'0')+'-'+m[6].padStart(2,'0')])))] ;\n  if(dates.length!==1)return {state:'period'};\n  const [start,end]=JSON.parse(dates[0]);\n  if(step==='previous'){\n    // Only the displayed dashboard's period navigation, never account settings.\n    const controls=all('button').filter(b=>!b.disabled && b.getAttribute('aria-disabled')!=='true' &&\n      /^(?:前の期間(?:へ|に移動|を表示)?|前期間|Previous period)$/i.test(clean(b.getAttribute('aria-label')||b.getAttribute('title')||b.innerText)));\n    if(controls.length!==1)return {state:'previous_missing'};\n    controls[0].click();return {state:'moved',start,end};\n  }\n  const values={},labels={impressions:'インプレッション',pageviews:'ページビュー',likes:'スキ',comments:'コメント'};\n  const nodes=all('span,p,dt,dd,div,button,strong,h2,h3');\n  for(const [key,label] of Object.entries(labels)){\n    const found=new Set();\n    for(const el of nodes.filter(e=>clean(e.innerText)===label)){\n      // Summary metric cards have one label and one exact count. Article rows,\n      // charts, menus and comparison percentages cannot pass this whole match.\n      for(let p=el.parentElement,n=0;p&&p!==root&&n<4;p=p.parentElement,n++){\n        const value=clean(p.innerText).replace(/\\s/g,'');\n        const match=new RegExp('^(?:'+label+'([0-9,]+|[-−–—])(?:回|件)?|([0-9,]+|[-−–—])(?:回|件)?'+label+')$').exec(value);\n        if(match){\n          const raw=match[1]||match[2];\n          if(/^[0-9]+$|^[1-9][0-9]{0,2}(?:,[0-9]{3})+$/.test(raw))found.add(Number(raw.replaceAll(',','')));\n          // note documents '-' as zero for the modern metrics. Do not apply it\n          // to pre-2021 impressions or missing/unavailable data.\n          else if(/^[-−–—]$/.test(raw) && start>='2021-05-01')found.add(0);\n          break;\n        }\n      }\n    }\n    if(found.size!==1 || !Number.isSafeInteger([...found][0]))return {state:'metrics',field:key};\n    values[key]=[...found][0];\n  }\n  const updated=[...header.matchAll(/(\\d{4}[\\/年.-]\\d{1,2}[\\/月.-]\\d{1,2}日?\\s+\\d{1,2}:\\d{2}(?::\\d{2})?)\\s*集計/g)].map(m=>m[1]);\n  const refText=text.split('記事の流入元').slice(1).join('記事の流入元'),referrers=[];\n  const pattern=/((?:[a-z0-9-]+\\.)+[a-z]{2,63}|no referrer|other|流入元不明|X|Facebook|Google|Instagram)\\s+(\\d+(?:\\.\\d+)?)\\s*%\\s*\\(\\s*([\\d,]+)\\s*PV\\s*\\)/gi;\n  for(const m of refText.matchAll(pattern)){\n    const count=Number(m[3].replaceAll(',','')),share=Number(m[2]),name=m[1];\n    if(Number.isSafeInteger(count)&&count>=0&&share>=0&&share<=100&&!referrers.some(r=>r.name===name))referrers.push({name,pageviews:count,share});\n  }\n  if(referrers.length>12)return {state:'referrers'};\n  return {state:'ready',start,end,...values,updated:updated.length===1?updated[0]:'',referrers,\n    referrersRead:referrers.length>0,signature:JSON.stringify([start,end,values,updated,referrers])};\n}",
   "boardPostURL16912": "function boardPostURL16912(value,owner) {\n  if(!/^[\\w-]{1,80}$/.test(owner||''))return null;\n  try {\n    const u=new URL(value,'https://note.com');\n    const match=/^\\/([\\w-]{1,80})\\/membership\\/boards\\/([a-z0-9]{1,64})\\/posts\\/([a-z0-9]{1,64})\\/?$/.exec(u.pathname);\n    return u.origin==='https://note.com' && !u.username && !u.password && match?.[1]===owner ? u.origin+u.pathname.replace(/\\/$/,'') : null;\n  }catch{return null;}\n}",
   "boardScreen16912": "function boardScreen16912(step,arg,postURL) {\n  if(location.origin!=='https://note.com' || !/^[\\w-]{1,80}$/.test(arg.owner||''))return {state:'page'};\n  const path=location.pathname.replace(/\\/$/,''),base='/'+arg.owner+'/membership';\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  try {const u=new URL(canonical);if(u.origin!==location.origin || u.pathname.replace(/\\/$/,'')!==path)return {state:'canonical'};}catch{return {state:'canonical'};}\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').trim();\n  const main=document.querySelector('main,[role=\"main\"]');if(!main)return {state:'page'};\n  const blocked=all(document,'[role=\"dialog\"],dialog[open]').length>0;\n  if(blocked)return {state:'dialog'};\n  if(step==='entry') {\n    if(path!==base)return {state:'page'};\n    const urls=all(main,'a[href]').filter(a=>/^(?:掲示板|掲示板を見る|すべての掲示板)$/.test(label(a))).map(a=>{\n      try{const u=new URL(a.href);return u.origin===location.origin && !u.username && !u.password && u.pathname.replace(/\\/$/,'')===base+'/boards'?u.origin+u.pathname:null;}catch{return null;}\n    }).filter(Boolean);\n    const found=[...new Set(urls)];return found.length===1?{state:'entry',url:found[0]}:{state:'missing'};\n  }\n  if(step==='list') {\n    if(path!==base+'/boards')return {state:'page'};\n    const posts=[...new Set(all(main,'a[href]').filter(a=>!a.closest('[data-testid*=\"comment\"],[class*=\"Comment\"],[class*=\"comment\"]'))\n      .map(a=>postURL(a.href,arg.owner)).filter(Boolean))].slice(0,8);\n    return {state:'list',posts};\n  }\n  const url=postURL(location.href,arg.owner);\n  if(!url || url!==arg.url)return {state:'page'};\n  // Require the actual post heading, author and timestamp together. Never take\n  // the first heart on the page or reuse a button handle after a navigation.\n  const headings=all(main,'h1');if(headings.length!==1 || !headings[0].innerText.trim())return {state:'post'};\n  const excluded='[data-testid*=\"comment\"],[class*=\"Comment\"],[class*=\"comment\"],[id*=\"comment\"],aside,nav,[role=\"dialog\"]';\n  const hearts=root=>all(root,'button,[role=\"button\"]').filter(b=>!b.closest(excluded) &&\n    (/^(?:投稿に)?スキ(?:する|をする|をつける|を取り消す|を取消す|済み)?$/.test(label(b)) ||\n      (b.getAttribute('aria-pressed')!==null && /like|スキ/i.test((b.getAttribute('class')||'')+' '+(b.querySelector('svg')?.getAttribute('aria-label')||'')))));\n  for(let root=headings[0].parentElement,depth=0;root && depth<9;root=root.parentElement,depth++) {\n    if(root!==main && !main.contains(root))break;\n    const buttons=hearts(root);\n    if(buttons.length>1)return {state:'ambiguous'};\n    const owners=[...new Set(all(root,'a[href]').filter(a=>!a.closest(excluded)).map(a=>{\n      try{const u=new URL(a.href);return u.origin===location.origin && !u.username && !u.password?/^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]:null;}catch{return null;}\n    }).filter(Boolean))];\n    const times=all(root,'time[datetime]').filter(e=>!e.closest(excluded));\n    const dated=times.some(t=>{const n=Date.parse(t.getAttribute('datetime'));return Number.isFinite(n) && n>0 && n<=Date.now();});\n    if(buttons.length===1 && owners.length===1 && owners[0]===arg.owner && dated) {\n      const b=buttons[0],name=label(b),pressed=b.getAttribute('aria-pressed');\n      const conflict=pressed==='true'&&/スキ(?:する|をする|をつける)$/.test(name)||pressed==='false'&&/取り消す|取消す|済み/.test(name);\n      const liked=conflict?null:pressed==='true'||/取り消す|取消す|済み/.test(name)?true:\n        pressed==='false'||/スキ(?:する|をする|をつける)$/.test(name)?false:null;\n      if(step==='read'||step==='verify')return {state:'post',liked};\n      if(step!=='act'||liked!==false||b.disabled||b.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n      b.click();return {state:'clicked'};\n    }\n    if(root===main)break;\n  }\n  return {state:'post_unidentified'};\n}",
