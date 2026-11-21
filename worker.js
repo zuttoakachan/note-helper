@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.25';
+const VERSION = 'v16.9.26';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -2543,7 +2543,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3678,6 +3678,8 @@ class Desk520 {
     await task('下書き一覧',()=>this.resolveDraftDirectory(Date.now()));
     if(!publication)await task('企画への自動応募',()=>this.contestTick16923(Date.now()));
     if(!publication)await task('作品と読者の比較情報',()=>this.networkTick16922(Date.now()));
+    await task('RSSと既刊の照合',()=>this.rssMatchTick16926(Date.now()));
+    await task('誌面の時間帯観測',()=>this.rssSampleTick16926(Date.now()));
     await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
     if(!publication)await task('参加先の募集確認',()=>this.expandJoin520(Date.now()));
     if(!publication)await task('Tutaの招待確認',()=>this.tutaTick520(Date.now()));
@@ -4068,6 +4070,7 @@ function deskRecordText(s) {
   if(s.audience)lines.push(networkRecord16922(s.audience));
   if(s.repeat)lines.push(repeatRecord16923(s.repeat));
   if(s.contests)lines.push(contestRecord16923(s.contests));
+  lines.push(rssRecord16926(s.rssIntelligence));
   if(s.pipeline)lines.push(pipelineRecord16913(s.pipeline));
   if(s.traffic)lines.push(trafficRecord16913(s.traffic));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
@@ -5372,7 +5375,7 @@ Object.assign(Desk520.prototype,{
         }
         if(nextPage)this.rows('INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,?,?)',nextPage,next.kind,now);
         this.rows('UPDATE desk_scout_cursor SET offset=?,checked=? WHERE url=?',more?offset+batch.length:0,now,next.url);
-        this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+(more?4*M520:next.kind==='feed'||next.kind==='owner'?D520:7*D520),next.url);
+        this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+(more?4*M520:next.kind==='feed'?this.rssScoutDelay16926(next.url,now):next.kind==='owner'?D520:7*D520),next.url);
         this.rows('UPDATE desk_scout_state SET message=? WHERE id=1','新たに'+added+'誌を登録。'+(more?'この一覧の続きも確認します。':'')+'累計誌数の上限なし');
         if(next.kind==='owner')this.rows("UPDATE desk_directory SET token='',due=?,message=? WHERE id=1",now+D520,'520の公開一覧を巡回中。ページの続きも探索キューで確認します。');
       });
@@ -7591,8 +7594,9 @@ Object.assign(Desk520.prototype,{
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
     const prior=this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
-    return {kind:'mag',key,subject:prior?.subject||key+'@'+link.id,target:link.id,url:link.url,title:a.title,name:mag.name,
+    const job={kind:'mag',key,subject:prior?.subject||key+'@'+link.id,target:link.id,url:link.url,title:a.title,name:mag.name,
       old:a.pub<=now-30*D520,previousMagAt:a.mag_at,previousMagDue:a.mag_due};
+    return activeTarget?job:this.rssTiming16926(job,now);
   },
   nextPlacement(now,oldFirst){
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
@@ -8994,6 +8998,360 @@ Desk520.prototype.publicRead=async function(path,format){
   try{this.contestDiscover16923(path,format,result);}catch{}
   return result;
 };
+
+// RSS observations are bounded local hints. They never grant publishing rights,
+// alter an article, or bypass the existing mutation ledger and rate limits.
+const RSS16926=Object.freeze({feeds:128,windows:4096,appearances:4096,spread:2048,delays:256,briefs:96,matches:512,age:28*D520});
+function rssUrl16926(path){
+  try{const u=new URL(path);return u.origin==='https://note.com'&&!u.username&&!u.password&&!u.search&&!u.hash&&
+    (/^\/[\w-]{1,80}\/rss$/.test(u.pathname)||!!noteLink161(path.replace(/\/rss$/,''))&&u.pathname.endsWith('/rss'))?u.href:null;}catch{return null;}
+}
+function rssIdentity16926(url,issue){
+  if(!issue||!Array.isArray(issue.entries)||typeof issue.header?.link!=='string')return null;
+  const base=url.replace(/\/rss$/,''),mag=noteLink161(base),channel=noteLink161(issue.header.link);
+  if(mag)return channel?.id===mag.id?{id:mag.id,owner:channel.owner||mag.owner||'',url:base}:null;
+  try{const a=new URL(base),b=new URL(issue.header.link);return a.origin===b.origin&&a.pathname.replace(/\/$/,'')===b.pathname.replace(/\/$/,'')?{id:'',owner:a.pathname.slice(1),url:base}:null;}catch{return null;}
+}
+function rssItems16926(issue,url){
+  const seen=new Set(),items=[];
+  for(const e of issue.entries.slice(0,100)){
+    const a=noteLink161(e?.link||'',url,'article');if(!a||seen.has(a.id))continue;
+    seen.add(a.id);items.push({key:a.id,owner:a.owner,title:String(e.title||'').slice(0,180),pub:Date.parse(e.pubdate)||0});
+  }
+  return items;
+}
+function rssHeader16926(value){return typeof value==='string'&&value.length<=512&&!/[\r\n\u0000]/.test(value)?value:'';}
+function rssPrevious16926(body){
+  const text=words161(body).normalize('NFKC').replace(/\s+/g,'');
+  if(/未発表|未公開|新作(?:のみ|限定)|(?:既発表|過去作|過去記事|再掲).{0,10}(?:不可|禁止|NG|除く)|(?:過去|既発表).{0,30}(?:ただし|但し|場合に限|条件付き)/i.test(text))return false;
+  return /(?:既発表(?:の)?(?:作品|記事)?|過去(?:の)?(?:作品|記事)|再掲)(?:も|は|で)?(?:可|OK|歓迎|可能)|過去に(?:公開|投稿|発表)した(?:作品|記事).{0,35}(?:応募可能|応募できます|参加できます|応募可)/i.test(text);
+}
+function rssTopic16926(n){
+  const text=words161(n.body).normalize('NFKC');
+  const m=/(?:テーマ|お題)\s*(?:は|[:：]|■)?\s*[「『“"]([^」』”"\n]{1,50})[」』”"]/.exec(text);
+  return m?m[1].trim():'';
+}
+function rssTopicMatch16926(topic,feature,title){
+  if(!feature?.full||!topic)return 0;
+  const f=networkFeature16922({name:topic,body:topic},true);
+  const themes=f.themes.filter(t=>t!=='独白'&&feature.themes.includes(t));
+  const tokens=f.tokens.filter(t=>feature.tokens.includes(t));
+  if(!themes.length&&!tokens.length&&!title.includes(topic))return 0;
+  return Math.min(1,(title.includes(topic)?0.6:0)+0.25*themes.length+0.15*tokens.length);
+}
+Object.assign(Desk520.prototype,{
+  initRss16926(){
+    if(this.rssReady16926)return;
+    this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE IF NOT EXISTS desk_rss16926(id INTEGER PRIMARY KEY,requests INTEGER DEFAULT 0,unchanged INTEGER DEFAULT 0,changed INTEGER DEFAULT 0,new_items INTEGER DEFAULT 0,due INTEGER DEFAULT 0,pruned INTEGER DEFAULT 0,sample_day TEXT DEFAULT '',sample_used INTEGER DEFAULT 0,sample_slot TEXT DEFAULT '',sample_url TEXT DEFAULT '',sample_at INTEGER DEFAULT 0,sample_due INTEGER DEFAULT 0,sample_feed TEXT DEFAULT '',message TEXT DEFAULT 'RSSの観測を開始待ち')");
+      this.rows('INSERT OR IGNORE INTO desk_rss16926(id) VALUES(1)');
+      this.rows("CREATE TABLE IF NOT EXISTS desk_rss_feed16926(url TEXT PRIMARY KEY,id TEXT NOT NULL,checked INTEGER NOT NULL,items TEXT NOT NULL,payload TEXT NOT NULL,etag TEXT NOT NULL,modified TEXT NOT NULL,quiet INTEGER NOT NULL,added INTEGER NOT NULL,full_at INTEGER NOT NULL)");
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_feed_age16926 ON desk_rss_feed16926(checked,url)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_feed_id16926 ON desk_rss_feed16926(id,checked)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_window16926(id TEXT NOT NULL,start INTEGER NOT NULL,finish INTEGER NOT NULL,day TEXT NOT NULL,hour INTEGER NOT NULL,added INTEGER NOT NULL,PRIMARY KEY(id,start))');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_window_age16926 ON desk_rss_window16926(finish)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_appearance16926(article TEXT NOT NULL,id TEXT NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,not_before INTEGER NOT NULL,automatic INTEGER NOT NULL,name TEXT NOT NULL,PRIMARY KEY(article,id))');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_appearance_age16926 ON desk_rss_appearance16926(last_seen)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_appearance_source16926 ON desk_rss_appearance16926(id,first_seen,article)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_spread16926(article TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,first_seen INTEGER NOT NULL,not_before INTEGER NOT NULL,observed INTEGER NOT NULL,PRIMARY KEY(article,source,target))');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_spread_source16926 ON desk_rss_spread16926(source,observed,article)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_spread_age16926 ON desk_rss_spread16926(observed)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_delay16926(article TEXT NOT NULL,id TEXT NOT NULL,started INTEGER NOT NULL,until INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(article,id))');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_delay_age16926 ON desk_rss_delay16926(started)');
+      this.rows("CREATE TABLE IF NOT EXISTS desk_rss_brief16926(source TEXT PRIMARY KEY,kind TEXT NOT NULL,url TEXT NOT NULL,title TEXT NOT NULL,hash TEXT NOT NULL,topic TEXT NOT NULL,previous INTEGER NOT NULL,policy TEXT NOT NULL,checked INTEGER NOT NULL,due INTEGER NOT NULL,cursor TEXT NOT NULL DEFAULT '',message TEXT NOT NULL)");
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_brief_due16926 ON desk_rss_brief16926(due,source)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_brief_age16926 ON desk_rss_brief16926(checked)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_match16926(source TEXT NOT NULL,article TEXT NOT NULL,title TEXT NOT NULL,score REAL NOT NULL,hash TEXT NOT NULL,at INTEGER NOT NULL,ready INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(source,article))');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_match_work16926 ON desk_rss_match16926(article,ready,at)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_match_age16926 ON desk_rss_match16926(at)');
+    });
+    this.rssReady16926=true;
+  },
+  rssTry16926(fn,fallback=null){
+    if(this.rssFaultUntil16926>Date.now())return fallback;
+    try{this.initRss16926();return fn();}catch{
+      this.rssFaultUntil16926=Date.now()+HOUR;
+      try{this.rows("UPDATE desk_rss16926 SET message='追加の観測情報を再確認待ち。通常の巡回を継続' WHERE id=1");}catch{}
+      return fallback;
+    }
+  },
+  rssTrim16926(now){
+    const prune=this.one('SELECT pruned FROM desk_rss16926 WHERE id=1').pruned<=now-HOUR;
+    for(const [table,age,cap] of [['feed','checked',RSS16926.feeds],['window','finish',RSS16926.windows],['appearance','last_seen',RSS16926.appearances],['spread','observed',RSS16926.spread],['delay','started',RSS16926.delays],['brief','checked',RSS16926.briefs],['match','at',RSS16926.matches]]){
+      if(!prune&&!['feed','delay','brief'].includes(table))continue;
+      const name='desk_rss_'+table+'16926';
+      this.rows('DELETE FROM '+name+' WHERE '+age+'<?',now-RSS16926.age);
+      this.rows('DELETE FROM '+name+' WHERE rowid IN (SELECT rowid FROM '+name+' ORDER BY '+age+' DESC,rowid DESC LIMIT -1 OFFSET ?)',cap);
+    }
+    if(prune)this.rows('UPDATE desk_rss16926 SET pruned=? WHERE id=1',now);
+  },
+  rssObserve16926(url,issue,old,headers={},unchanged=false){
+    const now=Date.now(),identity=rssIdentity16926(url,issue);if(!identity)return;
+    const items=rssItems16926(issue,url),before=networkJSON16922(old?.items||'[]'),known=new Set(before.map(i=>i.key));
+    const added=old?items.filter(i=>!known.has(i.key)):items;
+    const payload=JSON.stringify(issue),cacheable=payload.length<=131072&&!/(?:no-store|private)/i.test(headers.cache||'');
+    this.storage.transactionSync(()=>{
+      const span=old?now-old.checked:0,hour=Math.floor((now+9*HOUR)/HOUR),priorHour=old?Math.floor((old.checked+9*HOUR)/HOUR):0;
+      // A day-long gap cannot identify the hour when a magazine changed.
+      if(identity.id&&span>=30000&&span<=90*M520&&hour===priorHour)
+        this.rows('INSERT OR IGNORE INTO desk_rss_window16926 VALUES(?,?,?,?,?,?)',identity.id,old.checked,now,jstDay(now),hour%24,added.filter(n=>n.owner!=='43__').length);
+      this.rows(`INSERT INTO desk_rss_feed16926 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET id=excluded.id,checked=excluded.checked,items=excluded.items,payload=excluded.payload,etag=excluded.etag,modified=excluded.modified,quiet=excluded.quiet,added=excluded.added,full_at=excluded.full_at`,
+        url,identity.id,now,JSON.stringify(items),cacheable?payload:'',cacheable?rssHeader16926(headers.etag):'',cacheable?rssHeader16926(headers.modified):'',old&&!added.length?(old.quiet||0)+1:0,old?added.length:0,unchanged?old.full_at:now);
+      this.rows('UPDATE desk_rss16926 SET requests=requests+1,unchanged=unchanged+?,changed=changed+?,new_items=new_items+?,message=? WHERE id=1',unchanged?1:0,old&&added.length?1:0,added.length,'RSSの更新差分を確認。募集要項・操作直前の確認は継続');
+      if(identity.id&&identity.owner!=='43__')this.rssAppear16926(identity,issue.header.title||identity.id,items,old,known,now);
+      this.rssTrim16926(now);
+    });
+    // Old entries at the head of a feed cannot hide newly arrived works.
+    this.networkTry16922(()=>{
+      const writers=new Set();
+      for(const n of added)if(writers.size<4&&!writers.has(n.owner)&&n.pub>0&&n.pub<=now){
+        writers.add(n.owner);this.networkWork16922({key:n.key,status:'published',user:{urlname:n.owner},name:n.title,publishAt:new Date(n.pub).toISOString()},false);
+      }
+    });
+  },
+  rssAppear16926(identity,name,items,old,known,now){
+    for(const n of items.filter(i=>i.owner==='43__').slice(0,20)){
+      if(!this.one('SELECT 1 FROM desk_archive WHERE article=? AND verified>0',n.key))continue;
+      const existing=this.one('SELECT * FROM desk_rss_appearance16926 WHERE article=? AND id=?',n.key,identity.id);
+      const automatic=!!this.one('SELECT 1 FROM desk_mag_send WHERE article=? AND id=?',n.key,identity.id)||!!this.one("SELECT 1 FROM desk_job WHERE kind='mag' AND article=? AND target=? AND phase IN ('sent','seen','confirmed')",n.key,identity.id);
+      const lower=old&&!known.has(n.key)&&old.checked>=now-2*D520?old.checked:0;
+      this.rows(`INSERT INTO desk_rss_appearance16926 VALUES(?,?,?,?,?,?,?) ON CONFLICT(article,id) DO UPDATE SET last_seen=excluded.last_seen,automatic=MAX(automatic,excluded.automatic),name=excluded.name`,n.key,identity.id,now,now,lower,+automatic,String(name).slice(0,100));
+      if(existing||automatic||!lower)continue;
+      const prior=this.rows('SELECT * FROM desk_rss_appearance16926 WHERE article=? AND id<>? AND first_seen<=? AND first_seen>=? ORDER BY first_seen DESC LIMIT 8',n.key,identity.id,lower,now-RSS16926.age);
+      for(const a of prior)this.rows('INSERT OR IGNORE INTO desk_rss_spread16926 VALUES(?,?,?,?,?,?)',n.key,a.id,identity.id,a.first_seen,lower,now);
+    }
+  },
+  async rssFetch16926(url){
+    const now=Date.now();
+    if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)throw new PublicReadError('note指定の待機中');
+    const old=this.rssTry16926(()=>this.one('SELECT * FROM desk_rss_feed16926 WHERE url=?',url));
+    let cached=null;
+    try{cached=JSON.parse(old?.payload||'');if(!rssIdentity16926(url,cached))cached=null;}catch{}
+    const headers={Accept:'application/rss+xml, application/xml, text/xml'};
+    // Periodically retrieve a full response even when a server has validators.
+    if(cached&&old.full_at>now-D520){if(old.etag)headers['If-None-Match']=old.etag;else if(old.modified)headers['If-Modified-Since']=old.modified;}
+    let response,target=url;
+    for(let attempt=0;attempt<3;attempt++){
+      try{response=await fetch(target,{method:'GET',redirect:'manual',cache:'no-store',headers,signal:AbortSignal.timeout(7500)});}
+      catch(e){throw new PublicReadError(['AbortError','TimeoutError'].includes(e?.name)?'noteへの通信がタイムアウト':'noteから応答を受け取れません');}
+      if(![301,302,303,307,308].includes(response.status))break;
+      const next=directoryRedirect161(target,response.headers.get('Location')||'');await response.body?.cancel();
+      if(!next||next===target||attempt===2)throw new PublicReadError('RSSの転送先を確認できません');
+      target=next;
+    }
+    const unchanged=response.status===304;
+    if(unchanged&&(!cached||!headers['If-None-Match']&&!headers['If-Modified-Since'])){await response.body?.cancel();throw new PublicReadError('RSSの更新確認に必要な記録がありません');}
+    if(!response.ok&&!unchanged){
+      const raw=response.headers.get('Retry-After');let until=raw&&(/^\d+$/.test(raw)?now+Number(raw)*1000:Date.parse(raw));
+      if(response.status===429||until>now){if(!Number.isSafeInteger(until)||until<=now)until=now+HOUR;this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);}
+      await response.body?.cancel();throw new PublicReadError('note応答 HTTP '+response.status);
+    }
+    let issue=cached;
+    if(!unchanged){
+      let body;try{body=await read520body(response,3000000);}catch{throw new PublicReadError('RSS本文を読み取れません');}
+      try{issue=rss520(body,'issue');}catch{throw new PublicReadError('RSSの形式を読み取れません');}
+    }else await response.body?.cancel();
+    this.rssTry16926(()=>this.rssObserve16926(url,issue,old,{etag:response.headers.get('ETag')||(unchanged?old.etag:''),modified:response.headers.get('Last-Modified')||(unchanged?old.modified:''),cache:response.headers.get('Cache-Control')||''},unchanged));
+    return issue;
+  },
+  rssScoutDelay16926(url,now){
+    return this.rssTry16926(()=>{
+      const f=this.one('SELECT * FROM desk_rss_feed16926 WHERE url=?',url+'/rss');
+      if(!f||f.checked<now-10*M520)return D520;
+      return f.quiet>=2?2*D520:f.added>=6?2*HOUR:f.added>0?6*HOUR:D520;
+    },D520);
+  },
+  async rssSampleTick16926(now){
+    const plan=this.rssTry16926(()=>{
+      if(!this.contestActive16923(now))return null;
+      const day=jstDay(now),hour=Math.floor((now+9*HOUR)/HOUR)%24,minute=Math.floor(now/M520)%60;
+      let s=this.one('SELECT * FROM desk_rss16926 WHERE id=1');
+      if(s.sample_day!==day){
+        this.rows("UPDATE desk_rss16926 SET sample_day=?,sample_used=0,sample_slot='',sample_url='',sample_at=0,sample_due=0,sample_feed='' WHERE id=1",day);
+        s=this.one('SELECT * FROM desk_rss16926 WHERE id=1');
+      }
+      if(s.sample_used>=8||s.sample_due>now)return null;
+      if(s.sample_url&&(now-s.sample_at>50*M520||Math.floor(s.sample_at/HOUR)!==Math.floor(now/HOUR))){
+        this.rows("UPDATE desk_rss16926 SET sample_url='' WHERE id=1");return null;
+      }
+      const slot=day+'-'+hour,following=!!s.sample_url;
+      if(!following&&(![12,13,20,21].includes(hour)||minute>30||s.sample_slot===slot))return null;
+      const budget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1'),used=budget.day===day?budget.used:0;
+      if(used>=192||this.one('SELECT due FROM desk_scout_state WHERE id=1').due>now)return null;
+      let feed=following?s.sample_url:s.sample_feed;
+      if(!feed){
+        const candidates=this.rows(`SELECT f.url FROM desk_rss_feed16926 f JOIN desk_mag m ON f.url=m.url||'/rss'
+          WHERE m.active=1 AND f.id<>'' AND f.checked>=? ORDER BY f.checked DESC,f.url LIMIT 2`,now-2*D520);
+        if(!candidates.length)return null;
+        feed=candidates[Math.floor(jstStart(day)/D520)%candidates.length].url;
+      }
+      if(!rssUrl16926(feed))return null;
+      this.storage.transactionSync(()=>{
+        this.rows('UPDATE desk_scout_budget SET day=?,used=? WHERE id=1',day,used+1);
+        this.rows('UPDATE desk_scout_state SET due=MAX(due,?) WHERE id=1',now+6*M520);
+        this.rows('UPDATE desk_rss16926 SET sample_used=sample_used+1,sample_slot=?,sample_url=?,sample_at=?,sample_due=?,sample_feed=? WHERE id=1',slot,following?'':feed,following?0:now,following?0:now+20*M520,feed);
+      });
+      return feed;
+    });
+    if(!plan)return;
+    try{await this.publicRead(plan,'issue');}
+    catch{this.rssTry16926(()=>this.rows("UPDATE desk_rss16926 SET message='時間帯の観測は再確認待ち。確認できた区間だけ比較します' WHERE id=1"));}
+  },
+  rssRates16926(id,now){
+    return this.rows('SELECT hour,COUNT(DISTINCT day) days,SUM(finish-start) duration,SUM(added) added FROM desk_rss_window16926 WHERE id=? AND finish>=? GROUP BY hour',id,now-21*D520)
+      .filter(r=>r.days>=3&&r.duration>=HOUR).map(r=>({...r,rate:r.added*HOUR/r.duration}));
+  },
+  rssTiming16926(job,now){
+    return this.rssTry16926(()=>{
+      const old=this.one('SELECT * FROM desk_rss_delay16926 WHERE article=? AND id=?',job.key,job.target);
+      if(old){if(now>=old.until||now>=old.started+2*HOUR)return job;return null;}
+      const feed=this.one('SELECT checked FROM desk_rss_feed16926 WHERE id=? ORDER BY checked DESC LIMIT 1',job.target);
+      if(!feed||feed.checked<now-2*D520)return job;
+      const rates=this.rssRates16926(job.target,now),hour=Math.floor((now+9*HOUR)/HOUR)%24,current=rates.find(r=>r.hour===hour);
+      if(!current||current.rate<3)return job;
+      const next=rates.filter(r=>{const gap=(r.hour-hour+24)%24;return gap>=1&&gap<=2&&r.rate*2+0.5<current.rate;})
+        .sort((a,b)=>a.rate-b.rate||((a.hour-hour+24)%24)-((b.hour-hour+24)%24))[0];
+      if(!next)return job;
+      const until=Math.min(now+2*HOUR,Math.floor(now/HOUR)*HOUR+((next.hour-hour+24)%24)*HOUR);
+      this.rows('INSERT INTO desk_rss_delay16926 VALUES(?,?,?,?,?)',job.key,job.target,now,until,'観測上、更新の少ない時間帯まで共同誌への追加を待機');
+      this.rssTrim16926(now);return null;
+    },job);
+  },
+  rssChoose16926(valid,base,work,now){
+    if(!base||!work?.article)return base;
+    return this.rssTry16926(()=>{
+      const sent=this.one('SELECT COUNT(*) n FROM desk_mag_send WHERE article=?',work.article).n;
+      if(sent%4===0)return base;
+      const choices=[base,...valid.filter(m=>m.url!==base.url)].filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now)).slice(0,24);
+      const matches=this.rows(`SELECT m.source,m.score FROM desk_rss_match16926 m JOIN desk_rss_brief16926 b ON b.source=m.source AND b.hash=m.hash
+        WHERE m.article=? AND m.ready=1 AND m.at>=? AND b.checked>=?`,work.article,now-2*D520,now-2*D520);
+      const matched=matches.sort((a,b)=>b.score-a.score).map(r=>({r,mag:choices.find(m=>noteLink161(m.url)?.id===r.source)})).find(x=>x.mag);
+      if(matched&&matched.r.score>=0.25)return matched.mag;
+      const scores=choices.map(m=>{
+        const id=noteLink161(m.url)?.id;
+        const observations=this.one('SELECT COUNT(*) n FROM desk_rss_appearance16926 WHERE id=? AND first_seen>=?',id,now-RSS16926.age).n;
+        const later=this.one('SELECT COUNT(DISTINCT article) n FROM desk_rss_spread16926 WHERE source=? AND observed>=?',id,now-RSS16926.age).n;
+        return {m,observations,later,score:observations?later/observations:0};
+      });
+      const baseline=scores[0];if(!baseline||baseline.observations<6)return base;
+      const better=scores.filter(s=>s.observations>=6&&s.later>=3&&s.score>=baseline.score+0.2).sort((a,b)=>b.score-a.score)[0];
+      return better?.m||base;
+    },base);
+  },
+  rssBrief16926(source,kind,url,title,hash,topic,previous,policy,message){
+    const old=this.one('SELECT hash FROM desk_rss_brief16926 WHERE source=?',source),now=Date.now();
+    this.storage.transactionSync(()=>{
+      if(old&&old.hash!==hash)this.rows('DELETE FROM desk_rss_match16926 WHERE source=?',source);
+      this.rows(`INSERT INTO desk_rss_brief16926(source,kind,url,title,hash,topic,previous,policy,checked,due,message) VALUES(?,?,?,?,?,?,?,?,?,0,?)
+        ON CONFLICT(source) DO UPDATE SET kind=excluded.kind,url=excluded.url,title=excluded.title,hash=excluded.hash,topic=excluded.topic,previous=excluded.previous,policy=excluded.policy,checked=excluded.checked,
+        due=CASE WHEN hash<>excluded.hash THEN 0 ELSE due END,cursor=CASE WHEN hash<>excluded.hash THEN '' ELSE cursor END,message=excluded.message`,source,kind,url,String(title).slice(0,180),hash,topic,+previous,JSON.stringify(policy||{}),now,message);
+      if(!previous||kind==='mag'&&!policy)this.rows('DELETE FROM desk_rss_match16926 WHERE source=?',source);
+      this.rssTrim16926(now);
+    });
+  },
+  async rssCapture16926(path,format,value){
+    if(format!=='json'||!/^https:\/\/note\.com\/api\/v3\/notes\/n[a-z0-9]+$/.test(path))return;
+    const n=value?.data;if(n?.key!==path.split('/').at(-1)||n.status!=='published'||!contestOwner16923(n.user?.urlname)||n.price!==0||
+      n.isLimited===true||n.is_limited===true||n.isPaid===true||n.is_paid===true||n.isPreview===true||n.hasPaywall===true||typeof n.body!=='string'||n.body.length>250000||!/募集|コンテスト|お題|企画/.test(n.name||''))return;
+    const hash=await draftBodyHash(n.body);if(!hash)return;
+    const previous=rssPrevious16926(n.body),topic=rssTopic16926(n),policy=contestRule16923(n);
+    this.rssTry16926(()=>this.rssBrief16926(n.key,'contest','https://note.com/'+n.user.urlname+'/n/'+n.key,n.name,hash,topic,previous,policy,
+      previous?'既刊との照合候補。参加資格・期間・応募方法の全条件を別途確認':'過去作品の応募可否を確認できないため既刊は対象外'));
+  },
+  async rssMagazineBrief16926(row,result){
+    const link=noteLink161(row?.url);if(!link||!result)return;
+    // This hook runs AFTER the existing owner, permission and complete rule
+    // parser. RSS headlines and discovery alone cannot create a ready match.
+    const rule=noteLink161(result.rules||'','https://note.com','article');
+    const captured=this.rssTry16926(()=>rule?this.one('SELECT topic,hash FROM desk_rss_brief16926 WHERE source=?',rule.id):null);
+    const hash=await draftBodyHash(JSON.stringify({policy:result.policy||null,rules:result.rules||'',summary:result.summary||'',title:result.title||'',topic:captured?.topic||'',sourceHash:captured?.hash||''}));
+    this.rssTry16926(()=>{
+      this.rssBrief16926(link.id,'mag',row.url,result.title||row.name||link.id,hash,captured?.topic||'',!!result.policy,result.policy,
+        result.policy?'既発表可を含む掲載条件を確認。過去作品との照合待ち':result.reason||'掲載条件を再確認待ち');
+    });
+  },
+  rssMatchTick16926(now){
+    return this.rssTry16926(()=>{
+      if(!this.contestActive16923(now)||this.one('SELECT due FROM desk_rss16926 WHERE id=1').due>now)return;
+      this.rows('UPDATE desk_rss16926 SET due=? WHERE id=1',now+30*M520);
+      const b=this.one('SELECT * FROM desk_rss_brief16926 WHERE previous=1 AND checked>=? AND due<=? ORDER BY due,source LIMIT 1',now-2*D520,now);if(!b)return;
+      let policy;try{policy=JSON.parse(b.policy);}catch{return;}
+      const mag=b.kind==='mag'?this.eligibleMags(now).find(m=>noteLink161(m.url)?.id===b.source):null;
+      const candidates=this.rows(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method,n.feature,n.seen feature_at FROM desk_archive a
+        LEFT JOIN desk_work w ON w.article=a.article LEFT JOIN desk_network_work16922 n ON n.article=a.article AND n.owner='43__'
+        WHERE a.pub<? AND a.verified>=? AND a.article>? ORDER BY a.article LIMIT 24`,now,now-8*D520,b.cursor);
+      let nudged=false;
+      this.storage.transactionSync(()=>{
+        for(const a of candidates){
+          if(a.title.trim()==='521')continue;
+          const feature=a.feature_at>=now-8*D520?networkParseFeature16922(a.feature):null;
+          if(b.kind==='mag'&&(!mag||!this.archiveFits(a,[mag],now).length))continue;
+          const score=b.topic?rssTopicMatch16926(b.topic,feature,a.title):b.kind==='mag'?0.25:0;
+          if(!score){
+            if(b.topic&&!feature&&!nudged){this.networkTry16922(()=>this.networkWork16922({key:a.article,name:a.title,status:'published',user:{urlname:'43__'},publishAt:new Date(a.pub).toISOString()},false));nudged=true;}
+            continue;
+          }
+          const ready=b.kind==='mag'&&!!mag;
+          this.rows(`INSERT INTO desk_rss_match16926 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source,article) DO UPDATE SET title=excluded.title,score=excluded.score,hash=excluded.hash,at=excluded.at,ready=excluded.ready,message=excluded.message`,b.source,a.article,a.title,score,b.hash,now,+ready,
+            ready?'既発表可・字数・ジャンル・制作条件を照合。既存の掲載処理で直前再確認':'題材の一致候補。応募資格・期間・操作方法が未確認のため応募しません');
+          if(ready)this.rows('UPDATE desk_archive SET pick_due=0 WHERE article=?',a.article);
+        }
+        this.rows('UPDATE desk_rss_brief16926 SET cursor=?,due=? WHERE source=?',candidates.length===24?candidates.at(-1).article:'',now+(candidates.length===24?30*M520:6*HOUR),b.source);
+        this.rssTrim16926(now);
+      });
+    });
+  },
+  rssView16926(){
+    return this.rssTry16926(()=>({state:this.one('SELECT * FROM desk_rss16926 WHERE id=1'),feeds:this.one('SELECT COUNT(*) n FROM desk_rss_feed16926').n,
+      delays:this.rows('SELECT article,id,until,message FROM desk_rss_delay16926 WHERE until>? ORDER BY until LIMIT 8',Date.now()),
+      spread:this.rows('SELECT source,target,COUNT(DISTINCT article) works,MAX(observed) at FROM desk_rss_spread16926 WHERE observed>=? GROUP BY source,target ORDER BY works DESC,at DESC LIMIT 8',Date.now()-RSS16926.age),
+      matches:this.rows('SELECT m.*,b.url,b.title opportunity FROM desk_rss_match16926 m JOIN desk_rss_brief16926 b ON b.source=m.source AND b.hash=m.hash WHERE m.at>=? AND b.checked>=? ORDER BY m.ready DESC,m.score DESC,m.at DESC LIMIT 12',Date.now()-2*D520,Date.now()-2*D520)
+    }));
+  }
+});
+const rssInitBefore16926=Desk520.prototype.init;
+Desk520.prototype.init=function(){
+  const result=rssInitBefore16926.call(this);
+  this.rssTry16926(()=>true,false);
+  return result;
+};
+const rssFetchBefore16926=Desk520.prototype.fetchPublic;
+Desk520.prototype.fetchPublic=async function(path,format){
+  const url=['rss','issue','channel'].includes(format)&&rssUrl16926(path);
+  if(!url||!this.rssTry16926(()=>true,false))return rssFetchBefore16926.call(this,path,format);
+  this.rssPending16926 ||= new Map();
+  let task=this.rssPending16926.get(url);
+  if(!task){task=this.rssFetch16926(url).finally(()=>this.rssPending16926.delete(url));this.rssPending16926.set(url,task);}
+  const issue=await task;
+  return structuredClone(format==='issue'?issue:format==='channel'?issue.header:issue.entries);
+};
+const rssReadBefore16926=Desk520.prototype.publicRead;
+Desk520.prototype.publicRead=async function(path,format){
+  const result=await rssReadBefore16926.call(this,path,format);
+  try{await this.rssCapture16926(path,format,result);}catch{}
+  return result;
+};
+const rssRulesBefore16926=Desk520.prototype.sourceForMagazine;
+Desk520.prototype.sourceForMagazine=async function(row){
+  const result=await rssRulesBefore16926.call(this,row);
+  try{await this.rssMagazineBrief16926(row,result);}catch{}
+  return result;
+};
+const rssChooseBefore16926=Desk520.prototype.chooseMagazine520;
+Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
+  const base=rssChooseBefore16926.call(this,valid,genre,now,work);
+  return this.rssChoose16926(valid,base,work,now);
+};
+function rssRecord16926(v){
+  if(!v)return '【RSSと既刊の活用】追加情報を再確認待ち。通常処理は継続';
+  return '【RSSと既刊の活用】\n'+v.state.message+'\n観測中 '+v.feeds+'フィード ／ 更新なし応答 '+v.state.unchanged+'回 ／ 差分で見つけた記事 '+v.state.new_items+'件'+
+    '\n時間帯の観測は最大8取得/日。既存192ページ枠に含めます。3日以上の観測が揃うまでは通常の掲載を継続。'+
+    '\n混雑を避ける掲載待機 '+v.delays.length+'件（最大2時間後の通常枠へ。作品の公開予約は変更しません）'+
+    v.delays.map(d=>'\n'+d.article+' → '+d.id+' ／ '+time(d.until)+'以降').join('')+
+    '\n後続の誌面で確認した組み合わせ：'+(v.spread.length?v.spread.map(s=>s.source+' → '+s.target+' '+s.works+'作品').join(' ／ '):'観測を収集中')+
+    '\n過去作品と新しい募集の照合：'+(v.matches.length?v.matches.map(m=>'\n'+m.title+' → '+m.opportunity+'\n'+m.url+'\n'+m.message).join(''):'条件と題材の合う作品を確認待ち')+
+    '\n二次掲載はRSS上での観測順です。掲載時刻・紹介者・流入の因果関係は未確認。既存の参加資格・上限・待機・応募方法の確認を通ったものだけ操作します。';
+}
 
 const BROWSER_SOURCES520 = Object.freeze({
   "contestScreen16923": "function contestScreen16923(step,arg){\n  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||\n    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();\n  const one=xs=>xs.length===1?xs[0]:null;\n  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));\n  const dialogs=all(document,'[role=dialog],dialog');\n  if(dialogs.length){\n    const dialog=one(dialogs),text=dialog?.innerText||'';\n    const ok=dialog&&button(dialog,['OK']);\n    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};\n    if(step==='confirm'){ok.click();return {state:'confirmed'};}\n    return {state:'confirmation'};\n  }\n  if(step==='settings'){\n    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};\n    go.click();return {state:'opened'};\n  }\n  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};\n  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));\n  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};\n  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);\n  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));\n  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||\n    all(document,'input[type=\"datetime-local\"],[name*=\"schedul\"][type=hidden]').some(e=>e.value))return {state:'settings'};\n  const expected=[...new Set(arg.tags)].sort();\n  const values=[];\n  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name=\"hashtags[]\"]')){\n    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';\n    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\\s*$/,'').replace(/^#/,'').trim();\n    if(clean&&!/\\n/.test(clean))values.push(clean);\n  }\n  for(const el of all(document,'[aria-label]')){\n    const label=el.getAttribute('aria-label')||'';\n    const m=/^ハッシュタグ\\s*#?(.+?)(?:\\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());\n  }\n  const actual=[...new Set(values)].sort();\n  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;\n  if(!tags)return {state:'tags'};\n  if(step==='ready'&&!tags.includes(arg.tag)&&tags.length>=10)return {state:'tag_limit'};\n  if(step==='ready'||step==='updatedReady')return {state:'ready'};\n  if(step==='add'){\n    if(tags.includes(arg.tag))return {state:'already'};\n    if(tags.length>=10)return {state:'tag_limit'};\n    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\n    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};\n    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));\n    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));\n    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));\n    return {state:'added'};\n  }\n  if(step==='update'){submit.click();return {state:'clicked'};}\n  return {state:'unknown'};\n}",
