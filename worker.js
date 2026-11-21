@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.21';
+const VERSION = 'v16.9.22';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -29,6 +29,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <style>body{font:17px system-ui;max-width:700px;margin:24px auto;padding:0 18px;line-height:1.7}input,textarea,select,button{font:inherit;padding:12px;box-sizing:border-box}input,textarea,select{width:100%}button{margin:12px 8px 0 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}details{margin-top:24px}small{display:block}</style>
 <h1>note-helper ${VERSION}</h1><p><a href="/test">今すぐ本番テスト・結果を見る</a></p><p><a href="/tuta" style="display:block;padding:16px;background:#eef2ff;font-weight:bold">Tuta接続・招待メールの自動確認</a></p><p><a href="/520">520の作品管理・記録</a></p>
 <p>創作記事の感想コメントへのスキと、創作記事に反応した読者の公開記事を自動で探索します。追加探索は30分以上空け、各アカウント1日12回まで。送信枠と同じ人への待機を記事巡回と共有します。成功件数と確認待ちは状態欄に表示します。</p>
+<p>公開作品の内容が近い別作者の作品を最大10本比較し、3作品以上に共通して反応した読者と、継続して他者の作品を紹介する作者を優先します。材料が足りない間は従来の巡回を続けます。比較状況は「520の作品管理・記録」に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
 <p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <p>質問箱の文芸に関する回答へのスキと、520の0円メンバーシップ参加も自動で探索します。通常会費0円と、新しくフォローしないことを確認できた場合だけ参加します。結果は状態確認に表示します。</p>
@@ -520,6 +521,7 @@ async function saveSeed1697(env,notes,tag,ownIds,cursor) {
     !ownIds.has(String(n.user?.id)) && ((Number(n.comment_count??n.commentCount)||0)>0 || (Number(n.like_count??n.likeCount)||0)>0));
   if(!candidates.length)return;
   const n=candidates[cursor%candidates.length];
+  networkCall16922(env,'seed',candidates,null,false);
   await sql(env,'UPDATE nh_v1697_discovery SET seed=?,seed_owner=?,seed_at=? WHERE slot=?',n.key,n.user.urlname,Date.now(),env.SLOT).run();
 }
 async function liveDiscovery1697(env,token) {
@@ -675,6 +677,7 @@ async function rememberReaders1699(env,owners,seed,origin,bump) {
   const now=Date.now();
   const names=[...new Set(owners)].filter(n=>typeof n==='string' && /^[\w-]{1,80}$/.test(n) && n!==seed.owner && n!==env.TRACE?.identity?.owner).slice(0,20);
   if(!names.length)return;
+  const origins=origin==='literary'?(networkCall16922(env,'origins')||{}):{};
   // Maximum 64 pending public identities per account; all lookups use indexes.
   // Refreshing an existing reader never shortens its next-check time.
   const result=await env.DB.batch([
@@ -682,15 +685,18 @@ async function rememberReaders1699(env,owners,seed,origin,bump) {
     ...names.map(owner=>sql(env,`INSERT INTO nh_v1699_readers(slot,owner,source,origin,seen,expires,next_at) SELECT ?,?,?,?,?,?,0
       WHERE (SELECT COUNT(*) FROM nh_v1699_readers WHERE slot=?)<64 OR EXISTS(SELECT 1 FROM nh_v1699_readers WHERE slot=? AND owner=?)
       ON CONFLICT(slot,owner) DO UPDATE SET source=excluded.source,origin=excluded.origin,seen=excluded.seen,expires=excluded.expires`,
-      env.SLOT,owner,seed.key,origin,now,now+7*24*HOUR,env.SLOT,env.SLOT,owner))
+      env.SLOT,owner,seed.key,origins[owner]||origin,now,now+7*24*HOUR,env.SLOT,env.SLOT,owner))
   ]);
   bump('reader_saved',result.slice(1).filter(r=>r.meta.changes).length);
 }
 async function queuedReader1699(env,state,settings,token,ownIds,bump,origin=null) {
   if(!await liveDiscovery1697(env,token))return null;
   const now=Date.now();
+  await networkEnqueue16922(env,bump);
+  const preferred=(env.TRACE?.learning?.turn||0)%4!==0?(networkCall16922(env,'rank')||[]):[];
+  const priority=preferred.length?'CASE q.owner '+preferred.map((_,i)=>'WHEN ? THEN '+i).join(' ')+' ELSE 9 END,':'';
   const row=await sql(env,`SELECT q.*,a.last_at FROM nh_v1699_readers q LEFT JOIN nh_v15_authors a ON a.author=q.author
-    WHERE q.slot=? AND q.next_at<=? AND q.expires>? AND (? IS NULL OR q.origin=?) ORDER BY q.next_at,q.owner LIMIT 1`,env.SLOT,now,now,origin,origin).first();
+    WHERE q.slot=? AND q.next_at<=? AND q.expires>? AND (? IS NULL OR q.origin=?) ORDER BY ${priority}q.next_at,q.owner LIMIT 1`,env.SLOT,now,now,origin,origin,...preferred).first();
   if(!row)return null;
   const wait=Math.max(now+24*HOUR,(row.last_at||0)+settings.author_hours*HOUR);
   const claimed=await sql(env,`UPDATE nh_v1699_readers SET next_at=? WHERE slot=? AND owner=? AND next_at<=?
@@ -715,7 +721,7 @@ async function queuedReader1699(env,state,settings,token,ownIds,bump,origin=null
     if(ids.size!==1)return null;
     await sql(env,'UPDATE nh_v1699_readers SET author=? WHERE slot=? AND owner=?',String(notes[0].user.id),env.SLOT,row.owner).run();
     await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',
-      (row.origin==='returning'?'自分の作品に反応した読者':'文芸記事に反応した読者')+'の公開記事を確認・送信結果は通常巡回欄に記録',env.SLOT).run();
+      (row.origin==='returning'?'自分の作品に反応した読者':row.origin==='overlap'?'近い3作品以上に共通して反応した読者':row.origin==='curator'?'他者の作品の紹介活動を確認した作者':'文芸記事に反応した読者')+'の公開記事を確認・送信結果は通常巡回欄に記録',env.SLOT).run();
   }
   if(notes.length && env.TRACE)env.TRACE.readerOrigin=row.origin;
   return notes.length?notes:null;
@@ -725,6 +731,7 @@ async function ownReaderSeed1699(env,state,turn) {
   if(identity?.id!==state.account || !/^[\w-]{1,80}$/.test(identity.owner))return null;
   const data=await api(env,'/api/v2/creators/'+encodeURIComponent(identity.owner)+'/contents?kind=note&page=1');
   if(!Array.isArray(data?.contents))return null;
+  networkCall16922(env,'corpus',data.contents,false);
   const notes=data.contents.slice(0,30).filter(n=>n?.status==='published' && /^n[a-z0-9]{1,64}$/.test(n.key) &&
     n.user?.urlname===identity.owner && String(n.user?.id)===state.account && typeof n.name==='string' && n.name.trim() && n.name.trim()!=='521' &&
     Math.max(Number(n.like_count??n.likeCount)||0,Number(n.comment_count??n.commentCount)||0)>0);
@@ -760,6 +767,7 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   if(!returning && (!/^n[a-z0-9]{1,64}$/.test(seed.key)||!/^[\w-]{1,80}$/.test(seed.owner)))return null;
   if(!await auxReadWrite16919(env,'discovery_lease',()=>liveDiscovery1697(env,token)))return {handled:true,message:'停止または処理期限のため追加巡回を終了しました'};
   const mode=pending?'verify':returning||s.turn%2?'readers':'comments';
+  if(mode==='readers'&&!returning)seed=networkCall16922(env,'seed',[],seed,true,s.turn)||seed;
   const component=returning?'own_readers':mode==='readers'?'readers':'comments';
   await diagnostic16915(env,component,'attempt','source');
   if(returning){
@@ -768,10 +776,12 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   }
   const source=await article(env,seed.key);
   if(!source || source.key!==seed.key || source.user?.urlname!==seed.owner || (returning?String(source.user?.id)!==state.account || source.status!=='published':ownIds.has(String(source.user?.id)) || (!pending&&!publicFiction1697(source)))){
+    networkCall16922(env,'missing',seed);
     if(pending){await settleComment1697(env,s.pending,false);return {handled:true,message:'前回のコメントの公開元を確認できず、再送せず除外しました'};}
     await auxReadWrite16919(env,'discovery_source_wait',()=>sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=? WHERE slot=?',now+30*60000,s.turn+1,env.SLOT).run());
     await record('創作タグ・公開元の一致を確認できず・次の巡回で別の記事を確認');await diagnostic16915(env,component,'wait','source_mismatch');return null;
   }
+  networkCall16922(env,'note',source);
   const claim=await claimDiscovery16919(env,s,Date.now(),!pending);
   if(!claim)return null;
   bump('reader_checks');
@@ -872,6 +882,7 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
     else throw new Trouble(result.message||'コメントの送信結果は未確認');
     return {handled:true,success:true,message:result.message};
   }
+  if(result.readersVerified)networkCall16922(env,'observe',source,result.likeOwners||[],returning);
   if(returning && result.readersVerified)await learningObserve16913(env,result.likeOwners||[],source,env.TRACE?.identity);
   if(!result.owners?.length)return null;
   await rememberReaders1699(env,result.owners,seed,returning?'returning':'literary',bump);
@@ -1257,7 +1268,7 @@ export class NoteScheduler {
       const due = schedule.active.find(s=>s.eligible<=Date.now());
       if (due) {
         await sql(this.env,'UPDATE nh_v15_runtime SET last_slot=?,last_at=? WHERE id=1',due.slot,Date.now()).run();
-        try { await run({...this.env,MEMBER_GATE16910:()=>{
+        try { await run({...this.env,NETWORK16922:this.desk?.ready?this.desk.networkBridge16922():null,MEMBER_GATE16910:()=>{
           this.desk ||= new Desk520(this.ctx.storage,this.env);this.desk.init();
           return !!this.desk.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
         }},due.slot); }
@@ -2238,6 +2249,7 @@ class Desk520 {
     this.initRuntime16916();
     this.initDistribution16918();
     this.initProductionTest16920();
+    this.networkTry16922(()=>this.initNetwork16922());
     this.ready=true;
   }
   async admin(req,ctx) {
@@ -2530,7 +2542,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -2971,7 +2983,7 @@ class Desk520 {
       const row=this.one(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?`,article);
       const fits=this.placementCandidates16918(row,mags,now);
       const genre=row.work_genre||row.genre;
-      const pick=this.chooseMagazine520(fits,genre,now);
+      const pick=this.chooseMagazine520(fits,genre,now,row);
       this.rows('UPDATE desk_archive SET pick_due=?,pick_rev=?,choice=? WHERE article=?',now+(pick?D520:HOUR),rev,pick?.url??null,article);
     }
   }
@@ -3116,7 +3128,7 @@ class Desk520 {
       const valid=mags.filter(({p})=>p.genres.includes(w.genre) && p.methods.includes(w.method) && w.chars>=p.min && w.chars<=p.max);
       if(valid.some(m=>m.url===w.magazine)) continue;
       valid.sort((a,b)=>a.p.genres.length-b.p.genres.length || (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
-      const picked=this.chooseMagazine520(valid,w.genre,now);
+      const picked=this.chooseMagazine520(valid,w.genre,now,w);
       const url=picked?.url??null;
       if(url!==w.magazine) this.rows('UPDATE desk_work SET magazine=? WHERE seq=?',url,w.seq);
     }
@@ -3663,6 +3675,7 @@ class Desk520 {
     await task('公開後の本文・見出し画像',()=>this.verifyLinkCover(Date.now()));
     await task('下書きタイトル',()=>this.lookupDraftTitle(Date.now()));
     await task('下書き一覧',()=>this.resolveDraftDirectory(Date.now()));
+    if(!publication)await task('作品と読者の比較情報',()=>this.networkTick16922(Date.now()));
     await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
     if(!publication)await task('参加先の募集確認',()=>this.expandJoin520(Date.now()));
     if(!publication)await task('Tutaの招待確認',()=>this.tutaTick520(Date.now()));
@@ -4050,6 +4063,7 @@ function deskRecordText(s) {
     lines.push('【自動処理の確認】',r.message,'最終開始 '+tm(r.started)+' ／ 最終巡回完了 '+tm(r.finished)+(r.fallback?' ／ 補助起動による確認':''));
     if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
   }
+  if(s.audience)lines.push(networkRecord16922(s.audience));
   if(s.pipeline)lines.push(pipelineRecord16913(s.pipeline));
   if(s.traffic)lines.push(trafficRecord16913(s.traffic));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
@@ -4914,8 +4928,9 @@ Object.assign(Desk520.prototype,{
     const rows=this.rows(`SELECT j.* FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE (j.due<=? OR ?) AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')
       AND (j.phase<>'wait' OR ? OR EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait')) AND (?='' OR j.id=?)
       ORDER BY EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') DESC,
-      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 1`,now,+!!probe,+applicationRoom,probe?.target||'',probe?.target||'');
-    const row=rows[0];
+      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 16`,now,+!!probe,+applicationRoom,probe?.target||'',probe?.target||'');
+    const canRank=rows[0]?.phase==='wait'&&!this.one("SELECT 1 FROM desk_invite WHERE id=? AND phase='wait'",rows[0].id);
+    const row=canRank?this.networkTry16922(()=>this.networkRecruitment16922(rows.filter(j=>j.phase==='wait'),now,cfg.used),rows[0]):rows[0];
     if(!row)return;
     if(probe?.verify && !['sent','applied','accepting','joined'].includes(row.phase))return;
     const target=this.joinTarget520(row.id);
@@ -5260,9 +5275,10 @@ Object.assign(Desk520.prototype,{
     if(c.due>now || !this.joinActive520(''))return;
     const day=jstDay(now),used=c.day===day?c.used:0;
     if(used>=48)return;
-    const row=this.one(`SELECT i.* FROM desk_join_discovery q JOIN desk_import i ON i.id=q.id
+    const choices=this.rows(`SELECT i.* FROM desk_join_discovery q JOIN desk_import i ON i.id=q.id
       WHERE q.due<=? AND NOT EXISTS(SELECT 1 FROM desk_join_target t WHERE t.id=q.id)
-      AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=q.id AND m.mode='excluded') ORDER BY q.due,q.id LIMIT 1`,now);
+      AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=q.id AND m.mode='excluded') ORDER BY q.due,q.id LIMIT 16`,now);
+    const row=this.networkTry16922(()=>this.networkRecruitment16922(choices,now,used),choices[0]);
     if(!row)return;
     this.rows('UPDATE desk_expansion SET day=?,used=?,due=? WHERE id=1',day,used+1,now+15*M520);
     this.rows("UPDATE desk_join_discovery SET due=?,checked=?,message='募集方法の読み取り中' WHERE id=?",now+D520,now,row.id);
@@ -6775,7 +6791,7 @@ const learningSchema16913=[
   `CREATE TABLE IF NOT EXISTS nh_v16913_scores(slot TEXT NOT NULL,day TEXT NOT NULL,source TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,responded INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(slot,day,source))`
 ];
 function learningSource16913(tag,origin='') {
-  return tag?'tag:'+tag:origin==='returning'?'reader:returning':'reader:literary';
+  return tag?'tag:'+tag:'reader:'+(['returning','overlap','curator'].includes(origin)?origin:'literary');
 }
 function learningReserve16913(env,key,note,source,token) {
   const owner=note.user?.urlname,identity=env.TRACE?.identity;
@@ -6828,7 +6844,7 @@ async function learningChoice16913(env,settings,token) {
   if(!state)return {mode:'normal'};
   state.used=true;
   const plan=learningPlan16917(state.plan);
-  const winner=plan.find(r=>r.sent>=10 && r.responded>=2 && (r.source.startsWith('tag:')?settings.tags.includes(r.source.slice(4)):['reader:returning','reader:literary'].includes(r.source)));
+  const winner=plan.find(r=>r.sent>=10 && r.responded>=2 && (r.source.startsWith('tag:')?settings.tags.includes(r.source.slice(4)):['reader:returning','reader:literary','reader:overlap','reader:curator'].includes(r.source)));
   if(!winner)return {mode:'normal'};
   // 1 in 4 slots is ordinary exploration. Its independent original cursor
   // prevents a preferred tag from starving the remaining tags.
@@ -6888,10 +6904,10 @@ async function learningRecord16913(env,settings) {
   return '【反応に応じた巡回先の調整】\n'+rows.results.map(r=>{
     let plan;try{plan=learningPlan16917(r.plan);}catch{plan=[];}
     const learned=plan.some(p=>p.sent>=10&&p.responded>=2 &&
-      (p.source.startsWith('tag:')?settings.tags.includes(p.source.slice(4)):['reader:returning','reader:literary'].includes(p.source)));
+      (p.source.startsWith('tag:')?settings.tags.includes(p.source.slice(4)):['reader:returning','reader:literary','reader:overlap','reader:curator'].includes(p.source)));
     return 'アカウント '+r.slot+'：'+(learned?'観測できた反応をもとに優先・4回に1回は通常探索':'比較用の記録を収集中・通常探索')+
       '\n自分の記事の読者を最後に確認：'+time(r.observed)+'\n'+plan.slice(0,8).map(p=>
-        (p.source.startsWith('tag:')?'#'+p.source.slice(4):p.source==='reader:returning'?'自分の記事の読者':'文芸記事の読者')+
+        (p.source.startsWith('tag:')?'#'+p.source.slice(4):p.source==='reader:returning'?'自分の記事の読者':p.source==='reader:overlap'?'近い作品に共通する読者':p.source==='reader:curator'?'作品を紹介する作者':'文芸記事の読者')+
         '：記事スキ送信確認 '+p.sent+'件／後日公開した自分の記事に相手のスキを観測 '+p.responded+'件').join('\n');
   }).join('\n\n')+'\n直近28日の送信分。比較には1経路10件以上・反応2件以上が必要です。確認する読者一覧は一部です。未観測は無反応と断定せず、訪問・読了・送信による効果とは区別します。送信間隔と作者待機は維持します。';
 }
@@ -7566,7 +7582,7 @@ Object.assign(Desk520.prototype,{
     if(!a?.choice || a.title.trim()==='521' || !activeTarget && a.mag_due>now)return null;
     const pacing=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1');
     if(pacing.mag_next>now)return null;
-    const mag=this.chooseMagazine520(this.placementCandidates16918(a,this.eligibleMags(now),now,activeTarget),a.work_genre||a.genre,now);
+    const mag=this.chooseMagazine520(this.placementCandidates16918(a,this.eligibleMags(now),now,activeTarget),a.work_genre||a.genre,now,a);
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
     const prior=this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
@@ -7810,7 +7826,7 @@ Object.assign(Desk520.prototype,{
   },
   async testReaders16920(r){
     await prepare(this.env);
-    let env={...scoped(this.env,r.slot),TRACE:{calls:0}},lease;
+    let env={...scoped(this.env,r.slot),NETWORK16922:this.networkBridge16922(),TRACE:{calls:0}},lease;
     const put=(key,label,state,message)=>this.testResult16920(r.token,key,label,state,message);
     await sql(env,'CREATE TABLE IF NOT EXISTS nh_v16920_probe(slot TEXT PRIMARY KEY,token TEXT NOT NULL,at INTEGER NOT NULL)').run();
     await sql(env,'INSERT INTO nh_v16920_probe(slot,token,at) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET token=excluded.token,at=excluded.at',r.slot,r.token,Date.now()).run();
@@ -7848,11 +7864,15 @@ Object.assign(Desk520.prototype,{
       put('comments','コメント欄の読み取り',result.comments?'ok':result.commentEmpty?'empty':'error',result.commentMessage);
       put('readers','スキした読者の読み取り',result.readers?'ok':result.readerEmpty?'empty':'error',result.readerMessage);
       if(result.readers){
+        const own=source.user.urlname===env.TRACE?.identity?.owner;
+        networkCall16922(env,'observe',source,result.owners||[],own);
         let saved=0;
-        await rememberReaders1699(env,result.owners,seed,'literary',(_,n)=>saved+=n);
+        await rememberReaders1699(env,result.owners,seed,own?'returning':'literary',(_,n)=>saved+=n);
         put('candidates','読者候補の保存','ok',saved+'人の候補を保存・更新しました。上限・既存の作者待機は維持します。');
         await diagnostic16915(env,'readers','read','liker_list');
       }
+      const compare=this.networkView16922(),cohort=compare.accounts.find(a=>a.slot===r.slot);
+      put('comparison','作品・読者・紹介先の比較',cohort?.seeds>=3?'ok':'wait',cohort?'比較作品 '+cohort.seeds+'本／3作品以上に共通する読者 '+cohort.readers.length+'人／紹介活動を確認した作者 '+cohort.curators.length+'人。材料不足の間は従来の巡回を継続します。':'比較用の自作本文を取得待ちです。通常巡回中に自動で収集します。');
       if(result.comments)await diagnostic16915(env,'comments','read','comment_rows');
       if(env.TRACE.diagnosticFault16919)put('diagnostic','確認記録の保存','error','読み取りはできましたが、診断記録の保存に失敗しました。TEST20/diagnostic/'+env.TRACE.diagnosticFault16919);
     }catch(error){
@@ -8044,6 +8064,411 @@ msg.textContent=s.active?'テスト中です。結果は自動で表示します
 }catch(e){msg.textContent=e.message||'通信を確認できません。「結果を確認」を押してください。';}finally{busy=false;}}
 f.addEventListener('submit',e=>{e.preventDefault();if(f.reportValidity())send(e.submitter?.value||'status');});})();</script></html>`,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
     'Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"}});
+}
+
+// Public literary discovery. Derived, bounded caches live in the existing
+// Durable Object, never in D1. They cannot authorize an external write.
+const NETWORK16922=Object.freeze({works:320,magazines:128,samples:80,curators:96,seeds:10,readers:20,days:28,daily:8,gap:30*60000});
+const LOCAL_NETWORK16922=new WeakSet();
+const NETWORK_THEMES16922=[
+  ['仕事','仕事|職場|接客|店員|客席|出勤|退勤|給料|時給|店長|同僚|ロッカー|梱包|工場|営業'],
+  ['容姿','容姿|顔|鏡|化粧|美容|整形|口紅|香水|鼻|可愛い|美し'],
+  ['関係','恋|彼女|彼氏|恋人|好き|愛し|キス|別れ|返信|ふたり|二人|きみ|君'],
+  ['記憶','記憶|思い出|思い出す|あの頃|昔|回想|忘れ|覚えて'],
+  ['暮らし','部屋|台所|洗濯|アパート|団地|冷蔵庫|玄関|窓|暮らし|コンビニ|ワンルーム'],
+  ['家族','家族|母|父|姉|妹|兄|弟|娘|息子|親子'],
+  ['都市','電車|駅|タクシー|改札|終電|街|歩道|信号|東京'],
+  ['自然','雨|海|水|川|花|桜|風|鳥|動物|木|空'],
+  ['金銭','金|支払|会計|値段|借金|財布|千円|万円'],
+  ['独白','僕|ぼく|俺|わたし|わたしたち|おまえ']
+];
+function networkJSON16922(s,fallback=[]){try{const x=JSON.parse(s);return Array.isArray(x)?x:fallback;}catch{return fallback;}}
+function networkOwner16922(s){return typeof s==='string'&&/^[\w-]{1,80}$/.test(s)&&!['api','settings','search','hashtag','tag','info'].includes(s);}
+function networkNote16922(n){return n?.status==='published'&&/^n[a-z0-9]{1,64}$/.test(n.key||'')&&networkOwner16922(n.user?.urlname)&&typeof n.name==='string'&&n.name.trim()&&n.name.trim()!=='521';}
+function networkFeature16922(n,detail=false){
+  const full=detail&&typeof n.body==='string'&&n.body.length<=250000&&n.is_limited!==true&&n.isLimited!==true&&n.is_paid!==true&&n.isPaid!==true&&!(Number(n.price)>0);
+  const text=words161((n.name||'')+'\n'+(full?n.body:'')).normalize('NFKC').slice(0,24000);
+  const counts=new Map(),stop=new Set(['自分','本当','今日','時間','言葉','文章','小説','記事','作品','投稿','読者','紹介','気持','全部','最後','最初','人間']);
+  for(const word of text.match(/[一-龯々]{2,8}|[ァ-ヶー]{3,16}/g)||[]){
+    const parts=/^[一-龯々]+$/.test(word)?Array.from({length:word.length-1},(_,i)=>word.slice(i,i+2)):[word];
+    for(const token of parts)if(!stop.has(token))counts.set(token,(counts.get(token)||0)+1);
+  }
+  return {full:!!full&&text.length>=80,themes:NETWORK_THEMES16922.filter(([,p])=>new RegExp(p).test(text)).map(([k])=>k),
+    tokens:[...counts].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0])).slice(0,96).map(([k])=>k)};
+}
+function networkSimilarity16922(a,b){
+  if(!a?.full||!b?.full)return 0;
+  const themes=a.themes.filter(t=>t!=='独白'&&b.themes.includes(t)),tokens=a.tokens.filter(t=>b.tokens.includes(t));
+  // Genre labels alone cannot establish a match. This is content similarity,
+  // not an inference about either creator's or reader's personal attributes.
+  if(themes.length<2&&tokens.length<4)return 0;
+  return Math.min(1,0.55*themes.length/Math.max(2,new Set([...a.themes,...b.themes].filter(t=>t!=='独白')).size)+
+    0.45*tokens.length/Math.max(8,Math.min(a.tokens.length,b.tokens.length)));
+}
+function networkParseFeature16922(text){try{const f=JSON.parse(text);return f&&typeof f.full==='boolean'&&Array.isArray(f.themes)&&Array.isArray(f.tokens)?f:null;}catch{return null;}}
+function networkCall16922(env,method,...args){
+  const bridge=env.NETWORK16922;
+  if(!bridge||!LOCAL_NETWORK16922.has(bridge))return null;
+  return bridge.call(method,env.SLOT,env.TRACE?.identity,...args);
+}
+async function networkEnqueue16922(env,bump){
+  const candidates=networkCall16922(env,'queue')||[];
+  for(const c of candidates.slice(0,4))await rememberReaders1699(env,[c.owner],{key:c.article,owner:env.TRACE?.identity?.owner||''},c.origin,bump);
+}
+Object.assign(Desk520.prototype,{
+  initNetwork16922(){
+    if(this.networkReady16922)return;
+    if(!this.one("SELECT 1 FROM sqlite_master WHERE name='desk_network16922'"))this.storage.transactionSync(()=>{
+      this.rows("CREATE TABLE desk_audience16922(slot TEXT PRIMARY KEY,account TEXT NOT NULL,owner TEXT NOT NULL,corpus TEXT NOT NULL DEFAULT '[]',seeds TEXT NOT NULL DEFAULT '[]',queue_at INTEGER NOT NULL DEFAULT 0,updated INTEGER NOT NULL DEFAULT 0)");
+      this.rows("CREATE TABLE desk_network_work16922(article TEXT PRIMARY KEY,owner TEXT NOT NULL,title TEXT NOT NULL,pub INTEGER NOT NULL,feature TEXT NOT NULL,full INTEGER NOT NULL,fiction INTEGER NOT NULL,likes INTEGER NOT NULL,seen INTEGER NOT NULL,due INTEGER NOT NULL DEFAULT 0)");
+      this.rows('CREATE INDEX desk_network_work_due16922 ON desk_network_work16922(due,article)');
+      this.rows('CREATE INDEX desk_network_work_owner16922 ON desk_network_work16922(owner,pub DESC)');
+      this.rows('CREATE INDEX desk_network_work_seen16922 ON desk_network_work16922(seen,article)');
+      this.rows("CREATE TABLE desk_network_mag16922(id TEXT PRIMARY KEY,url TEXT NOT NULL,owner TEXT NOT NULL,name TEXT NOT NULL,items TEXT NOT NULL DEFAULT '[]',first_at INTEGER NOT NULL,last_at INTEGER NOT NULL,changed INTEGER NOT NULL DEFAULT 0)");
+      this.rows('CREATE INDEX desk_network_mag_age16922 ON desk_network_mag16922(last_at,id)');
+      this.rows("CREATE TABLE desk_network_sample16922(article TEXT PRIMARY KEY,owner TEXT NOT NULL,readers TEXT NOT NULL,sampled INTEGER NOT NULL)");
+      this.rows('CREATE INDEX desk_network_sample_age16922 ON desk_network_sample16922(sampled,article)');
+      this.rows("CREATE TABLE desk_network_curator16922(owner TEXT PRIMARY KEY,posts TEXT NOT NULL DEFAULT '[]',magazines TEXT NOT NULL DEFAULT '[]',seen INTEGER NOT NULL)");
+      this.rows('CREATE INDEX desk_network_curator_age16922 ON desk_network_curator16922(seen,owner)');
+      this.rows("CREATE TABLE desk_network_route16922(article TEXT PRIMARY KEY,id TEXT NOT NULL,at INTEGER NOT NULL,reason TEXT NOT NULL)");
+      this.rows('CREATE INDEX desk_network_route_age16922 ON desk_network_route16922(at,article)');
+      this.rows("CREATE TABLE desk_network16922(id INTEGER PRIMARY KEY,due INTEGER NOT NULL DEFAULT 0,day TEXT NOT NULL DEFAULT '',used INTEGER NOT NULL DEFAULT 0,turn INTEGER NOT NULL DEFAULT 0,fault_until INTEGER NOT NULL DEFAULT 0,checked INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '公開作品と読者の比較材料を収集中')");
+      this.rows('INSERT INTO desk_network16922(id) VALUES(1)');
+    });
+    this.networkReady16922=true;
+  },
+  networkTry16922(fn,fallback=null){
+    if(this.networkFaultUntil16922>Date.now())return fallback;
+    try{this.initNetwork16922();return fn();}catch{
+      // The new cache failing cannot abort ordinary likes or a publication.
+      this.networkFaultUntil16922=Date.now()+HOUR;
+      try{this.rows("UPDATE desk_network16922 SET fault_until=?,message='比較情報の保存・読み取りを再確認待ち。従来の巡回を継続' WHERE id=1",this.networkFaultUntil16922);}catch{}
+      return fallback;
+    }
+  },
+  networkIdentity16922(slot,identity){
+    if(!SLOTS.includes(slot)||!networkOwner16922(identity?.owner)||!/^\d{1,20}$/.test(identity?.id||''))return null;
+    let row=this.one('SELECT * FROM desk_audience16922 WHERE slot=?',slot);
+    if(!row||row.account!==identity.id||row.owner!==identity.owner){
+      this.rows("INSERT INTO desk_audience16922(slot,account,owner) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET account=excluded.account,owner=excluded.owner,corpus='[]',seeds='[]',queue_at=0,updated=0",slot,identity.id,identity.owner);
+      row=this.one('SELECT * FROM desk_audience16922 WHERE slot=?',slot);
+    }
+    return row;
+  },
+  networkWork16922(n,detail=false){
+    if(!networkNote16922(n))return null;
+    const now=Date.now(),f=networkFeature16922(n,detail),pub=Date.parse(n.publishAt||n.publish_at||n.publishedAt)||0;
+    if(pub>now)return null;
+    const own=this.rows('SELECT owner FROM desk_audience16922').some(r=>r.owner===n.user.urlname)||n.user.urlname==='43__';
+    const old=this.one('SELECT * FROM desk_network_work16922 WHERE article=?',n.key);
+    if(old&&old.owner!==n.user.urlname){this.rows('DELETE FROM desk_network_sample16922 WHERE article=?',n.key);}
+    // A summary never overwrites a verified full-text fingerprint.
+    if(!detail&&old?.full&&old.owner===n.user.urlname)return old;
+    this.rows(`INSERT INTO desk_network_work16922(article,owner,title,pub,feature,full,fiction,likes,seen,due) VALUES(?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(article) DO UPDATE SET owner=excluded.owner,title=excluded.title,pub=excluded.pub,feature=excluded.feature,full=excluded.full,fiction=excluded.fiction,likes=excluded.likes,seen=excluded.seen,
+      due=CASE WHEN ? THEN excluded.due ELSE desk_network_work16922.due END`,n.key,n.user.urlname,n.name.slice(0,160),pub,JSON.stringify(f),+f.full,+(own||publicFiction1697(n)),Math.max(0,Number(n.likeCount??n.like_count)||0),now,detail?now+7*D520:0,+detail);
+    this.networkTrim16922('desk_network_work16922','article','seen',NETWORK16922.works);
+    if(detail){
+      this.networkRecommendations16922(n,f,now);
+      for(const m of (Array.isArray(n.magazines)?n.magazines:[]).slice(0,12)){
+        const link=noteLink161(m?.magazineUrl||m?.magazine_url||m?.url||(/^m[a-z0-9]{1,64}$/.test(m?.key||'')?'https://note.com/m/'+m.key:''));
+        if(link){
+          this.networkMagazine16922(link,m.name||link.id,[{title:n.name,link:'https://note.com/'+n.user.urlname+'/n/'+n.key,pubdate:pub?new Date(pub).toISOString():''}],false);
+          const related=f.full&&publicFiction1697(n)&&this.rows('SELECT * FROM desk_audience16922').some(r=>this.networkOwnFeatures16922(r).some(o=>networkSimilarity16922(o,f)>=0.22));
+          if(related&&link.owner!=='43__'&&this.rememberMagazine(link,m.name||link.id)){
+            this.rows('INSERT OR IGNORE INTO desk_scout_mag(id) VALUES(?)',link.id);
+            this.rows("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'feed',?)",link.url,now);
+          }
+        }
+      }
+    }
+    return this.one('SELECT * FROM desk_network_work16922 WHERE article=?',n.key);
+  },
+  networkTrim16922(table,key,column,limit){
+    // All callers are fixed internal constants. At most cap+batch rows exist.
+    if(table==='desk_network_work16922'){
+      const kept=new Set(this.rows('SELECT corpus,seeds FROM desk_audience16922').flatMap(r=>[...networkJSON16922(r.corpus).slice(0,12),...networkJSON16922(r.seeds).slice(0,10)]));
+      for(const w of this.rows("SELECT article FROM desk_network_work16922 WHERE owner='43__' AND full=1 ORDER BY pub DESC LIMIT 12"))kept.add(w.article);
+      const keys=[...kept],where=keys.length?' WHERE article NOT IN ('+keys.map(()=>'?').join(',')+')':'';
+      const extra=this.rows('SELECT article FROM desk_network_work16922'+where+' ORDER BY full DESC,seen DESC,article LIMIT 40 OFFSET ?',...keys,Math.max(0,limit-keys.length));
+      for(const w of extra)this.rows('DELETE FROM desk_network_work16922 WHERE article=?',w.article);
+      return;
+    }
+    const extra=this.rows('SELECT '+key+' FROM '+table+' ORDER BY '+column+' DESC,'+key+' LIMIT 40 OFFSET ?',limit);
+    for(const row of extra)this.rows('DELETE FROM '+table+' WHERE '+key+'=?',row[key]);
+  },
+  networkCorpus16922(slot,identity,notes,detail=false){
+    const row=this.networkIdentity16922(slot,identity);if(!row)return;
+    let keys=networkJSON16922(row.corpus);
+    for(const n of notes.slice(0,12))if(networkNote16922(n)&&n.user.urlname===row.owner&&String(n.user.id)===row.account){
+      const w=this.networkWork16922(n,detail);if(w)keys=[...new Set([...keys,w.article])];
+    }
+    const works=keys.map(k=>this.one('SELECT article,pub FROM desk_network_work16922 WHERE article=? AND owner=?',k,row.owner)).filter(Boolean).sort((a,b)=>b.pub-a.pub||a.article.localeCompare(b.article)).slice(0,12);
+    this.rows('UPDATE desk_audience16922 SET corpus=?,updated=? WHERE slot=?',JSON.stringify(works.map(w=>w.article)),Date.now(),slot);
+  },
+  networkOwnFeatures16922(row){
+    return networkJSON16922(row?.corpus).slice(0,12).map(k=>this.one('SELECT feature FROM desk_network_work16922 WHERE article=? AND owner=? AND full=1',k,row.owner)).filter(Boolean).map(w=>networkParseFeature16922(w.feature)).filter(Boolean);
+  },
+  networkSeeds16922(slot,identity,notes=[],fallback=null,choose=false,turn=0){
+    const row=this.networkIdentity16922(slot,identity);if(!row)return fallback;
+    for(const n of notes.slice(0,8))if(networkNote16922(n)&&publicFiction1697(n)&&n.user.urlname!==row.owner)this.networkWork16922(n,false);
+    const own=this.networkOwnFeatures16922(row);if(!own.length)return fallback;
+    const excluded=new Set(this.rows('SELECT owner FROM desk_audience16922').map(r=>r.owner));
+    const candidates=this.rows('SELECT * FROM desk_network_work16922 WHERE fiction=1 AND full=1 AND likes>0 AND seen>=? ORDER BY seen DESC,article LIMIT 320',Date.now()-28*D520)
+      .filter(w=>!excluded.has(w.owner)&&w.owner!=='43__').map(w=>({...w,score:Math.max(0,...own.map(f=>networkSimilarity16922(f,networkParseFeature16922(w.feature))))})).filter(w=>w.score>=0.22)
+      .sort((a,b)=>b.score-a.score||b.pub-a.pub||a.article.localeCompare(b.article));
+    const writers=new Set(),seeds=[];
+    for(const w of candidates)if(!writers.has(w.owner)){writers.add(w.owner);seeds.push(w);if(seeds.length>=NETWORK16922.seeds)break;}
+    const keys=seeds.map(w=>w.article);
+    if(JSON.stringify(keys)!==row.seeds)this.rows('UPDATE desk_audience16922 SET seeds=?,updated=? WHERE slot=?',JSON.stringify(keys),Date.now(),slot);
+    if(!choose)return fallback;
+    // Alternate ordinary affinity samples with a missing second article from
+    // an eligible magazine. Both use the SAME existing reader-browser slot.
+    if(Math.floor(turn/4)%2){
+      const mags=this.rows(`SELECT m.* FROM desk_network_mag16922 m JOIN desk_import i ON i.id=m.id JOIN desk_member r ON r.id=m.id
+        WHERE i.allowed=1 AND i.managed=1 AND i.state='利用中' AND r.mode='auto' AND r.checked>? AND m.last_at>?
+        ORDER BY m.last_at DESC,m.id LIMIT 12`,Date.now()-2*D520,Date.now()-28*D520),needs=[];
+      const byKey=new Map(candidates.map(w=>[w.article,w]));
+      for(const mag of mags){
+        const items=networkJSON16922(mag.items).slice(0,20),samples=items.map(i=>this.one('SELECT sampled FROM desk_network_sample16922 WHERE article=? AND sampled>?',i.article,Date.now()-28*D520)).filter(Boolean).length;
+        for(const item of items){const work=byKey.get(item.article),sample=this.one('SELECT sampled FROM desk_network_sample16922 WHERE article=?',item.article);
+          if(work&&(!sample||sample.sampled<Date.now()-7*D520))needs.push({...work,samples});}
+      }
+      needs.sort((a,b)=>a.samples-b.samples||b.score-a.score||a.article.localeCompare(b.article));
+      if(needs[0])return {key:needs[0].article,owner:needs[0].owner};
+    }
+    const ranked=seeds.map(w=>({...w,sampled:this.one('SELECT sampled FROM desk_network_sample16922 WHERE article=?',w.article)?.sampled||0})).sort((a,b)=>a.sampled-b.sampled||b.score-a.score);
+    const next=ranked.find(w=>w.sampled<Date.now()-7*D520);
+    return next?{key:next.article,owner:next.owner}:fallback;
+  },
+  networkObserve16922(slot,identity,source,owners,returning=false){
+    const row=this.networkIdentity16922(slot,identity);if(!row||!networkNote16922(source))return;
+    if(returning){this.networkCorpus16922(slot,identity,[source],true);return;}
+    if(!publicFiction1697(source)||source.user.urlname===identity.owner)return;
+    this.networkWork16922(source,true);
+    const excluded=new Set(this.rows('SELECT owner FROM desk_audience16922').map(r=>r.owner));
+    const names=[...new Set(owners)].filter(o=>networkOwner16922(o)&&!excluded.has(o)&&o!==source.user.urlname&&o!=='43__').slice(0,20);
+    this.rows('INSERT INTO desk_network_sample16922(article,owner,readers,sampled) VALUES(?,?,?,?) ON CONFLICT(article) DO UPDATE SET owner=excluded.owner,readers=excluded.readers,sampled=excluded.sampled',source.key,source.user.urlname,JSON.stringify(names),Date.now());
+    this.networkTrim16922('desk_network_sample16922','article','sampled',NETWORK16922.samples);
+    this.networkSeeds16922(slot,identity);
+  },
+  networkReaders16922(row){
+    if(!row)return [];
+    const cutoff=Date.now()-28*D520,people=new Map(),own=new Set(this.rows('SELECT owner FROM desk_audience16922').map(r=>r.owner)),features=this.networkOwnFeatures16922(row);
+    for(const key of networkJSON16922(row.seeds).slice(0,10)){
+      const s=this.one('SELECT * FROM desk_network_sample16922 WHERE article=? AND sampled>=?',key,cutoff);
+      const w=this.one('SELECT owner,feature FROM desk_network_work16922 WHERE article=? AND full=1 AND seen>=?',key,cutoff);
+      if(!s||!w||s.owner!==w.owner||!features.some(f=>networkSimilarity16922(f,networkParseFeature16922(w.feature))>=0.22))continue;
+      for(const owner of networkJSON16922(s.readers).slice(0,20)){
+        if(!networkOwner16922(owner)||own.has(owner)||owner==='43__')continue;
+        const p=people.get(owner)||{owner,writers:new Set(),articles:new Set(),article:key,origin:'overlap'};
+        p.writers.add(s.owner);p.articles.add(key);people.set(owner,p);
+      }
+    }
+    return [...people.values()].filter(p=>p.writers.size>=3&&p.articles.size>=3).map(p=>({...p,count:p.writers.size})).sort((a,b)=>b.count-a.count||a.owner.localeCompare(b.owner));
+  },
+  networkMagazine16922(link,name,entries,complete=true){
+    if(!link||!/^m[a-z0-9]{1,64}$/.test(link.id))return;
+    const now=Date.now(),old=this.one('SELECT * FROM desk_network_mag16922 WHERE id=?',link.id),prior=networkJSON16922(old?.items);
+    const items=[...new Map(entries.slice(0,30).map(e=>{
+      const a=noteLink161(e.link,link.url,'article'),pub=Date.parse(e.pubdate);
+      return a&&Number.isFinite(pub)&&pub>0&&pub<=now&&pub>=now-60*D520?[a.id,{article:a.id,owner:a.owner,title:String(e.title||'').slice(0,160),pub}]:null;
+    }).filter(Boolean)).values()].slice(0,20);
+    const combined=complete?items:[...new Map([...items,...prior].map(e=>[e.article,e])).values()].slice(0,20);
+    const owner=networkOwner16922(link.owner)?link.owner:old?.owner||'';
+    const changed=!!old&&complete&&now-old.first_at>=7*D520&&items.some(e=>!prior.some(p=>p.article===e.article));
+    this.rows(`INSERT INTO desk_network_mag16922(id,url,owner,name,items,first_at,last_at,changed) VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET url=excluded.url,owner=excluded.owner,name=excluded.name,items=excluded.items,last_at=excluded.last_at,changed=MAX(desk_network_mag16922.changed,excluded.changed)`,link.id,link.url,owner,String(name||link.id).slice(0,100),JSON.stringify(combined),old?.first_at||now,now,changed?now:0);
+    // Hydrate only a few diverse public works, through the shared scout budget.
+    const writers=new Set();
+    for(const item of items)if(writers.size<4&&!writers.has(item.owner)){
+      writers.add(item.owner);this.networkWork16922({key:item.article,status:'published',user:{urlname:item.owner},name:item.title,publishAt:new Date(item.pub).toISOString()},false);
+    }
+    this.networkTrim16922('desk_network_mag16922','id','last_at',NETWORK16922.magazines);
+    if(owner&&owner!=='43__'){
+      const curator=this.one('SELECT * FROM desk_network_curator16922 WHERE owner=?',owner),mags=networkJSON16922(curator?.magazines);
+      this.rows("INSERT INTO desk_network_curator16922(owner,magazines,seen) VALUES(?,?,?) ON CONFLICT(owner) DO UPDATE SET magazines=excluded.magazines,seen=excluded.seen",owner,JSON.stringify([...new Set([link.id,...mags])].slice(0,8)),now);
+      this.networkTrim16922('desk_network_curator16922','owner','seen',NETWORK16922.curators);
+    }
+  },
+  networkRecommendations16922(n,f,now){
+    if(!f.full||n.user.urlname==='43__'||!/紹介|おすすめ|推薦|読んだ|読みました/.test(words161(n.body).slice(0,24000)))return;
+    const targets=[...new Map(anchors161(n.body).slice(0,80).map(a=>noteLink161(a.href,'https://note.com','article')).filter(a=>a&&a.owner!==n.user.urlname).map(a=>[a.owner,a])).values()];
+    const pub=Date.parse(n.publishAt||n.publish_at||n.publishedAt);
+    if(targets.length<2||!Number.isFinite(pub)||pub<now-60*D520||pub>now)return;
+    const old=this.one('SELECT * FROM desk_network_curator16922 WHERE owner=?',n.user.urlname),posts=networkJSON16922(old?.posts).filter(p=>p.article!==n.key&&p.pub>=now-60*D520);
+    posts.push({article:n.key,pub,owners:targets.slice(0,8).map(a=>a.owner),feature:f});
+    posts.sort((a,b)=>b.pub-a.pub);
+    this.rows("INSERT INTO desk_network_curator16922(owner,posts,seen) VALUES(?,?,?) ON CONFLICT(owner) DO UPDATE SET posts=excluded.posts,seen=excluded.seen",n.user.urlname,JSON.stringify(posts.slice(0,6)),now);
+    this.networkTrim16922('desk_network_curator16922','owner','seen',NETWORK16922.curators);
+  },
+  networkCurators16922(row){
+    const own=this.networkOwnFeatures16922(row);if(!own.length)return [];
+    const now=Date.now(),excluded=new Set(this.rows('SELECT owner FROM desk_audience16922').map(r=>r.owner)),out=[];
+    for(const c of this.rows('SELECT * FROM desk_network_curator16922 WHERE seen>=? ORDER BY seen DESC LIMIT 96',now-28*D520)){
+      if(excluded.has(c.owner)||c.owner==='43__')continue;
+      const posts=networkJSON16922(c.posts).filter(p=>p.pub>=now-60*D520&&p.pub<=now),days=new Set(posts.map(p=>jstDay(p.pub)));
+      let score=0,article='',magazine='';
+      if(days.size>=2&&Math.max(...posts.map(p=>p.pub))-Math.min(...posts.map(p=>p.pub))>=7*D520&&Math.max(...posts.map(p=>p.pub))>=now-28*D520){
+        score=Math.max(0,...posts.flatMap(p=>own.map(f=>networkSimilarity16922(f,p.feature))));article=posts[0].article;
+      }
+      for(const id of networkJSON16922(c.magazines).slice(0,8)){
+        const m=this.one('SELECT * FROM desk_network_mag16922 WHERE id=? AND owner=? AND last_at>=? AND changed>=?',id,c.owner,now-28*D520,now-28*D520);if(!m)continue;
+        const items=networkJSON16922(m.items).filter(i=>i.owner!==c.owner&&i.pub>=now-60*D520),writers=new Set(items.map(i=>i.owner)),dates=items.map(i=>i.pub);
+        if(writers.size<3||items.length<3||Math.max(...dates)-Math.min(...dates)<7*D520||Math.max(...dates)<now-28*D520)continue;
+        const features=items.slice(0,20).map(i=>this.one('SELECT feature FROM desk_network_work16922 WHERE article=? AND full=1',i.article)).filter(Boolean).map(w=>networkParseFeature16922(w.feature)).filter(Boolean);
+        const matches=features.map(f=>Math.max(0,...own.map(o=>networkSimilarity16922(o,f)))).filter(s=>s>=0.22);
+        if(matches.length>=2&&Math.max(...matches)>score){score=Math.max(...matches);article=items[0].article;magazine=id;}
+      }
+      if(score>=0.22)out.push({owner:c.owner,score,article,magazine,origin:'curator'});
+    }
+    return out.sort((a,b)=>b.score-a.score||a.owner.localeCompare(b.owner)).slice(0,16);
+  },
+  networkBridge16922(){
+    const desk=this,bridge={call(method,slot,identity,...args){return desk.networkTry16922(()=>{
+      if(desk.one('SELECT fault_until FROM desk_network16922 WHERE id=1').fault_until>Date.now())return null;
+      const row=desk.networkIdentity16922(slot,identity);if(!row)return null;
+      if(method==='corpus')return desk.networkCorpus16922(slot,identity,...args);
+      if(method==='seed')return desk.networkSeeds16922(slot,identity,...args);
+      if(method==='note'){if(args[0]?.user?.urlname===identity.owner)desk.networkCorpus16922(slot,identity,[args[0]],true);else desk.networkWork16922(args[0],true);return null;}
+      if(method==='missing'){
+        const seed=args[0];if(!/^n[a-z0-9]{1,64}$/.test(seed?.key||'')||!networkOwner16922(seed?.owner))return;
+        desk.rows('DELETE FROM desk_network_sample16922 WHERE article=? AND owner=?',seed.key,seed.owner);
+        desk.rows('UPDATE desk_network_work16922 SET full=0,fiction=0,due=? WHERE article=? AND owner=?',Date.now()+D520,seed.key,seed.owner);
+        desk.networkSeeds16922(slot,identity);return null;
+      }
+      if(method==='observe')return desk.networkObserve16922(slot,identity,...args);
+      if(method==='origins')return Object.fromEntries(desk.networkReaders16922(row).map(r=>[r.owner,'overlap']));
+      if(method==='queue'){
+        if(row.queue_at>Date.now())return [];
+        const readers=desk.networkReaders16922(row),curators=desk.networkCurators16922(row),turn=Math.floor(Date.now()/(6*HOUR));
+        const rotated=readers.length?[...readers.slice(turn%readers.length),...readers.slice(0,turn%readers.length)]:[];
+        const curator=curators.length?curators[turn%curators.length]:null;
+        const candidates=[...rotated.slice(0,3),...(curator?[curator]:[])];
+        if(curator)desk.rows("INSERT OR IGNORE INTO desk_scout(url,kind,due) VALUES(?,'author',?)",'https://note.com/'+curator.owner+'/magazines',Date.now());
+        desk.rows('UPDATE desk_audience16922 SET queue_at=? WHERE slot=?',Date.now()+6*HOUR,slot);
+        return candidates;
+      }
+      if(method==='rank')return [...desk.networkReaders16922(row),...desk.networkCurators16922(row)].slice(0,8).map(r=>r.owner);
+      return null;
+    });}};
+    LOCAL_NETWORK16922.add(bridge);return bridge;
+  },
+  async networkTick16922(now){
+    this.initNetwork16922();
+    const c=this.one('SELECT * FROM desk_network16922 WHERE id=1'),cfg=this.one('SELECT c.enabled,c.blocked,d.enabled delivery,q.enabled directory FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id JOIN desk_directory q ON q.id=c.id WHERE c.id=1');
+    if(!cfg.enabled||!cfg.delivery||!cfg.directory||cfg.blocked>now||c.due>now||c.fault_until>now||this.publicationPriority16916(now))return;
+    const date=jstDay(now),budget=this.one('SELECT * FROM desk_scout_budget WHERE id=1'),used=budget.day===date?budget.used:0;
+    if((c.day===date?c.used:0)>=8||used>=192||used%4!==0||this.one('SELECT due FROM desk_scout_state WHERE id=1').due>now)return;
+    const own=new Set(['43__',...this.rows('SELECT owner FROM desk_audience16922').map(r=>r.owner)]);
+    const candidates=this.rows('SELECT * FROM desk_network_work16922 WHERE due<=? ORDER BY due,article LIMIT 32',now);
+    const recentOwn=[...own].flatMap(owner=>this.rows('SELECT * FROM desk_network_work16922 WHERE owner=? AND full=0 AND due<=? ORDER BY pub DESC LIMIT 2',owner,now));
+    const next=c.turn%3!==2&&recentOwn.length?recentOwn[0]:candidates[0];if(!next)return;
+    // Reserving both counters and the ordinary scout gate is synchronous.
+    this.storage.transactionSync(()=>{
+      this.rows('UPDATE desk_network16922 SET day=?,used=?,turn=turn+1,due=?,checked=?,message=? WHERE id=1',date,(c.day===date?c.used:0)+1,now+NETWORK16922.gap,now,'公開作品の内容を比較中');
+      this.rows('UPDATE desk_scout_budget SET day=?,used=? WHERE id=1',date,used+1);
+      this.rows('UPDATE desk_scout_state SET due=MAX(due,?) WHERE id=1',now+6*M520);
+      this.rows('UPDATE desk_network_work16922 SET due=? WHERE article=?',now+D520,next.article);
+    });
+    try{
+      const n=(await this.publicRead('https://note.com/api/v3/notes/'+next.article,'json'))?.data;
+      if(!networkNote16922(n)||n.key!==next.article||n.user.urlname!==next.owner){
+        this.rows('DELETE FROM desk_network_sample16922 WHERE article=?',next.article);
+        this.rows("UPDATE desk_network_work16922 SET full=0,fiction=0,feature=? WHERE article=?",JSON.stringify({full:false,themes:[],tokens:[]}),next.article);
+        throw new Error('unverified source');
+      }
+      this.networkWork16922(n,true);
+      for(const row of this.rows('SELECT * FROM desk_audience16922')){
+        const identity={id:row.account,owner:row.owner};
+        if(n.user.urlname===row.owner&&String(n.user.id)===row.account)this.networkCorpus16922(row.slot,identity,[n],true);
+        this.networkSeeds16922(row.slot,identity);
+      }
+      this.rows("UPDATE desk_network16922 SET message='公開作品の比較情報を更新。読者一覧は通常の追加探索枠で確認' WHERE id=1");
+    }catch(error){
+      this.rows('UPDATE desk_network16922 SET message=? WHERE id=1',error instanceof PublicReadError?publicReadReason(error):'作品の公開元・本文を確認できず、従来の巡回を継続');
+    }
+  },
+  networkMagazineScore16922(id,feature,now){
+    const m=this.one('SELECT * FROM desk_network_mag16922 WHERE id=? AND last_at>=?',id,now-28*D520);if(!m||!feature)return null;
+    const items=networkJSON16922(m.items).filter(i=>i.pub>=now-60*D520&&i.pub<=now),matches=[],readers=new Set();let sampled=0;
+    for(const item of items.slice(0,20)){
+      const w=this.one('SELECT * FROM desk_network_work16922 WHERE article=? AND owner=? AND full=1 AND seen>=?',item.article,item.owner,now-28*D520);
+      if(w){const score=networkSimilarity16922(feature,networkParseFeature16922(w.feature));if(score>=0.22)matches.push({owner:item.owner,score});}
+      const s=this.one('SELECT * FROM desk_network_sample16922 WHERE article=? AND owner=? AND sampled>=?',item.article,item.owner,now-28*D520);
+      if(s){sampled++;for(const name of networkJSON16922(s.readers).slice(0,20))if(networkOwner16922(name))readers.add(name);}
+    }
+    if(new Set(matches.map(m=>m.owner)).size<2)return null;
+    return {theme:matches.reduce((a,m)=>a+m.score,0)/matches.length,readers,sampled,known:sampled>=2&&readers.size>=6};
+  },
+  networkChoose16922(choices,baseline,work,now){
+    if(!work?.article||!baseline||choices.length<2)return baseline;
+    const w=this.one('SELECT feature FROM desk_network_work16922 WHERE article=? AND owner=? AND full=1',work.article,'43__'),feature=networkParseFeature16922(w?.feature);if(!feature)return baseline;
+    const sent=this.rows('SELECT id FROM desk_mag_send WHERE article=?',work.article);
+    // Every fourth placement uses the original exploration/outcome policy.
+    if(sent.length%4===0)return baseline;
+    const previous=this.rows('SELECT id FROM desk_ref WHERE article=? ORDER BY observed DESC LIMIT 24',work.article);
+    const prior=new Set();let priorKnown=false;
+    for(const r of previous){const s=this.networkMagazineScore16922(r.id,feature,now);if(s?.known){priorKnown=true;for(const name of s.readers)prior.add(name);}}
+    const sampleChoices=[baseline,...choices.filter(m=>m.url!==baseline.url)].slice(0,24),scored=[];
+    for(const mag of sampleChoices){
+      const id=noteLink161(mag.url)?.id,s=this.networkMagazineScore16922(id,feature,now);if(!s)continue;
+      const overlap=[...s.readers].filter(name=>prior.has(name)).length,novelty=priorKnown&&s.known?1-overlap/s.readers.size:null;
+      scored.push({mag,id,...s,overlap,novelty});
+    }
+    // Unknown audience never becomes a fictitious zero-overlap winner. Novelty
+    // is compared only when all compared destinations have adequate samples.
+    const compareAudience=priorKnown&&scored.length>=2&&scored.every(s=>s.known);
+    scored.forEach(s=>s.score=s.theme+(compareAudience?0.3*s.novelty:0));
+    scored.sort((a,b)=>b.score-a.score||a.mag.url.localeCompare(b.mag.url));
+    const best=scored[0],base=scored.find(s=>s.mag.url===baseline.url);
+    if(!best||scored.length<2||!base||best.score<=base.score+0.03)return baseline;
+    const reason=compareAudience?'作品の題材が近く、観測した読者 '+best.readers.size+'人のうち既掲載誌と共通 '+best.overlap+'人（取得範囲の比較）':'複数作者の作品と題材が近いため優先。読者の重なりは資料不足';
+    this.rows('INSERT INTO desk_network_route16922(article,id,at,reason) VALUES(?,?,?,?) ON CONFLICT(article) DO UPDATE SET id=excluded.id,at=excluded.at,reason=excluded.reason',work.article,best.id,now,reason);
+    this.networkTrim16922('desk_network_route16922','article','at',80);
+    return best.mag;
+  },
+  networkRecruitment16922(rows,now,turn=0){
+    if(rows.length<2||turn%4===0)return rows[0];
+    const row=this.one("SELECT * FROM desk_audience16922 WHERE owner='43__'");if(!row)return rows[0];
+    const curators=this.networkCurators16922(row),score=id=>{
+      const mag=this.one('SELECT owner FROM desk_network_mag16922 WHERE id=?',id);return curators.find(c=>c.owner===mag?.owner)?.score||0;
+    };
+    return rows.map((r,i)=>({r,i,s:score(r.id)})).sort((a,b)=>b.s-a.s||a.i-b.i)[0].r;
+  },
+  networkView16922(){return this.networkTry16922(()=>{
+    const now=Date.now(),cfg=this.one('SELECT * FROM desk_network16922 WHERE id=1');
+    return {message:cfg.message,checked:cfg.checked,used:cfg.day===jstDay(now)?cfg.used:0,
+      accounts:this.rows('SELECT * FROM desk_audience16922 ORDER BY slot').map(r=>({slot:r.slot,works:this.networkOwnFeatures16922(r).length,seeds:networkJSON16922(r.seeds).length,
+        readers:this.networkReaders16922(r).map(p=>({owner:p.owner,works:p.count})),curators:this.networkCurators16922(r).map(c=>c.owner)})),
+      routes:this.rows('SELECT r.*,w.title,m.name FROM desk_network_route16922 r LEFT JOIN desk_archive w ON w.article=r.article LEFT JOIN desk_network_mag16922 m ON m.id=r.id ORDER BY at DESC LIMIT 8')};
+  },{message:'比較機能を準備中',accounts:[],routes:[]});}
+});
+const networkReadBefore16922=Desk520.prototype.publicRead;
+Desk520.prototype.publicRead=function(path,format){
+  return networkReadBefore16922.call(this,path,format).then(result=>{
+    this.networkTry16922(()=>{
+      if(format==='json'&&/^https:\/\/note\.com\/api\/v3\/notes\/n[a-z0-9]+$/.test(path)&&result?.data?.key===path.split('/').pop())this.networkWork16922(result.data,true);
+      if(format==='issue'){
+        const link=noteLink161(result?.header?.link||''),requested=noteLink161(path.replace(/\/rss$/,''));
+        if(link&&requested?.id===link.id&&Array.isArray(result.entries))this.networkMagazine16922(link,result.header.title||link.id,result.entries,true);
+      }
+    });return result;
+  });
+};
+const networkChooseBefore16922=Desk520.prototype.chooseMagazine520;
+Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
+  const baseline=networkChooseBefore16922.call(this,valid,genre,now);
+  return this.networkTry16922(()=>this.networkChoose16922(valid.filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now)),baseline,work,now),baseline);
+};
+function networkRecord16922(v){
+  if(!v)return '';
+  return '【作品に近い読者・紹介者・掲載先の比較】\n'+v.message+'\n'+(v.accounts||[]).map(a=>
+    'アカウント '+a.slot+'：本文を確認した自作 '+a.works+'本／比較作品 '+a.seeds+'本（別作者・最大10本）'+
+    '\n3作品・3作者以上に共通する読者 '+a.readers.length+'人／紹介活動を確認した作者 '+a.curators.length+'人').join('\n')+
+    '\n'+(v.routes||[]).map(r=>(r.title||r.article)+' → '+(r.name||r.id)+'（比較 '+time(r.at)+'）：'+r.reason).join('\n')+
+    '\n比較用の追加取得は本日 '+(v.used||0)+'/8ページ。既存の公開探索192ページ枠に含みます。読者一覧は既存の追加探索枠内で確認。'+
+    '\n比較候補・掲載先の選択は送信や掲載の成功ではありません。公開一覧の一部を比較しており、新規訪問・読了・掲載による効果は未確認です。資料が足りない場合は従来の巡回と掲載先選択を継続します。';
 }
 
 const BROWSER_SOURCES520 = Object.freeze({
