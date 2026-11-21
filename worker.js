@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.23';
+const VERSION = 'v16.9.24';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -8488,6 +8488,7 @@ Object.assign(Desk520.prototype,{
       contact TEXT NOT NULL,confirmed INTEGER NOT NULL,works TEXT NOT NULL,seen INTEGER NOT NULL,
       PRIMARY KEY(slot,account,reader))`);
     this.rows('CREATE INDEX IF NOT EXISTS desk_repeat_age16923 ON desk_repeat16923(seen)');
+    this.rows('CREATE INDEX IF NOT EXISTS desk_repeat_cohort16924 ON desk_repeat16923(confirmed)');
     this.repeatReady16923=true;
   },
   repeatObserve16923(slot,identity,contacts,article){
@@ -8498,7 +8499,9 @@ Object.assign(Desk520.prototype,{
       !/^n[a-z0-9]{1,64}$/.test(article.key||'')||!Number.isFinite(pub)||pub>now||pub<=now-14*D520)return;
     const seen=new Set();
     this.storage.transactionSync(()=>{
-      this.rows('DELETE FROM desk_repeat16923 WHERE seen<?',now-45*D520);
+      // This bounded cache is used only for the 28-day comparison. Expired
+      // cohorts must not occupy the cap and prevent observing new readers.
+      this.rows('DELETE FROM desk_repeat16923 WHERE confirmed<?',now-28*D520);
       for(const c of contacts.slice(0,100)){
         if(seen.size>=20)break;
         if(c.slot!==slot||c.account!==identity.id||c.status!=='confirmed'||c.confirmed>=pub||c.confirmed<pub-14*D520||
@@ -8559,12 +8562,17 @@ function repeatRecord16923(accounts){
 // announcement is never permission to enter. Unknown rules stay out of writes.
 const CONTEST16923={pages:12,entries:2,gap:30*M520,writeGap:2*HOUR,maxRules:64,maxEntries:256,
   seed:{owner:'kakitsubataayame',id:'n9b601ce1183b',url:'https://note.com/kakitsubataayame/n/n9b601ce1183b'}};
+class ContestReadWait16924 extends Error {
+  constructor(message,at){super(message);this.at=at;}
+}
 function contestOwner16923(s){return typeof s==='string'&&/^[\w-]{1,80}$/.test(s)&&!['api','settings','search','hashtag','tag'].includes(s);}
 function contestTags16923(n){
   if(!Array.isArray(n?.hashtags)||n.hashtags.length>30)return null;
   const names=n.hashtags.map(t=>typeof t==='string'?t:t?.hashtag?.name??t?.name);
   if(names.some(t=>typeof t!=='string'||!t.trim()||t.length>120))return null;
-  return [...new Set(names.map(t=>t.replace(/^#/,'').trim()))].sort();
+  const tags=names.map(t=>t.replace(/^#/,'').trim());
+  if(tags.some(t=>!t||/[\r\n\u0000-\u001f]/.test(t)))return null;
+  return [...new Set(tags)].sort();
 }
 function contestRule16923(n,now=Date.now()){
   const hold=reason=>({ok:false,reason});
@@ -8601,6 +8609,7 @@ async function contestSnapshot16923(n,account){
   return {key:n.key,title:n.name,hash,cover,tags,pub,account};
 }
 function contestFits16923(n,p){
+  if(!n||typeof n!=='object'||typeof n.body!=='string'||!n.body.trim()||!p?.ok)return false;
   const pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt),chars=publishedChars162(n);
   if(!p?.ok||!Number.isFinite(pub)||pub<p.start||pub>=p.end||chars===null||chars>p.chars||chars<1)return false;
   if(/(?:amzn\.to|amazon\.[^\s"<>]+[?&]tag=|a\.r10\.to|hb\.afl\.rakuten|[?&](?:affiliate|aff_id|a8mat)=)/i.test(n.body))return false;
@@ -8642,7 +8651,7 @@ Object.assign(Desk520.prototype,{
         const l=noteLink161(a.href,path,'article');if(l)found.push({...l,title:a.label});
       }
     }else if(format==='issue'){
-      const items=Array.isArray(value)?value:value?.items;
+      const items=Array.isArray(value)?value:value?.entries;
       for(const x of (items||[]).slice(0,30))if(/コンテスト|作品募集|お題企画/.test(x.title||'')){
         const l=noteLink161(x.link,path,'article');if(l)found.push({...l,title:x.title});
       }
@@ -8653,11 +8662,21 @@ Object.assign(Desk520.prototype,{
       this.rows('INSERT OR IGNORE INTO desk_contest_rule16923(id,owner,url,title) VALUES(?,?,?,?)',f.id,f.owner,f.url,String(f.title||'').slice(0,300));
     }
   },
-  async contestRead16923(path,format='json'){
-    if(!this.contestActive16923())throw new Error('contest paused');
+  contestReadRoom16924(pages=1){
     const now=Date.now(),day=jstDay(now),s=this.one('SELECT * FROM desk_contest16923 WHERE id=1'),b=this.one('SELECT * FROM desk_scout_budget WHERE id=1');
+    if(!this.contestActive16923(now))return {ok:false,at:Math.max(now+CONTEST16923.gap,this.one('SELECT blocked FROM desk_cfg WHERE id=1')?.blocked||0),message:'停止・公開優先・note指定の待機中'};
     const used=s.day===day?s.used:0,shared=b.day===day?b.used:0;
-    if(used>=CONTEST16923.pages||shared>=192)throw new Error('contest read budget');
+    if(used+pages>CONTEST16923.pages||shared+pages>192)return {ok:false,at:jstStart(day)+D520+M520,message:'本日の読み取り枠を使用済み。翌日の枠で自動再確認します'};
+    return {ok:true,day,used,shared};
+  },
+  contestDefer16924(message,at,row=null){
+    this.rows('UPDATE desk_contest16923 SET due=MAX(due,?),message=? WHERE id=1',at,message);
+    if(row)this.rows("UPDATE desk_contest_entry16923 SET due=MAX(due,?),message=? WHERE contest=? AND article=? AND phase='sent'",at,message+'（応募操作の再送なし）',row.contest,row.article);
+  },
+  async contestRead16923(path,format='json'){
+    const room=this.contestReadRoom16924();
+    if(!room.ok)throw new ContestReadWait16924(room.message,room.at);
+    const now=Date.now(),{day,used,shared}=room;
     this.storage.transactionSync(()=>{
       this.rows('UPDATE desk_contest16923 SET day=?,used=?,writes=CASE WHEN day=? THEN writes ELSE 0 END WHERE id=1',day,used+1,day);
       this.rows('UPDATE desk_scout_budget SET day=?,used=? WHERE id=1',day,shared+1);
@@ -8669,7 +8688,8 @@ Object.assign(Desk520.prototype,{
     const entries=new Set(),seen=new Set();
     for(let page=1;page<=4;page++){
       const d=(await this.contestRead16923('https://note.com/api/v2/creators/43__/contents?kind=note&page='+page))?.data;
-      if(!Array.isArray(d?.contents)||d.contents.length>100||(d.page!=null&&Number(d.page)!==page))return null;
+      if(!Array.isArray(d?.contents)||d.contents.length>100||[d.page,d.currentPage].some(v=>v!=null&&Number(v)!==page))return null;
+      if(typeof d.isLastPage==='boolean'&&typeof d.is_last_page==='boolean'&&d.isLastPage!==d.is_last_page)return null;
       for(const n of d.contents){
         if(n.status!=='published')return null;
         if(n.user?.urlname!=='43__'||String(n.user.id)!==account||!/^n[a-z0-9]{1,64}$/.test(n.key||'')||seen.has(n.key))return null;
@@ -8684,10 +8704,11 @@ Object.assign(Desk520.prototype,{
   },
   contestReserve16923(rule,policy,before,manual){
     const now=Date.now(),today=jstDay(now);
-    if(!this.contestActive16923(now)||now>=policy.end||!this.joinProof520(policy.member,now)||!Array.isArray(manual))return false;
+    if(!this.contestActive16923(now)||now<policy.start||now>=policy.end||!this.joinProof520(policy.member,now)||!Array.isArray(manual)||
+      !Array.isArray(before?.tags)||before.tags.length>=10||before.tags.includes(policy.tag)||!this.contestReadRoom16924().ok)return false;
     return this.storage.transactionSync(()=>{
       const state=this.one('SELECT * FROM desk_contest16923 WHERE id=1'),live=this.one('SELECT * FROM desk_contest_rule16923 WHERE id=?',rule.id);
-      if(!live||live.hash!==rule.hash||live.checked<now-10*M520||state.next_write>now||state.used>=CONTEST16923.pages||
+      if(!live||live.hash!==rule.hash||live.checked<now-10*M520||state.next_write>now||
         (state.day===today&&state.writes>=CONTEST16923.entries)||this.one('SELECT COUNT(*) n FROM desk_contest_entry16923').n>=CONTEST16923.maxEntries||
         this.one('SELECT 1 FROM desk_contest_entry16923 WHERE article=?',before.key))return false;
       const known=new Set([...manual,...this.rows('SELECT article FROM desk_contest_entry16923 WHERE contest=?',rule.id).map(r=>r.article)]);
@@ -8701,35 +8722,55 @@ Object.assign(Desk520.prototype,{
     });
   },
   async contestVerify16923(row){
-    const now=Date.now(),before=JSON.parse(row.before_json),p=JSON.parse(row.policy);
-    // Only read-back is permitted after an attempted edit, including after restart.
-    this.rows('UPDATE desk_contest_entry16923 SET due=?,checks=checks+1 WHERE contest=? AND article=?',now+Math.min(24,2**Math.min(5,row.checks))*HOUR,row.contest,row.article);
-    const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+row.article))?.data;
-    const after=await contestSnapshot16923(n,row.account);
-    if(!after){this.rows('UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=?','応募先記事の公開状態を確認待ち。再送しません',row.contest,row.article);return;}
-    const preserved=contestSame16923({...before,tags:after.tags},after,p.tag);
-    if(!preserved){
-      this.rows("UPDATE desk_contest_entry16923 SET phase='changed',message='応募操作後に本文・タイトル・画像等の変更を検出。自動操作を保留' WHERE contest=? AND article=?",row.contest,row.article);
-      return;
+    const now=Date.now();
+    const current=this.one('SELECT * FROM desk_contest_entry16923 WHERE contest=? AND article=?',row.contest,row.article);
+    if(!current||current.phase!=='sent')return;
+    row=current;
+    let before,p;
+    try{before=JSON.parse(row.before_json);p=JSON.parse(row.policy);if(!Number.isFinite(p.end)||!Array.isArray(before.tags))throw Error();}
+    catch{this.rows("UPDATE desk_contest_entry16923 SET phase='unknown',message='応募前の照合記録を読み取れません。応募操作は再送しません' WHERE contest=? AND article=?",row.contest,row.article);return;}
+    if(now>p.end+7*D520){
+      this.rows("UPDATE desk_contest_entry16923 SET phase='unknown',message='募集終了後7日までに反映を確定できませんでした。応募操作は再送しません' WHERE contest=? AND article=?",row.contest,row.article);return;
     }
-    if(!contestSame16923(before,after,p.tag,true)){
-      this.rows('UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=?','応募タグまたは既存タグの保存結果を確認待ち。再送しません',row.contest,row.article);return;
+    // Reserve enough read budget before beginning a complete verification. A
+    // deferred or failed request is not a completed check and cannot exhaust it.
+    const room=this.contestReadRoom16924(2);
+    if(!room.ok){this.contestDefer16924(room.message,room.at,row);return;}
+    const next=now+Math.min(24,2**Math.min(5,row.checks))*HOUR;
+    this.rows("UPDATE desk_contest_entry16923 SET due=? WHERE contest=? AND article=? AND phase='sent'",next,row.contest,row.article);
+    try{
+      const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+row.article))?.data;
+      const after=await contestSnapshot16923(n,row.account);
+      if(!after){this.rows("UPDATE desk_contest_entry16923 SET message='応募先記事の公開状態を確認待ち。応募操作は再送しません' WHERE contest=? AND article=? AND phase='sent'",row.contest,row.article);return;}
+      const finish=(phase,message)=>this.rows("UPDATE desk_contest_entry16923 SET phase=?,message=?,checks=checks+1 WHERE contest=? AND article=? AND phase='sent'",phase,message,row.contest,row.article);
+      if(!contestSame16923({...before,tags:after.tags},after,p.tag)){
+        finish('changed','応募操作後に本文・タイトル・画像等の変更を検出。新しい応募操作を保留');return;
+      }
+      if(!contestSame16923(before,after,p.tag,true)){
+        finish('sent','応募タグまたは既存タグの保存結果を確認待ち。応募操作は再送しません');return;
+      }
+      const html=await this.contestRead16923('https://note.com/hashtag/'+encodeURIComponent(p.tag)+'?f=new','html');
+      const listed=anchors161(html).some(a=>{const l=noteLink161(a.href,'https://note.com','article');return l?.owner==='43__'&&l.id===row.article;});
+      finish(listed?'listed':'sent',listed?'応募タグ・募集一覧への掲載と作品内容の維持を確認。受賞・主催者の受理判定は未確認':'応募タグと作品内容の維持を確認。募集一覧への掲載は未確認（応募操作の再送なし）');
+    }catch(error){
+      if(readLimit(error))throw error;
+      const message=error instanceof ContestReadWait16924?error.message:error instanceof PublicReadError?publicReadReason(error):'応募結果の読み取りに失敗。保存済み記録から自動再確認します';
+      const at=error instanceof ContestReadWait16924?error.at:now+2*HOUR;
+      this.contestDefer16924(message,at,row);
     }
-    const html=await this.contestRead16923('https://note.com/hashtag/'+encodeURIComponent(p.tag)+'?f=new','html');
-    const listed=anchors161(html).some(a=>{const l=noteLink161(a.href,'https://note.com','article');return l?.owner==='43__'&&l.id===row.article;});
-    this.rows('UPDATE desk_contest_entry16923 SET phase=?,message=? WHERE contest=? AND article=?',listed?'listed':'sent',
-      listed?'応募タグ・募集一覧への掲載と作品内容の維持を確認。受賞・主催者の受理判定は未確認':'応募タグと作品内容の維持を確認。募集一覧への掲載は未確認（自動再送なし）',row.contest,row.article);
   },
   async contestTick16923(now){
     this.initContest16923();
     const state=this.one('SELECT * FROM desk_contest16923 WHERE id=1');
     if(!this.contestActive16923(now)||state.due>now)return;
     this.rows('UPDATE desk_contest16923 SET due=? WHERE id=1',now+CONTEST16923.gap);
-    if(this.one("SELECT 1 FROM desk_contest_entry16923 WHERE phase='changed'")){
-      this.rows("UPDATE desk_contest16923 SET message='応募後の作品変更を検出したため、新しい応募は保留中' WHERE id=1");return;
-    }
-    const pending=this.one("SELECT * FROM desk_contest_entry16923 WHERE phase='sent' AND due<=? AND checks<12 ORDER BY due LIMIT 1",now);
+    const pending=this.one("SELECT * FROM desk_contest_entry16923 WHERE phase='sent' AND due<=? ORDER BY due LIMIT 1",now);
     if(pending){await this.contestVerify16923(pending);return;}
+    if(this.one("SELECT 1 FROM desk_contest_entry16923 WHERE phase='changed'")){
+      this.rows("UPDATE desk_contest16923 SET message='応募後の作品変更を検出したため、新しい応募は保留中。ほかの操作済み応募は読み取り確認を継続' WHERE id=1");return;
+    }
+    const room=this.contestReadRoom16924();
+    if(!room.ok){this.contestDefer16924(room.message,room.at);return;}
     if(state.scout<=now){
       this.rows('UPDATE desk_contest16923 SET scout=? WHERE id=1',now+D520);
       await this.contestRead16923('https://note.com/contests','html');return;
@@ -8775,11 +8816,11 @@ Object.assign(Desk520.prototype,{
       lease=await acquire(env,false);if(!lease)return;
       const credentials=await loadCookie(env,account.id),cookie=cleanCookie(credentials.NOTE_SESSION);
       const mayAct=async()=>{
-        const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,c.enabled,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',account.slot).first();
+        const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,c.enabled,c.inflight,h.kind,n.hold_until,d.pending comment_pending,o.pending outreach_pending FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? LEFT JOIN nh_v1697_discovery d ON d.slot=n.slot LEFT JOIN nh_v16910_state o ON o.slot=n.slot WHERE c.id=1',account.slot).first();
         const at=Date.now();
-        return !!live&&!!live.enabled&&live.account===account.id&&live.token===lease&&live.lease>at&&live.hold_until<=at&&(!live.kind||live.next_at<=at)&&this.contestActive16923(at)&&at<p.end&&this.joinProof520(p.member,at)&&this.archiveFits(work,this.eligibleMags(at).filter(m=>noteLink161(m.url)?.id===p.member),at).length>0;
+        return !!live&&live.enabled===1&&live.inflight===''&&live.comment_pending===''&&live.outreach_pending===''&&live.account===account.id&&live.token===lease&&live.lease>at&&live.hold_until<=at&&(!live.kind||live.next_at<=at)&&this.contestActive16923(at)&&at<p.end&&this.joinProof520(p.member,at)&&this.archiveFits(work,this.eligibleMags(at).filter(m=>noteLink161(m.url)?.id===p.member),at).length>0;
       };
-      if(!await mayAct())return;
+      if(!await mayAct()){message('停止・ほかの操作の結果・待機終了を確認してから応募します');return;}
       const result=await contestBrowser16923(binding,cookie,before,p,async()=>await mayAct()&&this.contestReserve16923(rule,p,before,manual),mayAct,plainDraft16914(own.body),async()=>{const fresh=(await this.contestRead16923("https://note.com/api/v3/notes/"+before.key))?.data;const saved=await contestSnapshot16923(fresh,account.id);return contestSame16923(before,saved,p.tag)||contestSame16923(before,saved,p.tag,true);});
       message(result.message);
       this.rows("UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=? AND phase='sent'",result.message,rule.id,before.key);
@@ -8845,6 +8886,7 @@ function contestScreen16923(step,arg){
   const actual=[...new Set(values)].sort();
   const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;
   if(!tags)return {state:'tags'};
+  if(step==='ready'&&!tags.includes(arg.tag)&&tags.length>=10)return {state:'tag_limit'};
   if(step==='ready'||step==='updatedReady')return {state:'ready'};
   if(step==='add'){
     if(tags.includes(arg.tag))return {state:'already'};
@@ -8897,6 +8939,7 @@ async function contestBrowser16923(binding,cookie,before,p,mark,mayAct,plain,bef
     if(blocked()||!await mayAct()||!await mark())return blocked()?blockedResult():{message:'応募上限・停止・期限を再確認して保留'};
     // From here onward the ledger is irrevocably attempted. Never retry an edit
     // after a crash, timeout, unexpected screen or lost response.
+    if(blocked()||!await mayAct())return blocked()?blockedResult():{message:'タグ入力の直前に停止・待機・期限を確認して保留。応募操作は再送しません'};
     if((await screen('add'))?.state!=='added')return {message:'タグ入力操作の結果を確認待ち。自動再送しません'};
     const changed=await poll(()=>screen('updatedReady',{tags:[...before.tags,p.tag]}),x=>['ready','confirmation'].includes(x?.state));
     if(changed?.state==='confirmation'){
@@ -8920,7 +8963,7 @@ Desk520.prototype.publicRead=async function(path,format){
 };
 
 const BROWSER_SOURCES520 = Object.freeze({
-  "contestScreen16923": "function contestScreen16923(step,arg){\n  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||\n    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();\n  const one=xs=>xs.length===1?xs[0]:null;\n  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));\n  const dialogs=all(document,'[role=dialog],dialog');\n  if(dialogs.length){\n    const dialog=one(dialogs),text=dialog?.innerText||'';\n    const ok=dialog&&button(dialog,['OK']);\n    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};\n    if(step==='confirm'){ok.click();return {state:'confirmed'};}\n    return {state:'confirmation'};\n  }\n  if(step==='settings'){\n    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};\n    go.click();return {state:'opened'};\n  }\n  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};\n  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));\n  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};\n  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);\n  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));\n  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||\n    all(document,'input[type=\"datetime-local\"],[name*=\"schedul\"][type=hidden]').some(e=>e.value))return {state:'settings'};\n  const expected=[...new Set(arg.tags)].sort();\n  const values=[];\n  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name=\"hashtags[]\"]')){\n    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';\n    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\\s*$/,'').replace(/^#/,'').trim();\n    if(clean&&!/\\n/.test(clean))values.push(clean);\n  }\n  for(const el of all(document,'[aria-label]')){\n    const label=el.getAttribute('aria-label')||'';\n    const m=/^ハッシュタグ\\s*#?(.+?)(?:\\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());\n  }\n  const actual=[...new Set(values)].sort();\n  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;\n  if(!tags)return {state:'tags'};\n  if(step==='ready'||step==='updatedReady')return {state:'ready'};\n  if(step==='add'){\n    if(tags.includes(arg.tag))return {state:'already'};\n    if(tags.length>=10)return {state:'tag_limit'};\n    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\n    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};\n    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));\n    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));\n    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));\n    return {state:'added'};\n  }\n  if(step==='update'){submit.click();return {state:'clicked'};}\n  return {state:'unknown'};\n}",
+  "contestScreen16923": "function contestScreen16923(step,arg){\n  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||\n    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();\n  const one=xs=>xs.length===1?xs[0]:null;\n  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));\n  const dialogs=all(document,'[role=dialog],dialog');\n  if(dialogs.length){\n    const dialog=one(dialogs),text=dialog?.innerText||'';\n    const ok=dialog&&button(dialog,['OK']);\n    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};\n    if(step==='confirm'){ok.click();return {state:'confirmed'};}\n    return {state:'confirmation'};\n  }\n  if(step==='settings'){\n    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};\n    go.click();return {state:'opened'};\n  }\n  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};\n  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));\n  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};\n  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);\n  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));\n  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||\n    all(document,'input[type=\"datetime-local\"],[name*=\"schedul\"][type=hidden]').some(e=>e.value))return {state:'settings'};\n  const expected=[...new Set(arg.tags)].sort();\n  const values=[];\n  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name=\"hashtags[]\"]')){\n    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';\n    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\\s*$/,'').replace(/^#/,'').trim();\n    if(clean&&!/\\n/.test(clean))values.push(clean);\n  }\n  for(const el of all(document,'[aria-label]')){\n    const label=el.getAttribute('aria-label')||'';\n    const m=/^ハッシュタグ\\s*#?(.+?)(?:\\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());\n  }\n  const actual=[...new Set(values)].sort();\n  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;\n  if(!tags)return {state:'tags'};\n  if(step==='ready'&&!tags.includes(arg.tag)&&tags.length>=10)return {state:'tag_limit'};\n  if(step==='ready'||step==='updatedReady')return {state:'ready'};\n  if(step==='add'){\n    if(tags.includes(arg.tag))return {state:'already'};\n    if(tags.length>=10)return {state:'tag_limit'};\n    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\n    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};\n    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));\n    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));\n    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));\n    return {state:'added'};\n  }\n  if(step==='update'){submit.click();return {state:'clicked'};}\n  return {state:'unknown'};\n}",
   "contestBrowserRead16923": "async function contestBrowserRead16923(key){\n  if(location.origin!=='https://note.com'||!/^n[a-z0-9]{1,64}$/.test(key))return null;\n  const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});\n  if(!r.ok)return null;\n  const n=(await r.json())?.data;return n?.key===key?n:null;\n}",
 
   "trafficScreen16913": "function trafficScreen16913(step='read') {\n  if(location.origin!=='https://note.com' || !/^\\/dashboard\\/?$/.test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const root=document.querySelector('main,[role=\"main\"]')||document.body;\n  if(!root)return {state:'loading'};\n  const clean=t=>(t||'').normalize('NFKC').replace(/[\\u200b\\u200e\\u200f]/g,'').trim();\n  const all=s=>[...root.querySelectorAll(s)].filter(visible);\n  const text=clean(root.innerText),header=text.split(/直近1[ヶかケ]月のまとめ|あなたへの提案|記事の流入元/)[0];\n  if(!/アクセス状況/.test(text) || !/インプレッション/.test(header) || !/ページビュー/.test(header))return {state:'layout'};\n  if(/この期間のデータはありません|集計中|読み込み中/.test(header))return {state:'loading'};\n  const stamps=[...header.matchAll(/(\\d{4})[\\/年.-](\\d{1,2})[\\/月.-](\\d{1,2})日?\\s*(?:〜|～|~|–|−|—|-|から)\\s*(?:(\\d{4})[\\/年.-])?(\\d{1,2})[\\/月.-](\\d{1,2})日?/g)];\n  const dates=[...new Set(stamps.map(m=>JSON.stringify([m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0'),(m[4]||m[1])+'-'+m[5].padStart(2,'0')+'-'+m[6].padStart(2,'0')])))] ;\n  if(dates.length!==1)return {state:'period'};\n  const [start,end]=JSON.parse(dates[0]);\n  if(step==='previous'){\n    // Only the displayed dashboard's period navigation, never account settings.\n    const controls=all('button').filter(b=>!b.disabled && b.getAttribute('aria-disabled')!=='true' &&\n      /^(?:前の期間(?:へ|に移動|を表示)?|前期間|Previous period)$/i.test(clean(b.getAttribute('aria-label')||b.getAttribute('title')||b.innerText)));\n    if(controls.length!==1)return {state:'previous_missing'};\n    controls[0].click();return {state:'moved',start,end};\n  }\n  const values={},labels={impressions:'インプレッション',pageviews:'ページビュー',likes:'スキ',comments:'コメント'};\n  const nodes=all('span,p,dt,dd,div,button,strong,h2,h3');\n  for(const [key,label] of Object.entries(labels)){\n    const found=new Set();\n    for(const el of nodes.filter(e=>clean(e.innerText)===label)){\n      // Summary metric cards have one label and one exact count. Article rows,\n      // charts, menus and comparison percentages cannot pass this whole match.\n      for(let p=el.parentElement,n=0;p&&p!==root&&n<4;p=p.parentElement,n++){\n        const value=clean(p.innerText).replace(/\\s/g,'');\n        const match=new RegExp('^(?:'+label+'([0-9,]+|[-−–—])(?:回|件)?|([0-9,]+|[-−–—])(?:回|件)?'+label+')$').exec(value);\n        if(match){\n          const raw=match[1]||match[2];\n          if(/^[0-9]+$|^[1-9][0-9]{0,2}(?:,[0-9]{3})+$/.test(raw))found.add(Number(raw.replaceAll(',','')));\n          // note documents '-' as zero for the modern metrics. Do not apply it\n          // to pre-2021 impressions or missing/unavailable data.\n          else if(/^[-−–—]$/.test(raw) && start>='2021-05-01')found.add(0);\n          break;\n        }\n      }\n    }\n    if(found.size!==1 || !Number.isSafeInteger([...found][0]))return {state:'metrics',field:key};\n    values[key]=[...found][0];\n  }\n  const updated=[...header.matchAll(/(\\d{4}[\\/年.-]\\d{1,2}[\\/月.-]\\d{1,2}日?\\s+\\d{1,2}:\\d{2}(?::\\d{2})?)\\s*集計/g)].map(m=>m[1]);\n  const refText=text.split('記事の流入元').slice(1).join('記事の流入元'),referrers=[];\n  const pattern=/((?:[a-z0-9-]+\\.)+[a-z]{2,63}|no referrer|other|流入元不明|X|Facebook|Google|Instagram)\\s+(\\d+(?:\\.\\d+)?)\\s*%\\s*\\(\\s*([\\d,]+)\\s*PV\\s*\\)/gi;\n  for(const m of refText.matchAll(pattern)){\n    const count=Number(m[3].replaceAll(',','')),share=Number(m[2]),name=m[1];\n    if(Number.isSafeInteger(count)&&count>=0&&share>=0&&share<=100&&!referrers.some(r=>r.name===name))referrers.push({name,pageviews:count,share});\n  }\n  if(referrers.length>12)return {state:'referrers'};\n  return {state:'ready',start,end,...values,updated:updated.length===1?updated[0]:'',referrers,\n    referrersRead:referrers.length>0,signature:JSON.stringify([start,end,values,updated,referrers])};\n}",
