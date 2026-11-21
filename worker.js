@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.26';
+const VERSION = 'v16.9.28';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -446,8 +446,18 @@ async function account(env) {
   return String(user.id);
 }
 async function article(env, key) {
-  try { return await api(env, '/api/v3/notes/' + key); }
+  try {
+    const data=await api(env, '/api/v3/notes/' + key);
+    if(data.key!==key)throw new Trouble('取得した記事が確認対象と一致しません','response');
+    return data;
+  }
   catch (error) { if (error.code === 404 && !error.retry) return null; throw error; }
+}
+function likeState16928(note){
+  if(note===null)return false;
+  if(note?.status!=='published'||typeof note.is_liked!=='boolean')
+    throw new Trouble('記事の公開状態・スキ状態を確認できません','response');
+  return note.is_liked;
 }
 async function acquire(env, automatic) {
   const now = Date.now(), token = crypto.randomUUID();
@@ -918,7 +928,7 @@ async function run(original,slot) {
     await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0',slot).run();
     if (state.inflight) {
       stage='前回送信の確認';
-      const data=await article(env,state.inflight), liked=data?.is_liked===true;
+      const data=await article(env,state.inflight), liked=likeState16928(data);
       const before=await sql(env,'SELECT status FROM nh_seen WHERE key=?',state.inflight).first();
       const add=liked && before?.status!=='liked';
       const items=[
@@ -989,6 +999,7 @@ async function run(original,slot) {
         stage='記事確認'; details++;
         const note=await article(env,key);
         const author=authorOf(note);
+        if(note&&(note.status!=='published'||typeof note.is_liked!=='boolean')){bump('no_candidates');continue;}
         if(fromReader && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
         if (!note || note.is_liked===true || ownIds.has(author)) {
           await sql(env,"INSERT OR IGNORE INTO nh_seen VALUES (?,'skip',?)",key,Date.now()).run();
@@ -1030,7 +1041,7 @@ async function run(original,slot) {
         stage='スキ送信';
         await api(env,'/api/v3/notes/'+key+'/likes',true,referer);
         stage='送信後の確認';
-        if ((await article(env,key))?.is_liked!==true) throw new Trouble('送信結果は未確認。再送せず次回に確認します');
+        if (!likeState16928(await article(env,key))) throw new Trouble('送信結果は未確認。再送せず次回に確認します');
         await env.DB.batch([
           sql(env,"UPDATE nh_seen SET status='liked' WHERE key=?",key),
           sql(env,"UPDATE nh_control SET inflight='',total=total+1 WHERE id=1 AND token=?",token),
@@ -1359,7 +1370,10 @@ async function deskTick(env) {
   if (!r.ok) throw Error('520 tick unavailable');
 }
 async function read520body(res, limit) {
-  if (Number(res.headers.get('content-length'))>limit) throw new Input520('データが大きすぎます。');
+  if (Number(res.headers.get('content-length'))>limit) {
+    await res.body?.cancel().catch(()=>{});
+    throw new Input520('データが大きすぎます。');
+  }
   const reader=res.body?.getReader();
   if (!reader) throw new Input520('データが空です。');
   const decoder=new TextDecoder('utf-8',{fatal:true});
@@ -1369,10 +1383,13 @@ async function read520body(res, limit) {
       const {value,done}=await reader.read();
       if (done) break;
       size+=value.byteLength;
-      if (size>limit) { await reader.cancel(); throw new Input520('1回の登録量を減らしてください。'); }
+      if (size>limit) throw new Input520('1回の登録量を減らしてください。');
       result+=decoder.decode(value,{stream:true});
     }
     return result+decoder.decode();
+  } catch(error) {
+    await reader.cancel().catch(()=>{});
+    throw error;
   } finally { reader.releaseLock(); }
 }
 function deskJson(data,status=200) {
@@ -2543,7 +2560,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC"),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.taskHealthRows16928(),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -2855,7 +2872,8 @@ class Desk520 {
   }
   rememberPublic(key,title,pub) {
     if(!/^n[a-z0-9]{1,64}$/.test(key) || !text520(title,300) || title.trim()==='521' || !Number.isFinite(pub) || pub<=0 || pub>Date.now())return false;
-    this.rows('INSERT OR IGNORE INTO desk_archive(article,title,pub) VALUES(?,?,?)',key,title,pub);
+    this.rows(`INSERT INTO desk_archive(article,title,pub) VALUES(?,?,?) ON CONFLICT(article) DO UPDATE SET
+      title=excluded.title,pick_due=CASE WHEN title<>excluded.title THEN 0 ELSE pick_due END`,key,title,pub);
     // Recently published at upgrade: capture a still-open target, never invent a prior count.
     const now=Date.now();
     if(pub+7*D520+WINDOW520>now && pub<this.one('SELECT started FROM desk_growth WHERE id=1').started){
@@ -2947,7 +2965,7 @@ class Desk520 {
       const n=(await this.publicRead('https://note.com/api/v3/notes/'+a.article,'json'))?.data;
       if(n?.key===a.article && (n.name?.trim()==='521' || (n.status && n.status!=='published') || (n.user?.urlname && n.user.urlname!=='43__')))
         this.rows('DELETE FROM desk_reaction_work WHERE article=?',a.article);
-      if(n?.user?.urlname!=='43__' || n.key!==a.article || n.name?.trim()==='521' || (n.status && n.status!=='published'))throw Error('not verified');
+      if(n?.user?.urlname!=='43__' || n.key!==a.article || !text520(n.name,300) || n.name.trim()==='521' || (n.status && n.status!=='published'))throw Error('not verified');
       if(isPublishedBy520(n))this.recordReactionTitle(a.article,n.name,a.pub,now);
       const value=count520(n,['likeCount','like_count']);
       const tags=Array.isArray(n.hashtags)?n.hashtags.map(t=>String(typeof t==='string'?t:t?.hashtag?.name??t?.name??'').replace(/^#/,'')):[];
@@ -2958,9 +2976,9 @@ class Desk520 {
       // Do not estimate restricted text or infer how a writer produced it.
       const chars=publishedChars162(n);
       this.magazineHints(n);
-      this.rows(`UPDATE desk_archive SET pick_due=0,due=?,verified=?,genre=?,chars=?,previous=CASE WHEN ? IS NOT NULL THEN likes ELSE previous END,
+      this.rows(`UPDATE desk_archive SET title=?,pick_due=0,due=?,verified=?,genre=?,chars=?,previous=CASE WHEN ? IS NOT NULL THEN likes ELSE previous END,
         prior_at=CASE WHEN ? IS NOT NULL THEN at ELSE prior_at END,likes=COALESCE(?,likes),at=CASE WHEN ? IS NULL THEN at ELSE ? END,state=? WHERE article=?`,
-        now+(value===null?D520:7*D520),now,genre,chars,value,value,value,value,now,value===null?'スキ数取得待ち':'取得済み',a.article);
+        n.name,now+(value===null?D520:7*D520),now,genre,chars,value,value,value,value,now,value===null?'スキ数取得待ち':'取得済み',a.article);
     }catch(error){
       if(error instanceof PublicReadError && /HTTP (404|410)$/.test(error.message)) this.rows('DELETE FROM desk_reaction_work WHERE article=?',a.article);
       this.rows("UPDATE desk_archive SET due=?,state='詳細取得待ち',verified=0 WHERE article=?",now+D520,a.article);
@@ -2970,7 +2988,7 @@ class Desk520 {
     if(!article.verified || article.verified<now-8*D520)return [];
     const genre=article.work_genre??article.genre,chars=article.work_chars??article.chars;
     return magazines.filter(({p})=>
-      (genre?p.genres.includes(genre):genre520.every(g=>p.genres.includes(g))) &&
+      validPolicy16928(p) && (genre?p.genres.includes(genre):genre520.every(g=>p.genres.includes(g))) &&
       (article.method?p.methods.includes(article.method):method520.every(m=>p.methods.includes(m))) &&
       (chars!==null?chars>=p.min && chars<=p.max:p.min===0 && p.max===1000000));
   }
@@ -3008,7 +3026,7 @@ class Desk520 {
       (m.url=i.url OR m.url LIKE '%/m/'||i.id) JOIN desk_member role ON role.id=i.id
       WHERE m.active=1 AND m.recent>=? AND i.allowed=1 AND i.managed=1 AND i.state='利用中'
       AND role.mode='auto' AND role.checked>? ORDER BY m.url`,now-60*D520,now-2*D520)
-      .map(m=>({...m,p:JSON.parse(m.policy)})).sort((a,b)=>a.p.genres.length-b.p.genres.length ||
+      .flatMap(m=>{try{const p=JSON.parse(m.policy);return validPolicy16928(p)?[{...m,p}]:[];}catch{return [];}}).sort((a,b)=>a.p.genres.length-b.p.genres.length ||
         (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
   }
 
@@ -3531,8 +3549,8 @@ class Desk520 {
       message=readLimit(error)?'D1の読み取り枠更新後に再確認':'note設定を読み戻せず・次回再確認';
       due=readLimit(error)?(day+1)*D520+M520:now+2*HOUR;
     } finally {
-      this.rows('UPDATE desk_reactions SET message=?,due=? WHERE id=1',message,due);
-      if (token) await release(env,token);
+      try{this.rows('UPDATE desk_reactions SET message=?,due=? WHERE id=1',message,due);}
+      finally{if(token)await release(env,token);}
     }
   }
   async ensureRecommendation(now) {
@@ -3596,8 +3614,8 @@ class Desk520 {
     } catch(error) {
       if(readLimit(error)){message='D1の読み取り枠更新後に再確認';due=(Math.floor(now/D520)+1)*D520+60000;}
     } finally {
-      this.rows('UPDATE desk_recommend SET done=?,due=?,message=?,checked=? WHERE id=1',done,due,message,Date.now());
-      if(recommendLease)await release(recommendEnv,recommendLease);
+      try{this.rows('UPDATE desk_recommend SET done=?,due=?,message=?,checked=? WHERE id=1',done,due,message,Date.now());}
+      finally{if(recommendLease)await release(recommendEnv,recommendLease);}
     }
   }
   async frontPageBackup(now) {
@@ -3646,16 +3664,36 @@ class Desk520 {
       });
     }catch{ /* A failed read leaves the result unknown; it never queues another publication. */ }
   }
+  taskHealth16928(name,failed,message=''){
+    const at=Date.now();
+    try{
+      if(failed)this.rows('INSERT INTO desk_task_health(task,at,failed,message) VALUES(?,?,1,?) ON CONFLICT(task) DO UPDATE SET at=excluded.at,failed=1,message=excluded.message',name,at,message);
+      else this.rows("UPDATE desk_task_health SET failed=0,at=?,message='' WHERE task=? AND failed<>0",at,name);
+      this.taskHealthMemory16928?.delete(name);
+    }catch{
+      const first=!this.taskHealthMemory16928?.size;
+      this.taskHealthMemory16928 ||= new Map();
+      this.taskHealthMemory16928.set(name,{task:name,at,message:(failed?message+'／':'')+'状態記録の保存を再確認待ち'});
+      if(this.taskHealthMemory16928.size>32)this.taskHealthMemory16928.delete(this.taskHealthMemory16928.keys().next().value);
+      if(first)console.warn('note-helper: task status persistence deferred');
+    }
+  }
+  taskHealthRows16928(){
+    let rows=[];
+    try{rows=this.rows("SELECT task,at,message FROM desk_task_health WHERE failed=1 AND task<>'520の作品棚' ORDER BY at DESC");}
+    catch{rows=[{task:'状態記録',at:Date.now(),message:'状態記録の読み取りを再確認待ち'}];}
+    return [...new Map([...rows,...(this.taskHealthMemory16928?.values()||[])].map(r=>[r.task,r])).values()].sort((a,b)=>b.at-a.at);
+  }
   async task520(name, work) {
-    try {
-      const result=await work();
-      this.rows("UPDATE desk_task_health SET failed=0,at=?,message='' WHERE task=? AND failed<>0",Date.now(),name);
-      return result;
-    } catch(error) {
+    let result;
+    try {result=await work();}
+    catch(error) {
       const message=readLimit(error)?'D1の読み取り枠更新待ち':error instanceof PublicReadError?publicReadReason(error):'読み取り・保存・接続の途中で失敗しました。次回に再確認します';
-      this.rows('INSERT INTO desk_task_health(task,at,failed,message) VALUES(?,?,1,?) ON CONFLICT(task) DO UPDATE SET at=excluded.at,failed=1,message=excluded.message',name,Date.now(),message);
+      this.taskHealth16928(name,true,message);
       return null;
     }
+    this.taskHealth16928(name,false);
+    return result;
   }
   async tick() {
     this.init();
@@ -3762,6 +3800,11 @@ function cleanJpeg520(bytes) {
   bad();
 }
 // Public note links are used as identifiers. Never forward cookies, fragments or share parameters.
+function validPolicy16928(p){
+  return !!p&&Number.isSafeInteger(p.min)&&Number.isSafeInteger(p.max)&&p.min>=0&&p.max>=p.min&&p.max<=1000000&&
+    Array.isArray(p.genres)&&p.genres.length>0&&p.genres.every(g=>genre520.includes(g))&&
+    Array.isArray(p.methods)&&p.methods.length>0&&p.methods.every(m=>method520.includes(m));
+}
 function noteLink161(input,base='https://note.com',kind='mag') {
   if(typeof input!=='string'||!input.trim()) return null;
   try {
@@ -5465,7 +5508,7 @@ Object.assign(Desk520.prototype,{
       else if(result.sent)due=now+30*M520;
       if(result.hold>0){const until=Date.now()+result.hold;due=Math.max(due,until);this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);await sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,a.slot).run();}
     }catch(error){message=readLimit(error)?'D1の読み取り枠更新後に再確認':'人気記事設定の読み戻しを再確認待ち';if(readLimit(error))due=(Math.floor(Date.now()/D520)+1)*D520+M520;}
-    finally{this.rows('UPDATE desk_popular SET due=?,message=? WHERE id=1',due,message);if(lease)await release(env,lease);}
+    finally{try{this.rows('UPDATE desk_popular SET due=?,message=? WHERE id=1',due,message);}finally{if(lease)await release(env,lease);}}
   }
 });
 
@@ -5929,6 +5972,7 @@ Object.assign(Desk520.prototype,{
       });
     } catch {result={kind:'storage'};}
     finally {
+      try{
       const at=Date.now(),ok=result.kind==='ok',hold=Math.max(0,Number(result.hold)||0);
       const waiting=result.kind==='browser_wait';
       const failures=ok?0:waiting?row.failures:row.failures+1;
@@ -5940,8 +5984,8 @@ Object.assign(Desk520.prototype,{
       // running, preserve server Retry-After. Release only our own lease.
       this.rows('UPDATE desk_tuta SET hold_until=MAX(hold_until,?) WHERE id=1',at+hold);
       this.rows('UPDATE desk_tuta SET message=?,due=MAX(hold_until,?),checked=CASE WHEN ? THEN ? ELSE checked END,failures=? WHERE id=1 AND generation=? AND token=?',message,at+Math.max(delay,hold),+ok,at,failures,row.generation,token);
-      this.rows("UPDATE desk_tuta SET lease=0,token='' WHERE id=1 AND token=?",token);
       this.rows('DELETE FROM desk_tuta_seen WHERE at<?',at-30*D520);
+      }finally{this.rows("UPDATE desk_tuta SET lease=0,token='' WHERE id=1 AND token=?",token);}
     }
   }
 });
@@ -6983,11 +7027,12 @@ Object.assign(Desk520.prototype,{
     const imported=this.one('SELECT url,name FROM desk_import WHERE id=?',p.id);
     const target=this.joinTarget520(p.id),link=noteLink161(imported?.url||target?.url||'');
     if(!link){this.rows("UPDATE desk_mag_verify16913 SET done=2,message='対象誌の公開URLを確認できません・再送なし' WHERE article=? AND id=?",p.article,p.id);return;}
-    this.rows('UPDATE desk_mag_verify16913 SET attempts=attempts+1,due=? WHERE article=? AND id=?',now+Math.min(24,2**p.attempts)*HOUR,p.article,p.id);
-    let proved=false,reason='公開表示では掲載をまだ確認できません・再送なし';
+    this.rows('UPDATE desk_mag_verify16913 SET due=? WHERE article=? AND id=?',now+Math.min(24,2**p.attempts)*HOUR,p.article,p.id);
+    let proved=false,read=false,reason='公開表示では掲載をまだ確認できません・再送なし';
     try{
       const entries=await this.readIssue(link.url);
       if(!this.pipelineActive16913())return;
+      read=true;
       this.storage.transactionSync(()=>this.recordReferences(entries,link,imported?.name||target?.name,Date.now()));
       proved=!!this.one('SELECT 1 FROM desk_ref WHERE article=? AND id=?',p.article,p.id);
     }catch{reason='誌面の取得を再試行待ち・再送なし';}
@@ -6997,6 +7042,7 @@ Object.assign(Desk520.prototype,{
         // published article's explicit magazine list supplies another proof.
         const n=(await this.publicRead('https://note.com/api/v3/notes/'+p.article,'json'))?.data;
         const pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt);
+        if(n?.key===p.article&&n.status==='published'&&n.user?.urlname==='43__'&&Number.isFinite(pub)&&pub<=Date.now()&&Array.isArray(n.magazines))read=true;
         const listed=n?.key===p.article && n.status==='published' && n.user?.urlname==='43__' && Number.isFinite(pub) && pub<=Date.now() &&
           Array.isArray(n.magazines) && n.magazines.some(m=>{
             const l=noteLink161(m?.magazineUrl||m?.magazine_url||m?.url||'');
@@ -7011,7 +7057,8 @@ Object.assign(Desk520.prototype,{
         }
       }catch{ /* An unavailable page never confirms a placement. */ }
     }
-    this.rows('UPDATE desk_mag_verify16913 SET done=?,message=? WHERE article=? AND id=?',proved?1:0,proved?'公開表示で掲載を確認済み':reason,p.article,p.id);
+    if(!this.pipelineActive16913())return;
+    this.rows('UPDATE desk_mag_verify16913 SET attempts=attempts+?,done=?,message=? WHERE article=? AND id=?',+read,proved?1:0,proved?'公開表示で掲載を確認済み':reason,p.article,p.id);
   },
   pipelineView16913(){
     const rows=this.rows(`SELECT j.id,i.name,j.phase,j.proof,j.message,i.allowed,i.state,i.reason,m.mode,
@@ -7203,8 +7250,8 @@ Object.assign(Desk520.prototype,{
       message=readLimit(error)?'D1の読み取り枠更新後に取得':'アクセス状況を読み戻せず・次回に再確認';
       if(readLimit(error))this.rows('UPDATE desk_traffic16913 SET due=? WHERE id=1',(Math.floor(Date.now()/D520)+1)*D520+M520);
     }finally{
-      this.rows('UPDATE desk_traffic16913 SET message=? WHERE id=1',message);
-      if(token)await release(env,token);
+      try{this.rows('UPDATE desk_traffic16913 SET message=? WHERE id=1',message);}
+      finally{if(token)await release(env,token);}
     }
   },
   trafficView16913(){
@@ -9048,6 +9095,8 @@ Object.assign(Desk520.prototype,{
       this.rows("CREATE TABLE IF NOT EXISTS desk_rss_feed16926(url TEXT PRIMARY KEY,id TEXT NOT NULL,checked INTEGER NOT NULL,items TEXT NOT NULL,payload TEXT NOT NULL,etag TEXT NOT NULL,modified TEXT NOT NULL,quiet INTEGER NOT NULL,added INTEGER NOT NULL,full_at INTEGER NOT NULL)");
       this.rows('CREATE INDEX IF NOT EXISTS desk_rss_feed_age16926 ON desk_rss_feed16926(checked,url)');
       this.rows('CREATE INDEX IF NOT EXISTS desk_rss_feed_id16926 ON desk_rss_feed16926(id,checked)');
+      this.rows('CREATE TABLE IF NOT EXISTS desk_rss_activity16927(url TEXT PRIMARY KEY,checked INTEGER NOT NULL,changed_at INTEGER NOT NULL,added INTEGER NOT NULL)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_rss_activity_age16927 ON desk_rss_activity16927(checked)');
       this.rows('CREATE TABLE IF NOT EXISTS desk_rss_window16926(id TEXT NOT NULL,start INTEGER NOT NULL,finish INTEGER NOT NULL,day TEXT NOT NULL,hour INTEGER NOT NULL,added INTEGER NOT NULL,PRIMARY KEY(id,start))');
       this.rows('CREATE INDEX IF NOT EXISTS desk_rss_window_age16926 ON desk_rss_window16926(finish)');
       this.rows('CREATE TABLE IF NOT EXISTS desk_rss_appearance16926(article TEXT NOT NULL,id TEXT NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,not_before INTEGER NOT NULL,automatic INTEGER NOT NULL,name TEXT NOT NULL,PRIMARY KEY(article,id))');
@@ -9083,6 +9132,8 @@ Object.assign(Desk520.prototype,{
       this.rows('DELETE FROM '+name+' WHERE '+age+'<?',now-RSS16926.age);
       this.rows('DELETE FROM '+name+' WHERE rowid IN (SELECT rowid FROM '+name+' ORDER BY '+age+' DESC,rowid DESC LIMIT -1 OFFSET ?)',cap);
     }
+    // Activity is only a bounded companion to the feed cache, never history.
+    this.rows('DELETE FROM desk_rss_activity16927 WHERE NOT EXISTS (SELECT 1 FROM desk_rss_feed16926 f WHERE f.url=desk_rss_activity16927.url)');
     if(prune)this.rows('UPDATE desk_rss16926 SET pruned=? WHERE id=1',now);
   },
   rssObserve16926(url,issue,old,headers={},unchanged=false){
@@ -9097,6 +9148,11 @@ Object.assign(Desk520.prototype,{
         this.rows('INSERT OR IGNORE INTO desk_rss_window16926 VALUES(?,?,?,?,?,?)',identity.id,old.checked,now,jstDay(now),hour%24,added.filter(n=>n.owner!=='43__').length);
       this.rows(`INSERT INTO desk_rss_feed16926 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET id=excluded.id,checked=excluded.checked,items=excluded.items,payload=excluded.payload,etag=excluded.etag,modified=excluded.modified,quiet=excluded.quiet,added=excluded.added,full_at=excluded.full_at`,
         url,identity.id,now,JSON.stringify(items),cacheable?payload:'',cacheable?rssHeader16926(headers.etag):'',cacheable?rssHeader16926(headers.modified):'',old&&!added.length?(old.quiet||0)+1:0,old?added.length:0,unchanged?old.full_at:now);
+      // Short observation pairs do not establish days of inactivity. Preserve
+      // the last actual addition across unchanged reads and object restarts.
+      this.rows(`INSERT INTO desk_rss_activity16927 VALUES(?,?,?,?) ON CONFLICT(url) DO UPDATE SET checked=excluded.checked,
+        changed_at=CASE WHEN excluded.added>0 THEN excluded.changed_at ELSE changed_at END,
+        added=CASE WHEN excluded.added>0 THEN excluded.added ELSE added END`,url,now,now,old?added.length:0);
       this.rows('UPDATE desk_rss16926 SET requests=requests+1,unchanged=unchanged+?,changed=changed+?,new_items=new_items+?,message=? WHERE id=1',unchanged?1:0,old&&added.length?1:0,added.length,'RSSの更新差分を確認。募集要項・操作直前の確認は継続');
       if(identity.id&&identity.owner!=='43__')this.rssAppear16926(identity,issue.header.title||identity.id,items,old,known,now);
       this.rssTrim16926(now);
@@ -9158,7 +9214,10 @@ Object.assign(Desk520.prototype,{
     return this.rssTry16926(()=>{
       const f=this.one('SELECT * FROM desk_rss_feed16926 WHERE url=?',url+'/rss');
       if(!f||f.checked<now-10*M520)return D520;
-      return f.quiet>=2?2*D520:f.added>=6?2*HOUR:f.added>0?6*HOUR:D520;
+      const activity=this.one('SELECT * FROM desk_rss_activity16927 WHERE url=?',f.url);
+      if(!activity)return D520;
+      const elapsed=Math.max(0,now-activity.changed_at);
+      return elapsed>=2*D520?2*D520:elapsed<6*HOUR&&activity.added>0?(activity.added>=6?2*HOUR:6*HOUR):D520;
     },D520);
   },
   async rssSampleTick16926(now){
@@ -9204,7 +9263,9 @@ Object.assign(Desk520.prototype,{
   rssTiming16926(job,now){
     return this.rssTry16926(()=>{
       const old=this.one('SELECT * FROM desk_rss_delay16926 WHERE article=? AND id=?',job.key,job.target);
-      if(old){if(now>=old.until||now>=old.started+2*HOUR)return job;return null;}
+      const started=Math.min(now,this.one('SELECT MIN(started) started FROM desk_rss_delay16926 WHERE article=?',job.key).started??now);
+      if(now>=started+2*HOUR)return job;
+      if(old){if(now>=old.until)return job;return null;}
       const feed=this.one('SELECT checked FROM desk_rss_feed16926 WHERE id=? ORDER BY checked DESC LIMIT 1',job.target);
       if(!feed||feed.checked<now-2*D520)return job;
       const rates=this.rssRates16926(job.target,now),hour=Math.floor((now+9*HOUR)/HOUR)%24,current=rates.find(r=>r.hour===hour);
@@ -9212,10 +9273,22 @@ Object.assign(Desk520.prototype,{
       const next=rates.filter(r=>{const gap=(r.hour-hour+24)%24;return gap>=1&&gap<=2&&r.rate*2+0.5<current.rate;})
         .sort((a,b)=>a.rate-b.rate||((a.hour-hour+24)%24)-((b.hour-hour+24)%24))[0];
       if(!next)return job;
-      const until=Math.min(now+2*HOUR,Math.floor(now/HOUR)*HOUR+((next.hour-hour+24)%24)*HOUR);
-      this.rows('INSERT INTO desk_rss_delay16926 VALUES(?,?,?,?,?)',job.key,job.target,now,until,'観測上、更新の少ない時間帯まで共同誌への追加を待機');
+      const until=Math.min(started+2*HOUR,Math.floor(now/HOUR)*HOUR+((next.hour-hour+24)%24)*HOUR);
+      this.rows('INSERT INTO desk_rss_delay16926 VALUES(?,?,?,?,?)',job.key,job.target,started,until,'観測上、更新の少ない時間帯まで共同誌への追加を待機');
       this.rssTrim16926(now);return null;
     },job);
+  },
+  rssSpreadScore16927(id,now){
+    // Count a later appearance only for a source article in this same cohort.
+    // Evicted/recreated observations and subsequently identified auto-adds
+    // cannot inflate the numerator or produce a score above one.
+    const r=this.one(`SELECT COUNT(*) observations,COALESCE(SUM(EXISTS(
+      SELECT 1 FROM desk_rss_spread16926 s JOIN desk_rss_appearance16926 t ON t.article=s.article AND t.id=s.target
+      WHERE s.source=a.id AND s.article=a.article AND s.first_seen=a.first_seen
+        AND s.observed>=? AND s.observed<=? AND s.not_before>=a.first_seen
+        AND t.first_seen=s.observed AND t.automatic=0
+    )),0) later FROM desk_rss_appearance16926 a WHERE a.id=? AND a.first_seen>=? AND a.first_seen<=?`,now-RSS16926.age,now,id,now-RSS16926.age,now);
+    return {...r,score:r.observations?r.later/r.observations:0};
   },
   rssChoose16926(valid,base,work,now){
     if(!base||!work?.article)return base;
@@ -9229,9 +9302,7 @@ Object.assign(Desk520.prototype,{
       if(matched&&matched.r.score>=0.25)return matched.mag;
       const scores=choices.map(m=>{
         const id=noteLink161(m.url)?.id;
-        const observations=this.one('SELECT COUNT(*) n FROM desk_rss_appearance16926 WHERE id=? AND first_seen>=?',id,now-RSS16926.age).n;
-        const later=this.one('SELECT COUNT(DISTINCT article) n FROM desk_rss_spread16926 WHERE source=? AND observed>=?',id,now-RSS16926.age).n;
-        return {m,observations,later,score:observations?later/observations:0};
+        return {m,...this.rssSpreadScore16927(id,now)};
       });
       const baseline=scores[0];if(!baseline||baseline.observations<6)return base;
       const better=scores.filter(s=>s.observations>=6&&s.later>=3&&s.score>=baseline.score+0.2).sort((a,b)=>b.score-a.score)[0];
@@ -9282,7 +9353,12 @@ Object.assign(Desk520.prototype,{
         WHERE a.pub<? AND a.verified>=? AND a.article>? ORDER BY a.article LIMIT 24`,now,now-8*D520,b.cursor);
       let nudged=false;
       this.storage.transactionSync(()=>{
+        this.rows(`DELETE FROM desk_rss_match16926 WHERE source=? AND NOT EXISTS
+          (SELECT 1 FROM desk_archive a WHERE a.article=desk_rss_match16926.article AND a.pub<? AND a.verified>=?)`,b.source,now,now-8*D520);
         for(const a of candidates){
+          // The previous result ceases to apply even when this evaluation
+          // exits early because the content or eligibility has changed.
+          this.rows('DELETE FROM desk_rss_match16926 WHERE source=? AND article=?',b.source,a.article);
           if(a.title.trim()==='521')continue;
           const feature=a.feature_at>=now-8*D520?networkParseFeature16922(a.feature):null;
           if(b.kind==='mag'&&(!mag||!this.archiveFits(a,[mag],now).length))continue;
@@ -9304,7 +9380,11 @@ Object.assign(Desk520.prototype,{
   rssView16926(){
     return this.rssTry16926(()=>({state:this.one('SELECT * FROM desk_rss16926 WHERE id=1'),feeds:this.one('SELECT COUNT(*) n FROM desk_rss_feed16926').n,
       delays:this.rows('SELECT article,id,until,message FROM desk_rss_delay16926 WHERE until>? ORDER BY until LIMIT 8',Date.now()),
-      spread:this.rows('SELECT source,target,COUNT(DISTINCT article) works,MAX(observed) at FROM desk_rss_spread16926 WHERE observed>=? GROUP BY source,target ORDER BY works DESC,at DESC LIMIT 8',Date.now()-RSS16926.age),
+      spread:this.rows(`SELECT s.source,s.target,COUNT(DISTINCT s.article) works,MAX(s.observed) at FROM desk_rss_spread16926 s
+        JOIN desk_rss_appearance16926 a ON a.article=s.article AND a.id=s.source AND a.first_seen=s.first_seen
+        JOIN desk_rss_appearance16926 t ON t.article=s.article AND t.id=s.target AND t.first_seen=s.observed
+        WHERE s.observed>=? AND s.observed<=? AND a.first_seen>=? AND s.not_before>=a.first_seen AND t.automatic=0
+        GROUP BY s.source,s.target ORDER BY works DESC,at DESC LIMIT 8`,Date.now()-RSS16926.age,Date.now(),Date.now()-RSS16926.age),
       matches:this.rows('SELECT m.*,b.url,b.title opportunity FROM desk_rss_match16926 m JOIN desk_rss_brief16926 b ON b.source=m.source AND b.hash=m.hash WHERE m.at>=? AND b.checked>=? ORDER BY m.ready DESC,m.score DESC,m.at DESC LIMIT 12',Date.now()-2*D520,Date.now()-2*D520)
     }));
   }
