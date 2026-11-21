@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.24';
+const VERSION = 'v16.9.25';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -8650,16 +8650,23 @@ Object.assign(Desk520.prototype,{
         if(!/応募概要|募集要項/.test(a.label))continue;
         const l=noteLink161(a.href,path,'article');if(l)found.push({...l,title:a.label});
       }
-    }else if(format==='issue'){
+    }else if(format==='issue'||format==='rss'){
       const items=Array.isArray(value)?value:value?.entries;
-      for(const x of (items||[]).slice(0,30))if(/コンテスト|作品募集|お題企画/.test(x.title||'')){
+      for(const x of (Array.isArray(items)?items:[]).slice(0,30))if(/コンテスト|作品募集|お題企画/.test(x.title||'')){
         const l=noteLink161(x.link,path,'article');if(l)found.push({...l,title:x.title});
       }
     }
-    for(const f of found.slice(0,8)){
-      if(this.one('SELECT COUNT(*) n FROM desk_contest_rule16923').n>=CONTEST16923.maxRules)break;
-      if(!/^n[a-z0-9]{1,64}$/.test(f.id||'')||!contestOwner16923(f.owner))continue;
+    // Repeatedly reading a feed must advance past already-known candidates.
+    // Only genuinely new rows consume this per-read insertion allowance.
+    let count=this.one('SELECT COUNT(*) n FROM desk_contest_rule16923').n,added=0;
+    const seen=new Set();
+    for(const f of found){
+      if(added>=8||count>=CONTEST16923.maxRules)break;
+      if(!/^n[a-z0-9]{1,64}$/.test(f.id||'')||!contestOwner16923(f.owner)||seen.has(f.id))continue;
+      seen.add(f.id);
+      if(this.one('SELECT 1 FROM desk_contest_rule16923 WHERE id=?',f.id))continue;
       this.rows('INSERT OR IGNORE INTO desk_contest_rule16923(id,owner,url,title) VALUES(?,?,?,?)',f.id,f.owner,f.url,String(f.title||'').slice(0,300));
+      added++;count++;
     }
   },
   contestReadRoom16924(pages=1){
@@ -8683,6 +8690,27 @@ Object.assign(Desk520.prototype,{
       this.rows('UPDATE desk_scout_state SET due=MAX(due,?) WHERE id=1',now+6*M520);
     });
     return this.publicRead(path,format);
+  },
+  async contestSourceRead16925(path,format,ruleId=''){
+    try{
+      const value=await this.contestRead16923(path,format);
+      // An incomplete response is not evidence of changed contest rules.
+      if(ruleId&&(!value?.data||typeof value.data.body!=='string'||!value.data.body.trim()))throw new PublicReadError('募集記事の本文を確認できません');
+      return value;
+    }catch(error){
+      if(readLimit(error))throw error;
+      const now=Date.now(),hold=this.one('SELECT blocked FROM desk_cfg WHERE id=1')?.blocked||0;
+      const at=Math.max(error instanceof ContestReadWait16924?error.at:now+2*HOUR,hold);
+      const reason=error instanceof ContestReadWait16924?error.message:error instanceof PublicReadError?publicReadReason(error):'募集元の読み取りを完了できません';
+      const message=reason+' ／ '+time(at)+'以降に自動再確認';
+      if(ruleId)this.rows('UPDATE desk_contest_rule16923 SET due=?,message=? WHERE id=?',at,message,ruleId);
+      else this.rows('UPDATE desk_contest16923 SET scout=? WHERE id=1',at);
+      this.rows('UPDATE desk_contest16923 SET message=? WHERE id=1',message);
+      // A source failure must not delay other rules. Shared holds and budget
+      // exhaustion, however, apply to the entire contest reader.
+      if(error instanceof ContestReadWait16924||hold>now)this.contestDefer16924(message,at);
+      throw error;
+    }
   },
   async contestCensus16923(account,tag){
     const entries=new Set(),seen=new Set();
@@ -8742,7 +8770,12 @@ Object.assign(Desk520.prototype,{
       const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+row.article))?.data;
       const after=await contestSnapshot16923(n,row.account);
       if(!after){this.rows("UPDATE desk_contest_entry16923 SET message='応募先記事の公開状態を確認待ち。応募操作は再送しません' WHERE contest=? AND article=? AND phase='sent'",row.contest,row.article);return;}
-      const finish=(phase,message)=>this.rows("UPDATE desk_contest_entry16923 SET phase=?,message=?,checks=checks+1 WHERE contest=? AND article=? AND phase='sent'",phase,message,row.contest,row.article);
+      const finish=(phase,message)=>this.storage.transactionSync(()=>{
+        if(!this.one("SELECT 1 FROM desk_contest_entry16923 WHERE contest=? AND article=? AND phase='sent'",row.contest,row.article))return;
+        this.rows("UPDATE desk_contest_entry16923 SET phase=?,message=?,checks=checks+1 WHERE contest=? AND article=? AND phase='sent'",phase,message,row.contest,row.article);
+        const held=phase!=='changed'&&this.one("SELECT 1 FROM desk_contest_entry16923 WHERE phase='changed' LIMIT 1");
+        this.rows('UPDATE desk_contest16923 SET message=? WHERE id=1',message+(held?' ／ 別の作品の変更を検出したため、新しい応募は保留中':''));
+      });
       if(!contestSame16923({...before,tags:after.tags},after,p.tag)){
         finish('changed','応募操作後に本文・タイトル・画像等の変更を検出。新しい応募操作を保留');return;
       }
@@ -8773,11 +8806,11 @@ Object.assign(Desk520.prototype,{
     if(!room.ok){this.contestDefer16924(room.message,room.at);return;}
     if(state.scout<=now){
       this.rows('UPDATE desk_contest16923 SET scout=? WHERE id=1',now+D520);
-      await this.contestRead16923('https://note.com/contests','html');return;
+      await this.contestSourceRead16925('https://note.com/contests','html');return;
     }
     const rule=this.one('SELECT * FROM desk_contest_rule16923 WHERE due<=? ORDER BY due,id LIMIT 1',now);if(!rule)return;
     this.rows('UPDATE desk_contest_rule16923 SET due=? WHERE id=?',now+D520,rule.id);
-    const n=(await this.contestRead16923('https://note.com/api/v3/notes/'+rule.id))?.data;
+    const n=(await this.contestSourceRead16925('https://note.com/api/v3/notes/'+rule.id,'json',rule.id))?.data;
     const p=n?.key===rule.id&&n.user?.urlname===rule.owner?contestRule16923(n,now):{ok:false,reason:'募集元の本人・記事が一致しません'};
     const hash=typeof n?.body==='string'?await draftBodyHash(n.body):null;
     const message=reason=>{
