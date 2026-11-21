@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.28';
+const VERSION = 'v16.9.29';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -7,6 +7,16 @@ const sql = (env, q, ...a) => env.DB.prepare(q).bind(...a);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const time = n => typeof n==='number' && n>0 && Number.isFinite(new Date(n).getTime()) ? new Date(n).toLocaleString('ja-JP', {timeZone:'Asia/Tokyo'}) : 'まだありません';
 const day = (ago=0) => new Date(Date.now() + 9 * HOUR - ago * 24 * HOUR).toISOString().slice(0, 10);
+// Preserve valid server waits, including long ones. Reject overflow before it
+// reaches a persisted deadline; callers retain their normal error backoff.
+function retryDelay16929(value, now=Date.now(), secondsOnly=false) {
+  if(typeof value!=='number'&&typeof value!=='string')return 0;
+  const raw=typeof value==='string'?value.trim():value;
+  if(raw==='')return 0;
+  const seconds=secondsOnly||typeof raw==='number'||/^\d+$/.test(raw);
+  const until=seconds?now+Math.ceil(Number(raw)*1000):Date.parse(raw);
+  return Number.isSafeInteger(until)&&until>now&&Number.isFinite(new Date(until).getTime())?until-now:0;
+}
 function scoped(original, slot) {
   return {...original, SLOT:slot, NOTE_SESSION:slot === '2' ? original.NOTE_SESSION_2 : original.NOTE_SESSION,
     DB:slot === '1' ? original.DB : {
@@ -280,8 +290,7 @@ async function telegram(env, method, body) {
   }
   if (!response.ok || data?.ok !== true) {
     const code = Number(data?.error_code) || response.status;
-    const seconds = Number(data?.parameters?.retry_after);
-    const retry = Number.isFinite(seconds) ? Math.max(0, seconds)*1000 : 0;
+    const retry = retryDelay16929(data?.parameters?.retry_after,Date.now(),true);
     const reason = code === 401 || code === 404
       ? 'Botトークンを確認してください。BotFatherのAPI Tokenをコピーし直してSecretを更新してください'
       : code === 403 ? 'Botがブロックされていないか確認してください'
@@ -425,8 +434,7 @@ async function api(env, path, post = false, referer = 'https://note.com/') {
   } catch { throw new Trouble('通信エラー・タイムアウト'); }
   if (!response.ok) {
     const code = response.status, raw = (response.headers.get('Retry-After') || '').trim();
-    const parsed = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
-    const retry = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    const retry = retryDelay16929(raw);
     await response.body?.cancel().catch(() => {});
     const kind = code === 429 ? 'rate' : [401,403].includes(code) ? 'auth' : code >= 500 ? 'network' : 'response';
     const reason = code === 401 ? 'ログイン情報の更新が必要' : code === 403 ? 'アクセス拒否。ログイン情報や利用制限を確認' : code === 429 ? '回数制限' : code === 422 ? '送信内容などが受け付けられません' : '応答エラー';
@@ -1624,10 +1632,7 @@ async function inNoteBrowser(binding,cookie,allowEditor,action,requestTrace=null
       const {type,response}=data.params;
       if(!['Document','XHR','Fetch'].includes(type) || !/^https:\/\/(?:editor\.)?note\.com\//.test(response.url))return;
       const raw=Object.entries(response.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
-      if(raw!==undefined){
-        const delay=/^\d+$/.test(String(raw))?Number(raw)*1000:Date.parse(raw)-Date.now();
-        if(Number.isFinite(delay))retry=Math.max(retry,delay);
-      }
+      if(raw!==undefined)retry=Math.max(retry,retryDelay16929(raw));
       if([401,403,429].includes(response.status) || (allowEditor && response.status>=500))denied=response.status;
     });
     const command=pageCommand(socket);
@@ -2599,9 +2604,9 @@ class Desk520 {
     }
     if(!res.ok) {
       const raw=res.headers.get('Retry-After');
-      let hold=raw && (/^\d+$/.test(raw)?now+Number(raw)*1000:Date.parse(raw));
-      if(res.status===429 || hold>now) {
-        if(!Number.isSafeInteger(hold) || hold<=now) hold=now+HOUR;
+      const delay=retryDelay16929(raw,now);
+      if(res.status===429 || delay>0) {
+        const hold=now+(delay||HOUR);
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',hold);
       }
       await res.body?.cancel(); throw new PublicReadError('note応答 HTTP '+res.status);
@@ -5770,7 +5775,7 @@ async function readTuta520(binding,credential,callbacks) {
       if(u.protocol!=='https:' || !(u.hostname==='tuta.com'||u.hostname.endsWith('.tuta.com')||u.hostname.endsWith('.tutanota.com')))return;
       if((r.status===401&&opened)||[403,429].includes(r.status)||r.status>=500)blocked=r.status;
       const raw=Object.entries(r.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
-      if(raw!==undefined){const wait=/^\d+$/.test(String(raw))?Number(raw)*1000:Date.parse(raw)-Date.now();if(Number.isFinite(wait))retry=Math.max(retry,wait);}
+      if(raw!==undefined)retry=Math.max(retry,retryDelay16929(raw));
     });
     const halt=()=>blocked||retry>0||Date.now()>=until||!callbacks.active();
     const frame=async(step,arg={})=>{
@@ -6168,8 +6173,8 @@ async function readObservation1698(binding,jobs) {
       const response=data.params.response;
       if(!['Document','Fetch','XHR'].includes(data.params.type) || !response.url?.startsWith('https://note.com/'))return;
       const raw=Object.entries(response.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
-      const retry=raw===undefined?0:/^\d+$/.test(String(raw))?Number(raw)*1000:Date.parse(raw)-Date.now();
-      if(Number.isFinite(retry) && retry>0)hold=Math.max(hold,retry);
+      const retry=retryDelay16929(raw);
+      if(retry>0)hold=Math.max(hold,retry);
       if([401,403,429].includes(response.status)){denied=response.status;hold=Math.max(hold,2*HOUR);}
       if(response.status>=500){denied=response.status;hold=Math.max(hold,HOUR);}
     });
@@ -7491,23 +7496,30 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
       // Reserve synchronously before yielding. An interrupted isolate leaves a
       // finite lease, while the provider's 15-second keepAlive closes its session.
       rows("UPDATE desk_browser16916 SET next_at=?,lease=?,token=?,started=?,attempts=attempts+1 WHERE id=1",at+21000,at+4*60000,token,at);
+      let session;
       try {
-        const session=await raw.acquire(options);
+        session=await raw.acquire(options);
         if(typeof session?.sessionId!=='string'||!session.sessionId)throw Error('missing browser session');
-        sessions.set(session.sessionId,token);
+        const held=one('SELECT token,lease FROM desk_browser16916 WHERE id=1');
+        if(held?.token!==token||held.lease<=Date.now())
+          throw new BrowserWait16916('busy',Math.max(Date.now()+21000,held?.lease||0));
         rows("UPDATE desk_browser16916 SET sessions=sessions+1,reason='' WHERE id=1 AND token=?",token);
+        sessions.set(session.sessionId,token);
         return session;
       }catch(error){
+        // A session may already exist even though its local bookkeeping failed.
+        // The caller has not received it and cannot perform this cleanup.
+        const created=typeof session?.sessionId==='string'&&!!session.sessionId;
+        if(created)await boundedClose16916(()=>raw.closeSession(session.sessionId)).catch(()=>{});
         const text=errorText(error);
         const daily=/browser.*time.*limit.*(?:today|day)|daily.*browser.*limit/i.test(text);
         const rate=Number(error?.status??error?.statusCode??error?.code)===429||/\b429\b|too many|rate.?limit|concurrent.*limit/i.test(text);
-        const reason=daily?'daily':rate?'rate':'startup';
+        let reason=error instanceof BrowserWait16916?error.reason:created?'storage':daily?'daily':rate?'rate':'startup';
         const rawRetry=error?.retryAfter??error?.retry_after??error?.headers?.get?.('Retry-After');
-        const seconds=typeof rawRetry==='number'||typeof rawRetry==='string'&&/^\d+$/.test(rawRetry)?Number(rawRetry):NaN;
-        const date=typeof rawRetry==='string'&&!Number.isFinite(seconds)?Date.parse(rawRetry):NaN;
-        const until=Math.max(Date.now()+60000,daily?(Math.floor(Date.now()/86400000)+1)*86400000+5000:0,
-          Number.isFinite(seconds)&&seconds>=0?Date.now()+seconds*1000:0,Number.isFinite(date)?date:0);
-        rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=? WHERE id=1 AND token=?",until,reason,token);
+        let until=Math.max(Date.now()+60000,daily?(Math.floor(Date.now()/86400000)+1)*86400000+5000:0,
+          Date.now()+retryDelay16929(rawRetry),error instanceof BrowserWait16916?error.at:0);
+        try{rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=? WHERE id=1 AND token=?",until,reason,token);}
+        catch{reason='storage';until=Math.max(until,at+4*60000);}
         throw new BrowserWait16916(reason,until);
       }
     },
@@ -9198,8 +9210,8 @@ Object.assign(Desk520.prototype,{
     const unchanged=response.status===304;
     if(unchanged&&(!cached||!headers['If-None-Match']&&!headers['If-Modified-Since'])){await response.body?.cancel();throw new PublicReadError('RSSの更新確認に必要な記録がありません');}
     if(!response.ok&&!unchanged){
-      const raw=response.headers.get('Retry-After');let until=raw&&(/^\d+$/.test(raw)?now+Number(raw)*1000:Date.parse(raw));
-      if(response.status===429||until>now){if(!Number.isSafeInteger(until)||until<=now)until=now+HOUR;this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);}
+      const delay=retryDelay16929(response.headers.get('Retry-After'),now);
+      if(response.status===429||delay>0)this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',now+(delay||HOUR));
       await response.body?.cancel();throw new PublicReadError('note応答 HTTP '+response.status);
     }
     let issue=cached;
