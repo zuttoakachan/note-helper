@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.18';
+const VERSION = 'v16.9.19';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -72,7 +72,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>接続確認OKは確認日時時点の結果です。いいね送信の制限解除を保証するものではありません。開始やCookie保存では自動運転の休止期限を短縮しません。停止直前の送信は取り消せません。</p></html>`, true, status);
 }
 
-const READY = 'v16.9.17-ready';
+const READY = 'v16.9.19-ready';
 function errorText(error) {
   return [error?.message, error?.cause?.message, typeof error?.cause === 'string' ? error.cause : ''].join(' ');
 }
@@ -141,6 +141,7 @@ async function prepare(original) {
   schema.push(...auxSchema16917.map(q=>db.prepare(q)));
   schema.push(...boardSchema16912.map(q=>db.prepare(q)));
   await db.batch(schema);
+  await repairAuxMetadata16919(original);
   const done = await sql(original,"SELECT name FROM nh_migrations WHERE name IN ('v13-history','v15-authors')").all();
   const names = new Set(done.results.map(row=>row.name));
   const items = [];
@@ -717,7 +718,7 @@ async function ownReaderSeed1699(env,state,turn) {
 
 async function readerOpportunity1697(env,state,settings,token,ownIds,markSending,bump) {
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
-  const s=await sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first();
+  const s=await auxReadWrite16919(env,'discovery_read',()=>sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first());
   const deferred=browserWait16916(env.BROWSER);
   if(deferred){
     await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',deferred.message,env.SLOT).run();
@@ -725,7 +726,7 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   }
   const returning=!s.pending && (!s.seed || s.turn%4===3);
   if(!s.pending && ((!s.seed && !returning) || s.due>now))return null;
-  const record=async message=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run();
+  const record=async message=>auxReadWrite16919(env,'discovery_message',()=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run());
   if(typeof env.BROWSER?.acquire!=='function'){
     await sql(env,"UPDATE nh_v1697_discovery SET due=?,message='BROWSER未設定・追加巡回は待機中' WHERE slot=?",now+6*HOUR,env.SLOT).run();
     if(s.pending)return {handled:true,message:'前回のコメント操作は未確認。BROWSERの接続待ちです。'};
@@ -740,21 +741,23 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   if(pending)markSending();
   let seed=pending?{key:pending.source,owner:pending.source_owner}:{key:s.seed,owner:s.seed_owner};
   if(!returning && (!/^n[a-z0-9]{1,64}$/.test(seed.key)||!/^[\w-]{1,80}$/.test(seed.owner)))return null;
-  if(!await liveDiscovery1697(env,token))return {handled:true,message:'停止または処理期限のため追加巡回を終了しました'};
+  if(!await auxReadWrite16919(env,'discovery_lease',()=>liveDiscovery1697(env,token)))return {handled:true,message:'停止または処理期限のため追加巡回を終了しました'};
   const mode=pending?'verify':returning||s.turn%2?'readers':'comments';
   const component=returning?'own_readers':mode==='readers'?'readers':'comments';
-  await sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=turn+?,utc_day=?,used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END WHERE slot=?',now+30*60000,+!pending,utc,utc,env.SLOT).run();
-  bump('reader_checks');
   await diagnostic16915(env,component,'attempt','source');
   if(returning){
     bump('reader_returning');seed=await ownReaderSeed1699(env,state,s.turn);
-    if(!seed){await record('自分の公開作品の読者候補なし・通常巡回を継続');await diagnostic16915(env,component,'wait','no_source');return null;}
+    if(!seed){await auxReadWrite16919(env,'discovery_source_wait',()=>sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=? WHERE slot=?',now+30*60000,s.turn+1,env.SLOT).run());await record('自分の公開作品の読者候補なし・通常巡回を継続');await diagnostic16915(env,component,'wait','no_source');return null;}
   }
   const source=await article(env,seed.key);
   if(!source || source.key!==seed.key || source.user?.urlname!==seed.owner || (returning?String(source.user?.id)!==state.account || source.status!=='published':ownIds.has(String(source.user?.id)) || (!pending&&!publicFiction1697(source)))){
     if(pending){await settleComment1697(env,s.pending,false);return {handled:true,message:'前回のコメントの公開元を確認できず、再送せず除外しました'};}
+    await auxReadWrite16919(env,'discovery_source_wait',()=>sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=? WHERE slot=?',now+30*60000,s.turn+1,env.SLOT).run());
     await record('創作タグ・公開元の一致を確認できず・次の巡回で別の記事を確認');await diagnostic16915(env,component,'wait','source_mismatch');return null;
   }
+  const claim=await claimDiscovery16919(env,s,Date.now(),!pending);
+  if(!claim)return null;
+  bump('reader_checks');
   let reserved='',failure=null;
   const guard=async fn=>{try{return await fn();}catch(e){failure=e;throw e;}};
   const result=await inNoteBrowser(env.BROWSER,cleanCookie(env.NOTE_SESSION),false,async io=>{
@@ -833,7 +836,7 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   },env.TRACE);
   if(failure)throw failure;
   if(result.browserDeferred && !reserved){
-    await sql(env,'UPDATE nh_v1697_discovery SET due=?,used=MAX(0,used-1),turn=MAX(0,turn-?),message=? WHERE slot=? AND utc_day=? AND turn=?',Math.max(Date.now()+60000,result.retryAt),+!pending,result.message,env.SLOT,utc,s.turn+Number(!pending)).run();
+    await returnDiscovery16919(env,s,claim,Math.max(Date.now()+60000,result.retryAt),result.message);
     await diagnostic16915(env,component,'wait','browser');
     return pending?{handled:true,message:'前回操作は再送せず・'+result.message}:null;
   }
@@ -1059,9 +1062,9 @@ async function dashboard(original, settings, prefix = '') {
       FROM nh_health h JOIN nh_v13_connection c ON c.slot=?
       LEFT JOIN nh_v13_credentials k ON k.slot=c.slot WHERE h.id=1`,day(),slot,slot))
   ]);
-  const discovery=await sql(original,'SELECT d.slot,d.comments,d.readers,d.message,d.due,d.used,d.utc_day,(SELECT COUNT(*) FROM nh_v1699_readers q WHERE q.slot=d.slot AND q.expires>?) queued FROM nh_v1697_discovery d ORDER BY d.slot',Date.now()).all();
+  const discovery=await sql(original,'SELECT d.slot,d.comments,d.readers,d.message,d.due,d.used,d.utc_day,COALESCE(a.due,0) aux_due,(SELECT COUNT(*) FROM nh_v1699_readers q WHERE q.slot=d.slot AND q.expires>?) queued FROM nh_v1697_discovery d LEFT JOIN nh_v16917_aux a ON a.slot=d.slot ORDER BY d.slot',Date.now()).all();
   blocks.push('【追加の自動巡回】感想コメントへのスキ／創作記事に反応した読者の記事探索\n'+discovery.results.map(r=>
-    'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件／保存した読者候補 '+r.queued+'人\n'+r.message+'\n次の追加探索：'+time(r.due)).join('\n\n')+
+    'アカウント '+r.slot+'：コメントのスキ確認 '+r.comments+'件／読者経由の記事スキ確認 '+r.readers+'件／保存した読者候補 '+r.queued+'人\n'+discoveryStatus16919(r,schedule.states.find(s=>s.slot===r.slot),Date.now())).join('\n\n')+
     '\n記事スキとコメントスキの送信枠・同じ人への待機は共通です。記事の累計にはコメント分を含めません。画面確認待ちは送信成功ではありません。読者からの訪問・読了・通知到達は未計測です。');
   const outreach=await sql(original,'SELECT slot,qa,members,pending,member_blocked,qa_message,member_message FROM nh_v16910_state ORDER BY slot').all();
   blocks.push('【質問箱の回答へのスキ・0円メンバーシップ】\n'+outreach.results.map(r=>
@@ -4029,7 +4032,7 @@ function deskRecordText(s) {
     lines.push('【途中で失敗した処理】');
     for(const f of s.taskFailures)lines.push(f.task+' ／ '+f.message+' ／ '+tm(f.at));
   }
-  if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ 本日探索を試みたページ '+s.scout.used+'か所（最大64） ／ '+s.scout.message);
+  if(s.scout)lines.push('掲載先探索 ／ 発見 '+s.scout.total+'誌 ／ 現在の掲載条件・編集権限を確認済み '+s.scout.allowed+'誌 ／ 本日探索を試みたページ '+s.scout.used+'か所（最大192） ／ '+s.scout.message);
   const checkedPlans=(s.linkPlans||[]).filter(p=>p.result || p.message);
   if(checkedPlans.length){
     lines.push('【予約作品の確認記録】');
@@ -4879,7 +4882,7 @@ Object.assign(Desk520.prototype,{
     if(!target)return;
     const today=jstDay(now),used=cfg.day===today?cfg.used:0;
     if(used>=DISTRIBUTION16918.checks){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
-    this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+30*M520);
+    this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+15*M520);
     let env,lease,message='参加申請・招待の確認を再試行待ち',due=now+2*HOUR,attempt='';
     try {
       if(typeof this.env.BROWSER?.acquire!=='function'){message='CloudflareのBROWSER設定が必要です';return;}
@@ -4961,8 +4964,8 @@ Object.assign(Desk520.prototype,{
       message=readLimit(error)?'D1の読み取り枠更新後に再確認':'本人確認・画面・保存の途中で失敗。記録済みの操作は再送せず確認します';
       due=readLimit(error)?(Math.floor(Date.now()/D520)+1)*D520+M520:Date.now()+2*HOUR;
     }finally {
-      this.rows('UPDATE desk_join SET due=?,message=? WHERE id=?',due,message,target.id);
-      if(lease)await release(env,lease);
+      try{this.rows('UPDATE desk_join SET due=?,message=? WHERE id=?',due,message,target.id);}
+      finally{if(lease)await release(env,lease);}
     }
   }
 });
@@ -4972,7 +4975,7 @@ function joinRecord520(j) {
     ...(j.items||[]).map(r=>r.name+' ／ '+(r.active?'':'休止・除外 ／ ')+r.message),
     j.tuta?.configured?tutaRecord520(j.tuta):j.mailConfigured?(j.mailReceived?'招待メールの最終受信：'+time(j.mailReceived):'受信先の指定あり・メール到着は未確認'):'招待メールの受信が未接続です。自動承認の稼働には1回の受信接続が必要です。',
     j.tuta?.configured?'確認・復旧メールは引き続きTutaで受信します。':j.mailForwardError?'確認・復旧メールの転送先設定に誤りがあります。登録メールの変更は保留してください。':j.mailForwardConfigured?'確認・復旧メール：転送先の指定あり。実際に元の受信箱へ届くことを確認してから登録メールを変更してください。':'確認・復旧メールの転送先は未設定です。この受信先へ登録メールを変更する前に設定してください。',
-    '探索・参加先に固定の累計上限はありません。フォロー操作は行いません。新規申請は1日8誌（日本時間）、1時間以上あけて続けます。本人画面の確認は1日24回まで。条件未確認・通信待機では上限まで送らない場合があります。',
+    '探索・参加先に固定の累計上限はありません。フォロー操作は行いません。新規申請は1日24誌（日本時間）、30分以上あけて続けます。本人画面の確認は1日96回まで。条件未確認・通信待機では上限まで送らない場合があります。',
     '申請経路を確認できた誌：'+(j.total??j.items?.length??0)+'誌（この欄の表示は直近40誌。全件の処理と記録は継続）。',
     '送信済みは再申請しません。相手の招待待ちは自動承認できません。参加後も作品ごとの掲載条件を確認します。'].join('\n');
 }
@@ -5214,12 +5217,12 @@ Object.assign(Desk520.prototype,{
     const c=this.one('SELECT * FROM desk_expansion WHERE id=1');
     if(c.due>now || !this.joinActive520(''))return;
     const day=jstDay(now),used=c.day===day?c.used:0;
-    if(used>=12)return;
+    if(used>=48)return;
     const row=this.one(`SELECT i.* FROM desk_join_discovery q JOIN desk_import i ON i.id=q.id
       WHERE q.due<=? AND NOT EXISTS(SELECT 1 FROM desk_join_target t WHERE t.id=q.id)
       AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=q.id AND m.mode='excluded') ORDER BY q.due,q.id LIMIT 1`,now);
     if(!row)return;
-    this.rows('UPDATE desk_expansion SET day=?,used=?,due=? WHERE id=1',day,used+1,now+30*M520);
+    this.rows('UPDATE desk_expansion SET day=?,used=?,due=? WHERE id=1',day,used+1,now+15*M520);
     this.rows("UPDATE desk_join_discovery SET due=?,checked=?,message='募集方法の読み取り中' WHERE id=?",now+D520,now,row.id);
     let message='無料・募集元・フォロー不要の申請方法を確認できず保留';
     try{
@@ -5254,13 +5257,13 @@ Object.assign(Desk520.prototype,{
     if(!cfg.enabled || !cfg.directory)return '探索は休止中です。';
     if(cfg.blocked>now)return 'noteの待機期限 '+time(cfg.blocked)+' 以降に自動で続けます。';
     const day=jstDay(now),budget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1'),used=budget.day===day?budget.used:0;
-    if(used>=64)return '本日は64回の探索を試みました。翌日、続きから再開します。累計上限はありません。';
+    if(used>=192)return '本日は192回の探索を試みました。翌日、続きから再開します。累計上限はありません。';
     if(this.one('SELECT due FROM desk_scout_state WHERE id=1').due>now)return '探索は次の通常間隔で続けます。';
     const next=this.one('SELECT url,kind FROM desk_scout WHERE due<=? ORDER BY due,url LIMIT 1',now);
     if(!next)return '確認予定のページは巡回済みです。更新時に続けます。';
     this.storage.transactionSync(()=>{
       this.rows('UPDATE desk_scout_budget SET day=?,used=?,seeded=1 WHERE id=1',day,used+1);
-      this.rows('UPDATE desk_scout_state SET due=? WHERE id=1',now+(used+1<32?4:30)*M520);
+      this.rows('UPDATE desk_scout_state SET due=? WHERE id=1',now+6*M520);
       this.rows('UPDATE desk_scout SET due=? WHERE url=?',now+HOUR,next.url);
       this.rows('INSERT OR IGNORE INTO desk_scout_cursor(url) VALUES(?)',next.url);
     });
@@ -6521,7 +6524,8 @@ async function outreachOpportunity16910(env,state,settings,token,ownIds,markSend
     }
   }
   // Shared browser-attempt budget is charged after source preflight and before opening the browser, including failures.
-  await sql(env,'UPDATE nh_v1697_discovery SET due=?,turn=turn+?,utc_day=?,used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END WHERE slot=?',now+30*60000,+!job.recover,utc,utc,env.SLOT).run();
+  const claim=await claimDiscovery16919(env,d,Date.now(),!job.recover);
+  if(!claim)return null;
   bump(kind==='board'?'board_checks':kind==='qa'?'qa_checks':'member_checks');
   if(kind==='board')await sql(env,'UPDATE nh_v16912_state SET checked=? WHERE slot=?',now,env.SLOT).run();
   await diagnostic16915(env,kind,'attempt','browser');
@@ -6534,7 +6538,7 @@ async function outreachOpportunity16910(env,state,settings,token,ownIds,markSend
   }),()=>guard(async()=>await liveDiscovery1697(env,token) && (!['member','board'].includes(kind)||job.recover||!!env.MEMBER_GATE16910?.())),urls=>guard(()=>unseenBoardPosts16912(env,urls,job.owner)));
   if(failure)throw failure;
   if(result.browserDeferred && !reserved){
-    await sql(env,'UPDATE nh_v1697_discovery SET due=?,used=MAX(0,used-1),turn=MAX(0,turn-?) WHERE slot=? AND utc_day=? AND turn=?',Math.max(Date.now()+60000,result.retryAt),+!job.recover,env.SLOT,utc,d.turn+Number(!job.recover)).run();
+    await returnDiscovery16919(env,d,claim,Math.max(Date.now()+60000,result.retryAt),result.message);
     if(job.recover)await sql(env,'UPDATE nh_v16910_actions SET verifications=MAX(0,verifications-1) WHERE key=?',job.key).run();
     await record(result.message);await diagnostic16915(env,kind,'wait','browser');
     return job.recover?{handled:true,message:'前回操作は再送せず・'+result.message}:null;
@@ -6959,8 +6963,12 @@ function pipelineRecord16913(p) {
   if(p.distribution){const d=p.distribution;lines.push(
     '今日の申請操作 '+d.applications+'/'+DISTRIBUTION16918.applications+'誌 ／ 本人画面の確認 '+d.checks+'/'+DISTRIBUTION16918.checks+'回（日本時間0時更新）',
     '今日の掲載操作 '+d.placements+'/'+DISTRIBUTION16918.placements+'件 ／ うち公開30日以上の既刊 '+d.old+'件（日本時間9時更新）',
-    '新作と既刊を交互に、未掲載の複数誌へ順番に追加します。掲載は30分以上、同じ作品は6時間以上あけます。作品ごとの累計誌数に固定上限はありません。',
+    '新作と既刊を交互に、未掲載の複数誌へ順番に追加します。掲載は15分以上、同じ作品は2時間以上あけます。作品ごとの累計誌数に固定上限はありません。',
     '各誌の募集条件・投稿上限を優先します。操作件数には結果未確認を含み、掲載成功は下の公開確認で判断します。同じ作品を同じ誌へ再送・削除再追加しません。');} 
+  if(p.distribution?.outcomes){const o=p.distribution.outcomes;lines.push(
+    '申請経路を登録 '+o.targets+'誌 ／ 未申請 '+o.waiting+'誌 ／ 申請・招待の確認待ち '+o.pending+'誌 ／ 参加確認 '+o.joined+'誌',
+    '自動掲載の公開確認 '+o.confirmed+'件 ／ 掲載操作後の確認待ち '+o.unconfirmed+'件',
+    '公開探索は1日192ページ、募集方法は1日48誌まで確認します。未申請には条件未確認・除外済みを含みます。成功数が0のままなら下の保留理由を確認してください。');}
   for(const r of p.rows){
     const stage=r.mode==='excluded'?'除外済み':r.pending?'追加後の公開確認':r.phase==='joined'?
       r.mode==='auto'&&r.allowed&&r.state==='利用中'?'掲載条件に合う作品の選定・掲載枠待ち':'参加後の編集権限・掲載条件の確認':
@@ -7238,7 +7246,7 @@ const auxSchema16917=[
   `CREATE TABLE IF NOT EXISTS nh_v16917_aux(slot TEXT PRIMARY KEY,due INTEGER NOT NULL DEFAULT 0,failed_at INTEGER NOT NULL DEFAULT 0,component TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '')`,
   `INSERT OR IGNORE INTO nh_v16917_aux(slot) VALUES('1'),('2')`
 ];
-const AUX_COMPONENTS16917={snapshot:'巡回先の学習データ',outreach:'質問箱・参加・掲示板',readers:'感想・読者の探索',selection:'巡回先の選択',queue:'保存した読者の確認',seed:'追加探索の候補保存',contact:'反応比較用の送信記録',confirmed:'反応比較用の成功記録',metrics:'巡回先の学習記録'};
+const AUX_COMPONENTS16917={diagnostics:'動作記録の保存',snapshot:'巡回先の学習データ',outreach:'質問箱・参加・掲示板',readers:'感想・読者の探索',selection:'巡回先の選択',queue:'保存した読者の確認',seed:'追加探索の候補保存',contact:'反応比較用の送信記録',confirmed:'反応比較用の成功記録',metrics:'巡回先の学習記録'};
 function auxReason16917(error){
   if(error instanceof TypeError)return 'type';
   if(error instanceof SyntaxError)return 'format';
@@ -7254,10 +7262,11 @@ async function auxFault16917(env,component,error){
   const trace=env.TRACE;
   if(!trace || trace.auxFault)return;
   component=Object.hasOwn(AUX_COMPONENTS16917,component)?component:'snapshot';
-  const fault={component,reason:auxReason16917(error),due:Date.now()+2*HOUR};
+  const detail=AUX_ERRORS16919.get(error)||{operation:component,detail:auxDetail16919(error)};
+  const fault={component,reason:auxReason16917(error),...detail,due:Date.now()+2*HOUR};
   trace.auxFault=fault;trace.auxUntil=fault.due;trace.learning=null;
   try {
-    await sql(env,'UPDATE nh_v16917_aux SET due=MAX(due,?),failed_at=?,component=?,reason=? WHERE slot=?',fault.due,Date.now(),component,fault.reason,env.SLOT).run();
+    await sql(env,'UPDATE nh_v16917_aux SET due=MAX(due,?),failed_at=?,component=?,reason=?,operation=?,detail=?,recovered_at=0 WHERE slot=?',fault.due,Date.now(),component,fault.reason,fault.operation,fault.detail,env.SLOT).run();
     if(['snapshot','selection'].includes(component))await sql(env,'UPDATE nh_v16913_learning SET due=? WHERE slot=?',fault.due,env.SLOT).run();
   }catch(storageError){
     if(readLimit(storageError))throw storageError;
@@ -7309,8 +7318,8 @@ async function auxRecord16917(env){
   const reasons={type:'読み取ったデータの型',format:'保存データの形式',storage:'補助データの読み書き',network:'追加読み取りの通信',response:'追加読み取りの応答',internal:'追加機能の内部処理'};
   return '【追加機能と通常巡回の状態】\n'+rows.results.map(r=>
     'アカウント '+r.slot+'：'+(!r.failed_at?'追加機能の内部エラー記録なし':
-      (r.due>Date.now()?'追加機能だけ再確認待ち':'追加機能の再確認時刻に到達')+'／'+(AUX_COMPONENTS16917[r.component]||'追加機能')+'／'+(reasons[r.reason]||'内部処理')+
-      '\n確認コード：AUX17/'+r.component+'/'+r.reason+'／最終記録 '+time(r.failed_at)+'／再確認 '+time(r.due))
+      (r.recovered_at>r.failed_at?'失敗後の読み取り・操作確認あり':r.due>Date.now()?'追加機能だけ再確認待ち':r.component==='diagnostics'?'動作記録の保存に失敗・探索の継続は可能':'追加機能の再確認時刻に到達')+'／'+(AUX_COMPONENTS16917[r.component]||'追加機能')+'／'+(reasons[r.reason]||'内部処理')+
+      '\n確認コード：AUX19/'+r.component+'/'+(r.operation||'legacy')+'/'+(r.detail||r.reason)+'／最終記録 '+time(r.failed_at)+(r.due>0?'／再確認 '+time(r.due):'')+(r.recovered_at>r.failed_at?'／再確認成功 '+time(r.recovered_at):''))
   ).join('\n\n')+'\n通常の記事巡回は各アカウントの状態欄で確認してください。ログイン拒否・回数制限・note指定の待機・送信結果不明は引き続き共通で待機します。';
 }
 
@@ -7451,9 +7460,9 @@ const diagnosticSchema16915=[
 async function diagnostic16915(env,component,state,stage){
   if(!Object.hasOwn(COMPONENTS16915,component)||!['attempt','wait','read','failed','confirmed'].includes(state))return;
   const stages=new Set(['source','no_source','source_mismatch','article_page','liker_control','liker_loading','liker_list','comment_rows','comment_recovery','browser','qa_rows','member_plan','board_post']);
-  await sql(env,`INSERT INTO nh_v16915_diagnostics(slot,component,attempted,read_at,confirmed,state,stage) VALUES(?,?,?,?,?,?,?)
+  await diagnosticWrite16919(env,component,state,stage,()=>sql(env,`INSERT INTO nh_v16915_diagnostics(slot,component,attempted,read_at,confirmed,state,stage) VALUES(?,?,?,?,?,?,?)
     ON CONFLICT(slot,component) DO UPDATE SET attempted=MAX(attempted,excluded.attempted),read_at=MAX(read_at,excluded.read_at),confirmed=MAX(confirmed,excluded.confirmed),state=excluded.state,stage=excluded.stage`,
-    env.SLOT,component,state==='attempt'?Date.now():0,['read','confirmed'].includes(state)?Date.now():0,state==='confirmed'?Date.now():0,state,stages.has(stage)?stage:'browser').run();
+    env.SLOT,component,state==='attempt'?Date.now():0,['read','confirmed'].includes(state)?Date.now():0,state==='confirmed'?Date.now():0,state,stages.has(stage)?stage:'browser'));
 }
 async function diagnosticRecord16915(env){
   const all=await sql(env,'SELECT * FROM nh_v16915_diagnostics ORDER BY slot,component').all();
@@ -7463,7 +7472,7 @@ async function diagnosticRecord16915(env){
 }
 
 // Magazine-only expansion. The ordinary like scheduler and its D1 tables are unchanged.
-const DISTRIBUTION16918=Object.freeze({applications:8,checks:24,placements:12,applicationGap:HOUR,placementGap:30*M520,workGap:6*HOUR});
+const DISTRIBUTION16918=Object.freeze({applications:24,checks:96,placements:48,applicationGap:30*M520,placementGap:15*M520,workGap:2*HOUR});
 Object.assign(Desk520.prototype,{
   initDistribution16918(){
     if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_distribution16918'"))return;
@@ -7538,9 +7547,117 @@ Object.assign(Desk520.prototype,{
     const sent=this.one(`SELECT COUNT(*) n,SUM(CASE WHEN a.pub<=? THEN 1 ELSE 0 END) old
       FROM desk_mag_send s LEFT JOIN desk_archive a ON a.article=s.article WHERE s.at>=? AND s.at<?`,now-30*D520,Math.floor(now/D520)*D520,(Math.floor(now/D520)+1)*D520);
     return {applications:this.one('SELECT applications FROM desk_join_budget WHERE day=?',today)?.applications||0,
-      checks:checks.day===today?checks.used:0,placements:usage.utc_day===Math.floor(now/D520)?usage.mags:0,old:sent.old||0};
+      checks:checks.day===today?checks.used:0,placements:usage.utc_day===Math.floor(now/D520)?usage.mags:0,old:sent.old||0,
+      outcomes:{...this.one(`SELECT COUNT(*) targets,COALESCE(SUM(phase='wait'),0) waiting,
+        COALESCE(SUM(phase IN ('sent','applied','accepting')),0) pending,
+        COALESCE(SUM(phase='joined' AND proof>0),0) joined FROM desk_join`),
+        ...this.one(`SELECT COALESCE(SUM(phase='confirmed'),0) confirmed,
+        COALESCE(SUM(phase IN ('sent','seen')),0) unconfirmed FROM desk_job WHERE kind='mag'`)}};
   }
 });
+
+// Metadata recovery is limited to named auxiliary columns. Action ledgers and
+// credentials are never reconstructed, cleared or retried speculatively.
+const AUX_ERRORS16919=new WeakMap();
+const AUX_COLUMNS16919={
+  nh_v1697_discovery:{attempt_token:"TEXT NOT NULL DEFAULT ''"},
+  nh_v16917_aux:{operation:"TEXT NOT NULL DEFAULT ''",detail:"TEXT NOT NULL DEFAULT ''",recovered_at:'INTEGER NOT NULL DEFAULT 0'},
+  nh_v16915_diagnostics:{attempted:'INTEGER NOT NULL DEFAULT 0',read_at:'INTEGER NOT NULL DEFAULT 0',confirmed:'INTEGER NOT NULL DEFAULT 0',state:"TEXT NOT NULL DEFAULT 'wait'",stage:"TEXT NOT NULL DEFAULT ''"}
+};
+async function repairAuxMetadata16919(env){
+  const tables=Object.keys(AUX_COLUMNS16919);
+  const info=await env.DB.batch(tables.map(t=>env.DB.prepare('PRAGMA table_info('+t+')')));
+  const changes=[];
+  for(let i=0;i<tables.length;i++){
+    const table=tables[i],names=new Set(info[i].results.map(r=>r.name));
+    if(!names.size)throw new Error('D1_ERROR: missing auxiliary table');
+    for(const [column,type] of Object.entries(AUX_COLUMNS16919[table]))
+      if(!names.has(column))changes.push(env.DB.prepare('ALTER TABLE '+table+' ADD COLUMN '+column+' '+type));
+  }
+  if(changes.length){
+    try{await env.DB.batch(changes);}
+    catch(error){
+      // Two first invocations can observe the same old schema. A successful
+      // concurrent upgrade is accepted only after every expected column exists.
+      if(!/duplicate column name/i.test(errorText(error)))throw error;
+      const check=await env.DB.batch(tables.map(t=>env.DB.prepare('PRAGMA table_info('+t+')')));
+      if(check.some((r,i)=>Object.keys(AUX_COLUMNS16919[tables[i]]).some(c=>!r.results.some(x=>x.name===c))))throw error;
+    }
+  }
+}
+function auxDetail16919(error){
+  const t=errorText(error);
+  for(const [pattern,code] of [
+    [/daily row (?:read|write) limit/i,'daily_quota'],
+    [/no such table/i,'missing_table'],[/no such column|has no column named/i,'missing_column'],
+    [/D1_TYPE_ERROR|unsupported type|type.*undefined/i,'binding_type'],
+    [/too many SQL variables|too many (?:bound )?parameters/i,'binding_limit'],
+    [/too many API requests|subrequest/i,'request_limit'],
+    [/constraint failed|SQLITE_CONSTRAINT/i,'constraint'],
+    [/syntax error/i,'sql_syntax'],
+    [/maximum.*storage|maximum DB size|database or disk is full/i,'storage_full'],
+    [/reset|overloaded|network connection lost|replica disconnected|transient issue|timeout/i,'temporary_storage']
+  ])if(pattern.test(t))return code;
+  return auxReason16917(error);
+}
+async function auxReadWrite16919(env,operation,work){
+  for(let attempt=0;;attempt++){
+    try{return await work();}
+    catch(error){
+      const detail=auxDetail16919(error);
+      if(error && typeof error==='object')AUX_ERRORS16919.set(error,{operation,detail});
+      // Only callers with read-only or absolute/idempotent writes use this helper.
+      if(attempt || auxFatal16917(error))throw error;
+      if(detail==='missing_column' && !env.TRACE?.schemaChecked16919){
+        const text=errorText(error);
+        const allowed=Object.values(AUX_COLUMNS16919).flatMap(c=>Object.keys(c));
+        if(!allowed.some(c=>new RegExp('(?:column(?: named)?[: ]+|\\.)'+c+'\\b','i').test(text)))throw error;
+        if(env.TRACE)env.TRACE.schemaChecked16919=true;
+        await repairAuxMetadata16919(env);
+      }else if(detail!=='temporary_storage')throw error;
+    }
+  }
+}
+async function diagnosticWrite16919(env,component,state,stage,statement){
+  try{
+    await auxReadWrite16919(env,'diagnostic_save',()=>statement().run());
+    if(['read','confirmed'].includes(state)){
+      const group=['comments','readers','own_readers'].includes(component)?'readers':'outreach';
+      await sql(env,"UPDATE nh_v16917_aux SET recovered_at=? WHERE slot=? AND failed_at>0 AND failed_at<? AND component IN (?, 'diagnostics')",Date.now(),env.SLOT,Date.now(),group).run();
+    }
+  }catch(error){
+    if(auxFatal16917(error))throw error;
+    // Failure of an informational record must not veto an independently
+    // reserved operation or consume the rest of the browser attempt budget.
+    const detail=auxDetail16919(error);
+    if(env.TRACE)env.TRACE.diagnosticFault16919=detail;
+    try{await sql(env,"UPDATE nh_v16917_aux SET failed_at=?,component='diagnostics',reason='storage',operation='diagnostic_save',detail=?,recovered_at=0 WHERE slot=? AND due<=?",Date.now(),detail,env.SLOT,Date.now()).run();}
+    catch(recordError){if(auxFatal16917(recordError))throw recordError;}
+  }
+}
+async function claimDiscovery16919(env,s,now,advance){
+  const utc=Math.floor(now/(24*HOUR)),token=crypto.randomUUID();
+  const nextTurn=s.turn+Number(advance),nextUsed=s.utc_day===utc?s.used+1:1;
+  const result=await auxReadWrite16919(env,'discovery_budget',()=>sql(env,`UPDATE nh_v1697_discovery
+    SET due=?,turn=?,utc_day=?,used=?,attempt_token=? WHERE slot=? AND
+    (attempt_token=? OR (turn=? AND utc_day=? AND used=? AND due=?))`,
+    now+30*60000,nextTurn,utc,nextUsed,token,env.SLOT,token,s.turn,s.utc_day,s.used,s.due).run());
+  return result.meta.changes?{token,turn:nextTurn,utc,used:nextUsed}:null;
+}
+async function returnDiscovery16919(env,s,claim,at,message){
+  return auxReadWrite16919(env,'discovery_return',()=>sql(env,`UPDATE nh_v1697_discovery
+    SET due=?,turn=?,utc_day=?,used=?,attempt_token='',message=? WHERE slot=? AND attempt_token=?`,
+    at,s.turn,s.utc_day,s.used,message,env.SLOT,claim.token).run());
+}
+function discoveryStatus16919(r,state,now){
+  const utc=Math.floor(now/(24*HOUR)),used=r.utc_day===utc?r.used:0;
+  let due=Math.max(r.due||0,r.aux_due||0,state?.eligible||0),message=r.message;
+  if(used>=12)due=Math.max(due,(utc+1)*24*HOUR+60000);
+  if(/本日12回|翌日に自動再開/.test(message))message=used>=12?'本日の共通探索枠を使用済み':'前日の探索枠は更新済み';
+  if(r.aux_due>now)message='追加探索だけエラー後の再確認待ち。詳細は「追加機能と通常巡回の状態」に表示';
+  const next=!state?.enabled?'自動運転は停止中':due>now?time(due)+'以降':r.due?'次の通常巡回で確認':'元記事の取得待ち';
+  return message+'\n本日の共通探索枠 '+used+'/12回（成功件数ではありません）\n次の追加探索：'+next;
+}
 
 const BROWSER_SOURCES520 = Object.freeze({
 "trafficScreen16913":"function trafficScreen16913(step='read') {\n  if(location.origin!=='https://note.com' || !/^\\/dashboard\\/?$/.test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const root=document.querySelector('main,[role=\"main\"]')||document.body;\n  if(!root)return {state:'loading'};\n  const clean=t=>(t||'').normalize('NFKC').replace(/[\\u200b\\u200e\\u200f]/g,'').trim();\n  const all=s=>[...root.querySelectorAll(s)].filter(visible);\n  const text=clean(root.innerText),header=text.split(/直近1[ヶかケ]月のまとめ|あなたへの提案|記事の流入元/)[0];\n  if(!/アクセス状況/.test(text) || !/インプレッション/.test(header) || !/ページビュー/.test(header))return {state:'layout'};\n  if(/この期間のデータはありません|集計中|読み込み中/.test(header))return {state:'loading'};\n  const stamps=[...header.matchAll(/(\\d{4})[\\/年.-](\\d{1,2})[\\/月.-](\\d{1,2})日?\\s*(?:〜|～|~|–|−|—|-|から)\\s*(?:(\\d{4})[\\/年.-])?(\\d{1,2})[\\/月.-](\\d{1,2})日?/g)];\n  const dates=[...new Set(stamps.map(m=>JSON.stringify([m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0'),(m[4]||m[1])+'-'+m[5].padStart(2,'0')+'-'+m[6].padStart(2,'0')])))] ;\n  if(dates.length!==1)return {state:'period'};\n  const [start,end]=JSON.parse(dates[0]);\n  if(step==='previous'){\n    // Only the displayed dashboard's period navigation, never account settings.\n    const controls=all('button').filter(b=>!b.disabled && b.getAttribute('aria-disabled')!=='true' &&\n      /^(?:前の期間(?:へ|に移動|を表示)?|前期間|Previous period)$/i.test(clean(b.getAttribute('aria-label')||b.getAttribute('title')||b.innerText)));\n    if(controls.length!==1)return {state:'previous_missing'};\n    controls[0].click();return {state:'moved',start,end};\n  }\n  const values={},labels={impressions:'インプレッション',pageviews:'ページビュー',likes:'スキ',comments:'コメント'};\n  const nodes=all('span,p,dt,dd,div,button,strong,h2,h3');\n  for(const [key,label] of Object.entries(labels)){\n    const found=new Set();\n    for(const el of nodes.filter(e=>clean(e.innerText)===label)){\n      // Summary metric cards have one label and one exact count. Article rows,\n      // charts, menus and comparison percentages cannot pass this whole match.\n      for(let p=el.parentElement,n=0;p&&p!==root&&n<4;p=p.parentElement,n++){\n        const value=clean(p.innerText).replace(/\\s/g,'');\n        const match=new RegExp('^(?:'+label+'([0-9,]+|[-−–—])(?:回|件)?|([0-9,]+|[-−–—])(?:回|件)?'+label+')$').exec(value);\n        if(match){\n          const raw=match[1]||match[2];\n          if(/^[0-9]+$|^[1-9][0-9]{0,2}(?:,[0-9]{3})+$/.test(raw))found.add(Number(raw.replaceAll(',','')));\n          // note documents '-' as zero for the modern metrics. Do not apply it\n          // to pre-2021 impressions or missing/unavailable data.\n          else if(/^[-−–—]$/.test(raw) && start>='2021-05-01')found.add(0);\n          break;\n        }\n      }\n    }\n    if(found.size!==1 || !Number.isSafeInteger([...found][0]))return {state:'metrics',field:key};\n    values[key]=[...found][0];\n  }\n  const updated=[...header.matchAll(/(\\d{4}[\\/年.-]\\d{1,2}[\\/月.-]\\d{1,2}日?\\s+\\d{1,2}:\\d{2}(?::\\d{2})?)\\s*集計/g)].map(m=>m[1]);\n  const refText=text.split('記事の流入元').slice(1).join('記事の流入元'),referrers=[];\n  const pattern=/((?:[a-z0-9-]+\\.)+[a-z]{2,63}|no referrer|other|流入元不明|X|Facebook|Google|Instagram)\\s+(\\d+(?:\\.\\d+)?)\\s*%\\s*\\(\\s*([\\d,]+)\\s*PV\\s*\\)/gi;\n  for(const m of refText.matchAll(pattern)){\n    const count=Number(m[3].replaceAll(',','')),share=Number(m[2]),name=m[1];\n    if(Number.isSafeInteger(count)&&count>=0&&share>=0&&share<=100&&!referrers.some(r=>r.name===name))referrers.push({name,pageviews:count,share});\n  }\n  if(referrers.length>12)return {state:'referrers'};\n  return {state:'ready',start,end,...values,updated:updated.length===1?updated[0]:'',referrers,\n    referrersRead:referrers.length>0,signature:JSON.stringify([start,end,values,updated,referrers])};\n}",
