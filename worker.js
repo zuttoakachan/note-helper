@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.34';
+const VERSION = 'v16.9.35';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1459,7 +1459,11 @@ async function deskRoute(request,env) {
       const denied=await adminKeyDenied16934(request,env,form.get('key'),failure);
       if(denied)return denied;
       editing=form.get('edit_target')||'';
-      if(['reserve_link','cancel_link','preview_link'].includes(form.get('work_action'))){
+      if(form.has('check_draft')){
+        const target=/^(n[a-z0-9]{1,64})@([0-9]+)$/.exec(form.get('check_draft'));
+        if(!target || !Number.isSafeInteger(Number(target[2])))throw new Input520('確認する予約を選び直してください。');
+        input={action:'preview_link',article:target[1],expected:Number(target[2])};
+      }else if(['reserve_link','cancel_link','preview_link'].includes(form.get('work_action'))){
         const change=form.get('editing')||'';
         const match=/^(n[a-z0-9]{1,64})@([0-9]+)$/.exec(change);
         if(change && !match)throw new Input520('変更する予約を選び直してください。');
@@ -1933,19 +1937,24 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
   if(['https://editor.note.com','https://note.com'].includes(location.origin) && arg.key &&
      new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname)){
     const value=e=>'value' in e?e.value:e.innerText;
-    const checkedDraft=()=>{
+    const inspectDraft=()=>{
       const titles=all(document,'textarea,input,[contenteditable=true]').filter(e=>/^(記事)?タイトル(を入力)?$/.test(e.getAttribute('placeholder')||e.getAttribute('aria-label')||e.getAttribute('data-placeholder')||''));
       const title=unique(titles);
-      const body=unique(all(document,'[contenteditable=true].ProseMirror,[contenteditable=true][role=textbox],[contenteditable=true][data-placeholder]').filter(e=>e!==title));
-      if(!body || !title)return false;
+      if(!title)return {state:titles.length?'title_ambiguous':'title_unavailable'};
+      const bodies=all(document,'[contenteditable=true].ProseMirror,[contenteditable=true][role=textbox],[contenteditable=true][data-placeholder]').filter(e=>e!==title);
+      const body=unique(bodies);
+      if(!body)return {state:bodies.length?'body_ambiguous':'body_unavailable'};
+      const name=value(title);
+      if(typeof name!=='string')return {state:'title_unavailable'};
       if(arg.byLink){
-        const name=value(title);
-        if(!name?.trim() || name.trim()==='521' || name.length>300 || (!body.innerText?.trim() && !body.querySelector('img,figure,iframe,video')))return false;
-        if(step==='linkTitle')return name;
-        return name===arg.title;
+        if(!name.trim() || name.trim()==='521' || name.length>300)return {state:'title_unavailable'};
+        if(!body.innerText?.trim() && !body.querySelector('img,figure,iframe,video'))return {state:'body_unavailable'};
+        if(step==='linkTitle')return {state:'ready',title:name};
+        return {state:name===arg.title?'ready':'title_mismatch'};
       }
-      if(value(title)!==arg.title)return false;
-      // Only project ordinary text paragraphs. Preserve whitespace and blank paragraphs.
+      if(name!==arg.title)return {state:'title_mismatch'};
+      if(typeof arg.body!=='string' || !arg.body.length)return {state:'manuscript_unavailable'};
+      // Preserve the exact paragraph, whitespace and inline-formatting checks.
       const plain=node=>{
         let out='';
         for(const child of node.childNodes){
@@ -1956,16 +1965,22 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
         }
         return out;
       };
+      if(!body.childNodes.length)return {state:'body_unavailable'};
       const parts=[];
       for(const paragraph of body.childNodes){
-        if(!['P','DIV'].includes(paragraph.nodeName))return false;
-        let line=plain(paragraph);if(line===null)return false;
+        if(!['P','DIV'].includes(paragraph.nodeName))return {state:'body_format'};
+        let line=plain(paragraph);if(line===null)return {state:'body_format'};
         if(paragraph.childNodes.length===1 && paragraph.firstChild.nodeName==='BR')line='';
         parts.push(line);
       }
-      return parts.join('\n')===arg.body.replace(/\r\n?/g,'\n');
+      const actual=parts.join('\n'),expected=arg.body.replace(/\r\n?/g,'\n');
+      if(actual===expected)return {state:'ready'};
+      let at=0;while(at<actual.length && at<expected.length && actual[at]===expected[at])at++;
+      return {state:'body_mismatch',line:expected.slice(0,at).split('\n').length};
     };
-    if(step==='linkTitle')return checkedDraft()||null;
+    const checkedDraft=()=>inspectDraft().state==='ready';
+    if(step==='draftCheck')return inspectDraft();
+    if(step==='linkTitle'){const check=inspectDraft();return check.state==='ready'?check.title:null;}
     if(step==='linkCover'){
       const slots=all(document,'img[alt="見出し画像"],[data-testid="eyecatch"] img,[data-testid="eyecatch-image"] img,[data-testid="header-image"] img').filter(i=>!i.closest('[contenteditable=true]'));
       if(slots.length===1 && slots[0].complete && slots[0].naturalWidth>0)
@@ -2094,14 +2109,14 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     const end=Date.now()+36000;
     const navigate=url=>command('Page.navigate',{url});
     const frame=async(step,arg)=>evaluate('('+nativeScreenJS+')('+JSON.stringify(step)+','+JSON.stringify(arg)+')');
-    const poll=async(read,accept)=>{
-      for(let i=0;i<10 && !blocked() && Date.now()<end;i++){
+    const poll=async(read,accept,attempts=10)=>{
+      for(let i=0;i<attempts && !blocked() && Date.now()<end;i++){
         try{const v=await read();if(accept(v))return v;}catch{}
         await pause520(200);
       }
       return null;
     };
-    const state=(step,arg,values)=>poll(()=>frame(step,arg),v=>values.includes(v));
+    const state=(step,arg,values,attempts=10)=>poll(()=>frame(step,arg),v=>values.includes(v),attempts);
     const arg={key:job.key,title:job.title,byLink:!!job.link};
     let cover=null,hash=null;
     const page=job.kind==='publish'?'https://note.com/notes':'https://note.com/43__/n/'+job.key;
@@ -2152,12 +2167,19 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       await navigate(editor.href);
       Object.assign(arg,{key:draft.key,body:job.body});
       if(job.link){
-        const name=await poll(()=>frame('linkTitle',arg),v=>typeof v==='string' && !!v);
-        if(!name)return {message:'元の下書きのタイトルと編集画面を確認できず・公開保留'};
+        const name=await poll(()=>frame('linkTitle',arg),v=>typeof v==='string' && !!v,40);
+        if(!name)return blocked()?blockedResult():{message:'元の下書きのタイトルと編集画面を読み取れず・公開保留'};
         arg.title=name;
       }
       if(metadata?.name && metadata.name!==arg.title)return {message:'下書きのタイトルが一致せず・公開保留'};
-      if(!await state('draft',arg,['ready']))return blocked()?blockedResult():{message:'下書きのタイトル・本文・改行の一致を確認待ち'};
+      // A mounted editor can take longer than the old 10 checks (about 2 seconds).
+      // Stay within the same total browser deadline and never bypass an exact match.
+      let lastDraft=null;
+      const matched=await poll(async()=>{
+        try{lastDraft=await frame('draftCheck',arg);return lastDraft;}
+        catch{lastDraft=null;return null;}
+      },v=>v?.state==='ready',40);
+      if(!matched)return blocked()?blockedResult():{message:draftFailure16935(lastDraft)};
       const img=await frame('linkCover',arg);
       const domCover=img?coverId(img.src):null;
       const dataCover=metadata && Object.hasOwn(metadata,'cover')?coverId(metadata.cover):null;
@@ -2167,11 +2189,11 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
       if(cover===null)return {message:'下書きの見出し画像を確認できず・公開保留'};
       hash=metadata?.hash;
       if(!/^[0-9a-f]{64}$/.test(hash||''))return {message:'保存済みの本文全体を取得できず・公開保留'};
-      if(job.preview)return {message:'「'+arg.title+'」 ／ '+(cover?'設定済みの見出し画像を確認しました。':'見出し画像は未設定です。')+' 保存済み本文を照合できます。'};
+      if(job.preview)return {message:'「'+arg.title+'」 ／ '+(job.link?'保存済み下書きの読み取りを確認（完成稿との比較なし）。':'登録稿と下書きのタイトル・本文・改行の一致を確認しました。')+(cover?'設定済みの見出し画像を確認しました。':'見出し画像は未設定です。')+' この確認では公開していません。'};
       if(blocked() || await frame('settings',arg)!=='clicked')return blocked()?blockedResult():{message:'公開設定を確認待ち'};
       // Text is no longer needed in the browser commands for the publish screen.
       delete arg.body;
-      if(!await state('publishReady',arg,['ready']))return blocked()?blockedResult():{message:'無料・タグなし・通常公開の設定を確認待ち'};
+      if(!await state('publishReady',arg,['ready'],40))return blocked()?blockedResult():{message:'無料・タグなし・通常公開の設定を確認待ち'};
       finalStep='publish';
     }else{
       arg.mag=job.target;
@@ -2355,7 +2377,7 @@ class Desk520 {
           break;
         }
         case 'preview_link':
-          correctionMessage=await this.previewDraft(input.article,now);
+          correctionMessage=await this.previewDraft(input.article,now,input.expected);
           break;
         case 'reserve_link':
         case 'cancel_link':
@@ -3372,12 +3394,24 @@ class Desk520 {
     });
     }finally{await release(base,lease);}
   }
-  async previewDraft(key,now){
+  async previewDraft(key,now,expected=null){
     need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
     if(typeof this.env.BROWSER?.acquire!=='function')return 'CloudflareのBROWSER設定を確認してください。';
     const cfg=this.one('SELECT blocked FROM desk_cfg WHERE id=1');
     if(cfg.blocked>now)return 'note指定の待機中です。';
-    if(!this.one('UPDATE desk_preview_gate SET next=? WHERE id=1 AND next<=? RETURNING id',now+5*M520,now))return '画像の確認テストは5分に1回です。';
+    let preview={kind:'publish',link:true,preview:true,key,title:key};
+    const link=this.one('SELECT scheduled FROM desk_link_plan WHERE article=? AND pub IS NULL',key);
+    const matches=this.rows(`SELECT w.* FROM desk_work_schedule w LEFT JOIN desk_link_plan l ON l.article=?
+      WHERE w.pub IS NULL AND (w.key=? OR (w.key IS NULL AND w.title=l.title AND w.scheduled=l.scheduled)) LIMIT 2`,key,key);
+    if(matches.length>1)return 'この下書きに対応する登録稿を1件に特定できません。';
+    if(matches.length){
+      const w=matches[0],target=this.publicationTarget16914(w);
+      if(target.conflict || target.key!==key)return '登録稿と下書きの対応を確認できません。';
+      preview={kind:'publish',preview:true,key,title:w.title,body:w.body};
+    }
+    if(expected!==null && (!Number.isSafeInteger(expected) || expected!==(matches[0]?.scheduled??link?.scheduled)))
+      return '予約が変更されています。「記録を開く」で最新の予約を確認してください。';
+    if(!this.one('UPDATE desk_preview_gate SET next=? WHERE id=1 AND next<=? RETURNING id',now+5*M520,now))return '下書きの確認テストは5分に1回です。';
     const account=await this.deliveryAccount();
     if(!account || account.until>Date.now())return '520本人の接続または前の処理の終了を確認待ちです。';
     const env=scoped(this.env,account.slot);
@@ -3385,8 +3419,7 @@ class Desk520 {
     if(!lease)return '520が処理中です。';
     try {
       const credential=await loadCookie(env,account.id);
-      const job={kind:'publish',link:true,preview:true,key,title:key};
-      const result=await browserDelivery(this.env.BROWSER,account.id,cleanCookie(credential.NOTE_SESSION),job,async()=>false);
+      const result=await browserDelivery(this.env.BROWSER,account.id,cleanCookie(credential.NOTE_SESSION),preview,async()=>false);
       if(result.hold){
         const until=Date.now()+result.hold;
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
@@ -4312,7 +4345,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 <label>下書きの共有用リンク<input type="text" inputmode="url" id="share" name="share" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
 <label>公開日（日本時間）<input type="date" id="link_date" name="link_date" value="${stamp.slice(0,10)}"></label>
 <label>公開時刻（日本時間）<input type="time" id="link_time" name="link_time" value="${stamp.slice(11,16)}"></label>
-<button type="submit" name="work_action" value="preview_link">公開せずに画像を確認</button>
+<button type="submit" name="work_action" value="preview_link">公開せずに下書きを確認</button>
 <button type="submit" name="work_action" value="reserve_link">この下書きの公開予定を保存</button>
 <p>指定時刻に520の下書きを開きます。登録後に編集した場合は最新の保存内容が対象です。本文・タイトル・画像は転記しません。すでにnoteで予約した記事は対象外です。</p>
 <small>日時だけを直すときは、変更する予約を選び、リンク欄は空欄で保存してください。下書きを差し替えるときは、新しい共有リンクを貼って保存してください。</small>
@@ -4376,7 +4409,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 <button id="prep">選んだ写真の準備を再試行</button><div id="photos"></div></details>
 <details open><summary>既刊と新作の掲載先</summary><p id="catalogue">${esc(catalogue)}</p><div id="archive">${deskArchiveList(archive)}</div>
 <button id="prevarchive" form="readform" type="submit" name="offset" value="${Math.max(0,(archive?.offset||0)-30)}"${archive?.offset?'':' disabled'}>前の30本</button><button id="nextarchive" form="readform" type="submit" name="offset" value="${(archive?.offset||0)+30}"${archive?.more?'':' disabled'}>次の30本</button></details>
-<h2 id="schedules">予約した作品</h2><div id="planlinks">${records?plans.map(p=>'<p>'+esc(p.when+' ／ '+p.state)+'<br>'+(p.url?'<a href="'+esc(p.url)+'" target="_blank" rel="noopener noreferrer">'+esc(p.label)+'</a>':esc(p.label))+(p.detail?'<small>'+esc(p.detail)+'</small>':'')+(p.edit?'<button type="submit" form="readform" formaction="/520#planform" name="edit_target" value="'+esc(p.edit)+'" data-plan="'+esc(p.edit)+'">この予約を変更</button>':'')+'</p>').join('')||'登録された予定はありません。':'「記録を開く」を押してください。'}</div><h2>作品と計測</h2><pre id="result">${esc(records?.recordText??'管理用の鍵を入力し「記録を開く」を押してください。')}</pre>
+<h2 id="schedules">予約した作品</h2><div id="planlinks">${records?plans.map(p=>'<p>'+esc(p.when+' ／ '+p.state)+'<br>'+(p.url?'<a href="'+esc(p.url)+'" target="_blank" rel="noopener noreferrer">'+esc(p.label)+'</a>':esc(p.label))+(p.detail?'<small>'+esc(p.detail)+'</small>':'')+(p.edit?'<button type="submit" form="readform" formaction="/520#planform" name="edit_target" value="'+esc(p.edit)+'" data-plan="'+esc(p.edit)+'">この予約を変更</button><button type="submit" form="readform" name="check_draft" value="'+esc(p.edit)+'">公開せずに下書きを確認</button>':'')+'</p>').join('')||'登録された予定はありません。':'「記録を開く」を押してください。'}</div><h2>作品と計測</h2><pre id="result">${esc(records?.recordText??'管理用の鍵を入力し「記録を開く」を押してください。')}</pre>
 <script nonce="${nonce}">${DESK_BROWSER_SCRIPT}</script></body></html>`;
   return new Response(html,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'same-origin','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}});
 }
@@ -4444,6 +4477,7 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
         if(p.edit && selector){
           const opt=document.createElement('option');opt.value=p.edit;opt.textContent=p.when+'　'+p.label;selector.append(opt);
           const edit=document.createElement('button');edit.type='button';edit.dataset.plan=p.edit;edit.textContent='この予約を変更';el.append(' ',edit);
+          const check=document.createElement('button');check.type='submit';check.name='check_draft';check.value=p.edit;check.setAttribute('form','readform');check.textContent='公開せずに下書きを確認';el.append(' ',check);
         }
       }
       if(chosen && selector)selector.value=chosen;
@@ -4522,7 +4556,7 @@ const DESK_BROWSER_SCRIPT=String.raw`(function deskBrowser() {
     e.preventDefault();setPlan(edit.dataset.plan);$('planform').scrollIntoView();
   };
   $('readform').onsubmit=event=>{
-    if(event.submitter===$('basic'))return;
+    if(event.submitter===$('basic') || event.submitter?.name==='check_draft')return;
     const action=event.submitter?.value;
     if(['join_on','join_off','join_invite','tuta_connect','tuta_check','tuta_off'].includes(action))return;
     if(action==='scout'){
@@ -10096,4 +10130,20 @@ function adminGuardDecision16934(storage,input,now=Date.now()){
     rows('INSERT INTO admin_guard16934 VALUES(?,?,?,?,?) ON CONFLICT(client) DO UPDATE SET failures=excluded.failures,first_at=excluded.first_at,blocked_until=excluded.blocked_until,expires=excluded.expires',input.client,failures,first,blocked,blocked||first+600000);
     return {allowed:false,retry:blocked?900:0};
   });
+}
+
+function draftFailure16935(check){
+  const reasons={
+    title_unavailable:'編集画面のタイトル欄を読み取れず・原稿の一致は未確認',
+    title_ambiguous:'編集画面のタイトル欄を1つに特定できず・原稿の一致は未確認',
+    body_unavailable:'編集画面の本文欄を読み取れず・本文・改行の一致は未確認',
+    body_ambiguous:'編集画面の本文欄を1つに特定できず・本文・改行の一致は未確認',
+    manuscript_unavailable:'比較する登録稿を読み取れず・本文・改行の一致は未確認',
+    title_mismatch:'登録稿と下書きのタイトルが一致しません',
+    body_format:'本文に照合できない構造があります・本文・改行の一致は未確認',
+    body_mismatch:'登録稿と下書きの本文・改行が一致しません'
+  };
+  const reason=Object.hasOwn(reasons,check?.state)?reasons[check.state]:'編集画面の読み取りに失敗・原稿の一致は未確認';
+  const line=check?.state==='body_mismatch' && Number.isSafeInteger(check.line) && check.line>0 && check.line<=240001?'（登録稿の'+check.line+'行目付近）':'';
+  return reason+line+'・公開保留';
 }
