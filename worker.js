@@ -1,4 +1,49 @@
-const VERSION = 'v16.9.29';
+* note-helper v16.9.30 — 全体置換版
+修正：実際の「メール通知」リンク・タブから設定を読み取り、確認できない段階を記録。
+修正：参加申請の通信失敗・募集条件・リンク対応・通知確認を区別。各誌の確認日時と次回の目安を表示。
+表示：共同誌への自動追加のON/OFFと掲載状況を同じ欄で確認。
+再点検：ブラウザー起動後の保存失敗でも作成済みセッションを閉じます。
+修正：起動待ちの間に使用権が切れた処理は操作を開始せず、後続処理の使用権も変更しません。
+修正：日付として扱えないサーバー待機時間は保存せず、従来の待機後に再確認。正常な待機期限は維持。
+全体点検：自動スキの対象記事・公開状態・確認応答を照合。結果不明は再送せず読み取りで確認。
+修正：一部の募集条件や状態記録の失敗でほかの機能が止まらないよう分離。
+修正：設定・計測の結果保存が失敗しても自分の使用権を解放。掲載確認の通信失敗は確認回数に含めない。
+修正：サイズ超過・文字コード不正の応答本文は読み取りを中止して接続を解放。
+修正：公開作品のタイトル変更を既刊台帳にも反映。過去の掲載履歴・公開日時は維持。
+修正：RSSの巡回間隔は確認回数ではなく経過時間で調整。短時間の確認で2日待ちになる問題を解消。
+修正：二次掲載の比較期間を統一。作品変更後の古い募集候補を再評価時に除外。
+修正：掲載先が変わっても混雑回避の最大2時間待機を延長しない。
+追加：RSSの条件付き取得・更新差分の優先取り込み・更新頻度に応じた探索間隔。
+追加：共同誌の混雑時間を観測し、追加時刻を最大2時間調整。作品の公開予約は維持。
+追加：RSSで後から別の誌に現れた自作を記録。自動追加は区別し、十分な観測時のみ選択に反映。
+追加：新しい募集と既刊を継続照合。確認済みの掲載条件は既存処理へ、未対応の応募方法は候補表示まで。
+修正：募集元の一時的な取得失敗は2時間後に再確認。noteの待機期限・日次枠を優先。
+修正：RSSの先頭8件が既知でも後続の募集を順次登録。取得済みのクリエイターRSSも候補取り込みに対応。
+修正：応募結果の確認が進んだとき、全体の表示にも最新結果を反映。
+修正：応募結果の通信待ち・日次枠不足を確認済み回数に加算しない。操作済み応募は再送せず読み取りを再開。
+修正：RSSの募集記事取り込み、記事データ欠落、タグ数上限の事前判定、入力直前の停止確認。
+修正：ほかの操作が結果未確認の間は新規応募を保留。期限切れの比較用データで読者学習が詰まる問題を修正。
+追加：2作以上にスキした読者を確認できた経路を優先。4回に1回の探索を維持。
+追加：募集企画の探索・条件照合・対応するタグ応募・公開結果確認を自動実行。
+対応済み条件はnote文芸部年末コンテスト2026。未知の条件・外部フォームは自動見送り。
+本文・タイトル・画像・既存タグを照合。応募操作の結果不明は再送しません。
+追加：作品本文の近さと3作品・3作者以上の反応の重なりで読者を選択。
+追加：継続した紹介活動を公開情報で確認し、既存の読者巡回・募集確認に反映。
+追加：作品ごとに掲載候補の題材と読者の重なりを比較。情報不足と4回に1回は従来の選択。
+比較情報はDurable Objectに上限付きで保存。D1の履歴・設定・待機は変更しません。
+比較用の追加取得は最大8ページ/日・30分以上の間隔。既存192ページ枠に算入。
+修正：CloudflareのRPC接続をローカルの待機管理と誤判定する不具合。申請・掲載・追加探索の待機管理を修復。
+修正：読者一覧・コメント欄の読み込み待ち、一覧ボタンとスキボタンの区別、コメント0件の判定。
+本番テスト：読み取り対象・失敗段階・対象なしを区別して表示。申請1誌・掲載1件と公開結果を検証。
+追加探索：補助項目の移行確認、一時的な読み書き失敗の限定再試行、失敗箇所の記録。
+修正：元記事確認前の探索枠消費、診断の保存失敗による探索中断、古い次回時刻の表示。
+拡大：申請24誌/日、本人画面確認96回/日、掲載48件/日。募集元48誌/日、公開探索192ページ/日。
+申請は30分、掲載は15分、同じ作品は2時間以上あけます。条件・誌別上限・待機・既存履歴を保持。
+本番での成功は管理画面の確認記録で判定します。未確認を成功扱いにはしません。
+既存の接続・ON/OFF・記事履歴・送信結果不明・note指定の待機を引き継ぎます。
+通常の記事スキ、予約公開、Tuta、共同誌への参加・掲載確認を保持します。新しいSecretの入力は不要です。
+*/
+const VERSION = 'v16.9.30';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1541,9 +1586,11 @@ const recommendLabels = [
 ];
 
 // Chrome executes this function within the main frame of the settings page.
-const recommendationControlJS=String.raw`function recommendationControl(labels, action) {
+const recommendationControlJS=String.raw`function recommendationControl(labels, action, settingsPaths) {
   if(location.origin==='https://note.com' && /^\/login(?:\/|$)/.test(location.pathname))return 'login';
-  if (location.origin !== 'https://note.com' || !/^\/settings\/(?:account|reaction|reactions)\/?$/.test(location.pathname)) return 'outside';
+  const settingsPage=Array.isArray(settingsPaths)?settingsPaths.some(p=>typeof p==='string' && /^\/settings\/[a-zA-Z0-9/_-]+$/.test(p) && p===location.pathname.replace(/\/$/,'')):
+    /^\/settings\/(?:account|reaction|reactions)\/?$/.test(location.pathname);
+  if (location.origin !== 'https://note.com' || !settingsPage) return 'outside';
   const clean = text => (text || '').replace(/[\s、。]/gu, '').replace('ほかのクリエイター','他のクリエイター');
   const visible = element => element && element.getClientRects().length > 0;
   const exact = value => labels.includes(clean(value));
@@ -4216,7 +4263,7 @@ function planEditorOptions(plans,selected){
   return plans.filter(p=>p.edit).map(p=>'<option value="'+esc(p.edit)+'"'+(p.edit===selected?' selected':'')+'>'+esc(p.when+'　'+p.label)+'</option>').join('');
 }
 function magazineProgressText520(p){
-  return p?p.message+'\n発見 '+p.found+'誌 ／ 編集権限・無料を確認 '+p.rights+'誌 ／ 募集条件を確認 '+p.policy+'誌 ／ 最近の更新も確認 '+p.eligible+'誌'+
+  return p?'自動追加：'+(p.enabled?'ON':'休止中')+'\n'+p.message+'\n発見 '+p.found+'誌 ／ 編集権限・無料を確認 '+p.rights+'誌 ／ 募集条件を確認 '+p.policy+'誌 ／ 最近の更新も確認 '+p.eligible+'誌'+
     '\n追加の操作開始・追加済み確認 '+p.attempts+'作品 ／ 誌面RSSで掲載を確認 '+p.confirmed+'作品 ／ 操作後の掲載確認待ち '+p.uncertain+'作品':'記録を開くと、追加がどの段階まで進んでいるか表示します。';
 }
 function deskMagazineList(records) {
@@ -4263,7 +4310,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 <div id="reservedlist">${reservedList}</div>
 <button id="unreserve" type="submit" name="work_action" value="clear_reserved"${reserved?.length?'':' disabled'}>選んだ作品の「予約済み」を外す</button>
 </details></form>
-<p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#schedules">予約した作品を見る</a></p>
+<p id="msg" role="status" aria-live="polite">${esc(message)}</p><p><a href="#magsection">マガジンへの追加状況を見る</a> ／ <a href="#joinsection">参加申請の保留理由・次回確認を見る</a> ／ <a href="#schedules">予約した作品を見る</a></p>
 <p>登録時刻から5分以内の定期起動で、520の下書きと完成稿が一致すれば公開します。時間を過ぎた稿は保留します。手動で公開した新作も計測します。条件と編集権限を確認できた共同誌には、新作と既刊を複数誌へ順番に追加します。「記録を開く」で結果が見られます。</p>
 <details><summary>自動公開・共同誌・参加申請・0円参加・お礼更新を休止／再開</summary><button type="button" id="autopause">休止</button><button type="button" id="autoresume">再開</button></details>
 <details><summary>完成稿と公開予定を登録</summary><p>年をまたぐ予約や、登録済みの日付の間への追加もできます。公開日時の順に表示します。公開済みの新作は自動で計測されます。事前に完成稿と日時を登録すると、空欄の時刻について比較できるデータがあれば候補を1つ記録します。</p>
@@ -4304,7 +4351,7 @@ function deskPage(records=null,message='',status=200,editing='') {
 <details><summary>旧版の作品棚の記録（自動作成・追加は廃止）</summary>
 <pre id="shelfstatus">${esc(records?.shelf?shelfRecord520(records.shelf):'「記録を開く」で旧版の操作記録を確認できます。')}</pre>
 <p>本人のマガジンの自動作成と作品追加は行いません。旧版の記録だけを表示します。記事内の誘導リンクや案内記事も追加しません。</p></details>
-<details id="magsection"><summary>マガジンの自動確認</summary>
+<details open id="magsection"><summary>マガジンへの追加状況・掲載先の確認</summary>
 <p>520の公開一覧、ほかの作者の一覧、文芸誌の最新号から継続して探します。1回に処理しきれない一覧と次ページは続きから確認します。累計誌数の上限は設けません。通信量と申請間隔は抑えます。</p>
 <p>発見しただけの誌には追加しません。共同運営者としての編集権限・無料・募集条件を確認できた誌が対象です。参加申請・招待の承認は上の専用欄に表示します。</p>
 <button type="submit" form="readform" name="work_action" value="scout">掲載先を今探す</button>
@@ -4636,6 +4683,17 @@ function joinRecruitment520(n,html='',target=JOIN520) {
   const back=noteLink161(meta161(html,'og:url'))?.id===target.id && anchors161(html).some(a=>noteLink161(a.href,target.url,'article')?.id===target.article);
   return forward || back;
 }
+function joinRecruitmentFailure16930(n,html,target) {
+  if(!n || typeof n.body!=='string' || !n.body.trim())return {reason:'recruitment_response',detail:'募集記事の本文データを取得できません'};
+  if(n.key!==target.article || n.user?.urlname!==target.owner || n.status!=='published')
+    return {reason:'recruitment_identity',detail:'募集記事のID・投稿者・公開状態を確認できません'};
+  if(n.is_limited===true || n.isLimited===true || n.is_paid===true || n.isPaid===true || Number(n.price)>0)
+    return {reason:'recruitment_access',detail:'無料で全文を確認できる募集記事ではありません'};
+  const forward=anchors161(n.body).some(a=>noteLink161(a.href,target.rule)?.id===target.id);
+  const back=noteLink161(meta161(html,'og:url'))?.id===target.id && anchors161(html).some(a=>noteLink161(a.href,target.url,'article')?.id===target.article);
+  if(!forward && !back)return {reason:'recruitment_link',detail:'募集記事と対象マガジンを結ぶリンクを確認できません'};
+  return {reason:'recruitment_rules',detail:'現在の募集条件が、確認済みの申請方法と一致しません'};
+}
 function inviteUrl520(raw,id=JOIN520.id,requireId=false) {
   if(typeof raw!=='string' || raw.length>6000 || /[\x00-\x20\x7f]/.test(raw))return null;
   try {
@@ -4928,6 +4986,8 @@ Object.assign(Desk520.prototype,{
         this.rememberMagazine(noteLink161(target.url),target.name);
       }
     });
+    // Preserve j.at: it is an application/acceptance timestamp, not a read time.
+    this.rows("CREATE TABLE IF NOT EXISTS desk_join_check16930(id TEXT PRIMARY KEY,checked INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '')");
   },
   joinActive520(id=JOIN520.id) {
     return !!this.one(`SELECT 1 FROM desk_join_cfg j JOIN desk_cfg c ON c.id=j.id JOIN desk_delivery d ON d.id=j.id
@@ -4935,10 +4995,17 @@ Object.assign(Desk520.prototype,{
       AND NOT EXISTS(SELECT 1 FROM desk_member WHERE id=? AND mode='excluded')`,Date.now(),id);
   },
   joinView520() {
-    const c=this.one('SELECT enabled,mail_at FROM desk_join_cfg WHERE id=1');
-    const items=this.rows('SELECT t.definition,j.phase,j.at,j.message,j.proof FROM desk_join_target t JOIN desk_join j ON j.id=t.id ORDER BY j.at DESC,j.id LIMIT 40').map(row=>{
+    const c=this.one('SELECT enabled,mail_at,due FROM desk_join_cfg WHERE id=1');
+    const blocked=this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked;
+    const applicationAt=this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next;
+    const items=this.rows(`SELECT t.definition,j.phase,j.at,j.message,j.proof,j.due,c.checked,c.reason,
+      EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') invitation
+      FROM desk_join_target t JOIN desk_join j ON j.id=t.id LEFT JOIN desk_join_check16930 c ON c.id=j.id
+      ORDER BY j.at DESC,j.id LIMIT 40`).map(row=>{
       const target=JSON.parse(row.definition);
-      return {phase:row.phase,at:row.at,message:row.message,proof:row.proof,name:target.name,rule:target.rule,comment:target.comment,active:this.joinActive520(target.id)};
+      return {phase:row.phase,at:row.at,message:row.message,proof:row.proof,name:target.name,rule:target.rule,comment:target.comment,active:this.joinActive520(target.id),
+        checked:row.checked||0,reason:row.reason||'',restricted:!!target.restricted,
+        nextAt:Math.max(row.due||0,c.due||0,blocked||0,row.phase==='wait'&&!row.invitation?applicationAt||0:0)};
     });
     return {enabled:!!c.enabled,active:this.joinActive520(''),browser:typeof this.env.BROWSER?.acquire==='function',
       mailConfigured:!!noteMailConfig520(this.env).recipient,mailReceived:c.mail_at,mailForwardConfigured:!!noteMailConfig520(this.env).forward,mailForwardError:noteMailConfig520(this.env).error,tuta:this.tutaView520(),items,total:this.one('SELECT COUNT(*) n FROM desk_join_target').n};
@@ -4994,24 +5061,36 @@ Object.assign(Desk520.prototype,{
     const today=jstDay(now),used=cfg.day===today?cfg.used:0;
     if(used>=DISTRIBUTION16918.checks){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
     this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+15*M520);
-    let env,lease,message='参加申請・招待の確認を再試行待ち',due=now+2*HOUR,attempt='';
+    let env,lease,message='参加申請・招待の確認を再試行待ち',due=now+2*HOUR,attempt='',reason='retry';
     try {
-      if(typeof this.env.BROWSER?.acquire!=='function'){message='CloudflareのBROWSER設定が必要です';return;}
+      if(typeof this.env.BROWSER?.acquire!=='function'){reason='browser_config';message='CloudflareのBROWSER設定が必要です';return;}
       const pending=this.one("SELECT * FROM desk_invite WHERE id=? AND phase='wait' ORDER BY created DESC LIMIT 1",target.id);
       const recent=this.one("SELECT at FROM desk_invite WHERE id=? AND phase IN ('opened','confirmed') ORDER BY at DESC LIMIT 1",target.id);
       const kind=pending?'invite':row.phase==='joined'||row.phase==='accepting'||(recent && recent.at>=now-2*HOUR)?'verify':row.phase==='wait'?'apply':'check';
       if(kind==='apply' && (this.one('SELECT applications FROM desk_join_budget WHERE day=?',today)?.applications||0)>=DISTRIBUTION16918.applications){message='本日の参加申請枠を使用済み・翌日に続けます';due=jstStart(today)+D520+M520;return;}
-      if(kind==='apply' && target.restricted){message='AI生成文・応募中作品・R18の条件があるため自動申請対象外。作品の資格を未確認です';due=now+7*D520;return;}
+      if(kind==='apply' && target.restricted){reason='eligibility';message='AI生成文・応募中作品・R18の条件があるため自動申請対象外。作品の資格を未確認です。待機時間だけでは申請に進みません';due=now+7*D520;return;}
       const sources=await Promise.allSettled([
         this.publicRead('https://note.com/api/v1/magazines/'+target.id,'json'),
         this.publicRead(target.url,'html'),
         this.publicRead('https://note.com/api/v3/notes/'+target.article,'json')
       ]);
       const [mag,html,note]=sources.map(s=>s.status==='fulfilled'?s.value:null);
-      if(!joinFree520(mag,html||'',target,note?.data)){message='対象誌が無料か確認できず・申請と承認を保留';due=now+D520;return;}
-      if((kind==='apply'||kind==='check') && !joinRecruitment520(note?.data,html||'',target)){message='現在の募集方法を照合できず・参加申請を保留';due=now+D520;return;}
+      const failed=sources.flatMap((s,i)=>s.status==='rejected'?[['マガジン情報','誌面ページ','募集記事'][i]]:[]);
+      // Keep alternative proof paths usable. A failed optional fetch is only
+      // reported if the surviving sources cannot establish the required facts.
+      if(!joinFree520(mag,typeof html==='string'?html:'',target,note?.data)){
+        reason=failed.length?'source_fetch':'participation_fee';
+        message='対象誌が無料か確認できず・申請と承認を保留'+(failed.length?'：'+failed.join('・')+'の取得に失敗。条件不一致とは判定していません':'：対象誌の本人情報または参加費の根拠を確認できません');
+        due=now+(failed.length?2*HOUR:D520);return;
+      }
+      if((kind==='apply'||kind==='check') && !joinRecruitment520(note?.data,typeof html==='string'?html:'',target)){
+        const failure=joinRecruitmentFailure16930(note?.data,typeof html==='string'?html:'',target);
+        reason=failed.length?'source_fetch':failure.reason;
+        message='現在の募集方法を照合できず・参加申請を保留：'+(failed.length?failed.join('・')+'の取得に失敗。条件不一致とは判定していません':failure.detail);
+        due=now+(failed.length || reason==='recruitment_response'?2*HOUR:D520);return;
+      }
       const accountInfo=await this.deliveryAccount();
-      if(!accountInfo || accountInfo.until>Date.now()){message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.until+M520):now+2*HOUR;return;}
+      if(!accountInfo || accountInfo.until>Date.now()){reason='account_wait';message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.until+M520):now+2*HOUR;return;}
       if(row.account && row.account!==accountInfo.id){message='登録時の520本人と一致せず・操作を保留';return;}
       env=scoped(this.env,accountInfo.slot);lease=await acquire(env,false);
       if(!lease){message='520の処理終了を確認待ち';due=now+4*M520;return;}
@@ -5054,6 +5133,7 @@ Object.assign(Desk520.prototype,{
           });
         },live);
       probe?.result?.(result);
+      reason=result.reason || (result.joined?'joined':result.existing?'invitation_wait':result.sent?'application_sent':result.hold?'server_wait':result.noFollow?'follow_required':'browser_check');
       message=result.message;due=Date.now()+(result.noFollow?30*D520:attempt||result.prepared?4*M520:kind==='check'||kind==='verify'?6*HOUR:2*HOUR);
       this.storage.transactionSync(()=>{
         if(!this.joinActive520(target.id))return;
@@ -5073,10 +5153,16 @@ Object.assign(Desk520.prototype,{
         await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,accountInfo.slot).run();
       }
     }catch(error) {
+      reason=readLimit(error)?'read_limit':'read_error';
       message=readLimit(error)?'D1の読み取り枠更新後に再確認':'本人確認・画面・保存の途中で失敗。記録済みの操作は再送せず確認します';
       due=readLimit(error)?(Math.floor(Date.now()/D520)+1)*D520+M520:Date.now()+2*HOUR;
     }finally {
-      try{this.rows('UPDATE desk_join SET due=?,message=? WHERE id=?',due,message,target.id);}
+      try{
+        this.rows('UPDATE desk_join SET due=?,message=? WHERE id=?',due,message,target.id);
+        // A diagnostic write cannot strand the account lease or undo a result.
+        try {this.rows('INSERT INTO desk_join_check16930(id,checked,reason) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET checked=excluded.checked,reason=excluded.reason',target.id,Date.now(),reason);}
+        catch {console.error('note-helper: participation diagnostic save deferred');}
+      }
       finally{if(lease)await release(env,lease);}
     }
   }
@@ -5084,7 +5170,10 @@ Object.assign(Desk520.prototype,{
 function joinRecord520(j) {
   if(!j)return '';
   return ['【参加申請・招待の承認】'+(j.active?'自動確認ON':'休止中'),
-    ...(j.items||[]).map(r=>r.name+' ／ '+(r.active?'':'休止・除外 ／ ')+r.message),
+    ...(j.items||[]).map(r=>r.name+' ／ '+(r.active?'':'休止・除外・通信待機 ／ ')+r.message+
+      '\n最終確認：'+(r.checked?time(r.checked):'この版での確認はまだありません')+
+      (r.restricted && r.phase==='wait'?'\n作品の資格が未確認のため、自動申請の対象外です。時間の経過では解除しません。':
+        r.active?'\n次回の確認：'+(r.nextAt>Date.now()?time(r.nextAt)+'以降':'順番待ち（確認できる時刻になっています）')+'。他の処理・通信待機により遅れる場合があります。':'')),
     j.tuta?.configured?tutaRecord520(j.tuta):j.mailConfigured?(j.mailReceived?'招待メールの最終受信：'+time(j.mailReceived):'受信先の指定あり・メール到着は未確認'):'招待メールの受信が未接続です。自動承認の稼働には1回の受信接続が必要です。',
     j.tuta?.configured?'確認・復旧メールは引き続きTutaで受信します。':j.mailForwardError?'確認・復旧メールの転送先設定に誤りがあります。登録メールの変更は保留してください。':j.mailForwardConfigured?'確認・復旧メール：転送先の指定あり。実際に元の受信箱へ届くことを確認してから登録メールを変更してください。':'確認・復旧メールの転送先は未設定です。この受信先へ登録メールを変更する前に設定してください。',
     '探索・参加先に固定の累計上限はありません。フォロー操作は行いません。新規申請は1日24誌（日本時間）、30分以上あけて続けます。本人画面の確認は1日96回まで。条件未確認・通信待機では上限まで送らない場合があります。',
@@ -5108,33 +5197,97 @@ function joinFollowDOM520(owner,action) {
   // This function is deliberately read-only, regardless of action.
   return 'off';
 }
+// Navigate only controls actually present on note's settings screen. The
+// discovered pathname is passed to the reader; no notification URL is guessed.
+const joinNotificationNavigationJS16930=String.raw`function notificationNavigation(visited) {
+  if(location.origin!=='https://note.com' || !/^\/settings\/[a-zA-Z0-9/_-]+\/?$/.test(location.pathname))return {state:'outside'};
+  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');
+  const name=e=>(e.textContent||'').replace(/\s+/g,'');
+  for(const label of ['メール通知','メール通知設定','通知','通知設定']) {
+    const links=[...document.querySelectorAll('a[href]')].filter(a=>visible(a) && name(a)===label);
+    const urls=[...new Set(links.map(a=>a.href).filter(h=>{
+      try {const u=new URL(h);return u.origin===location.origin && !u.username && !u.password &&
+        /^\/settings\/[a-zA-Z0-9/_-]+\/?$/.test(u.pathname) && h!==location.href && !visited.includes(h);}catch{return false;}
+    }))];
+    if(urls.length>1)return {state:'ambiguous'};
+    if(urls.length===1)return {state:'navigate',url:urls[0]};
+    const tabs=[...document.querySelectorAll('[role=tab],button')].filter(b=>b.tagName!=='A' && visible(b) && name(b)===label &&
+      b.getAttribute('aria-selected')!=='true' && !visited.includes('tab:'+label));
+    if(tabs.length>1)return {state:'ambiguous'};
+    if(tabs.length===1){
+      if(tabs[0].disabled || tabs[0].getAttribute('aria-disabled')==='true')return {state:'disabled'};
+      tabs[0].click();return {state:'tab',label};
+    }
+  }
+  return {state:'missing'};
+}`;
+function joinNotificationFailure16930(state,nav) {
+  const reasons={
+    login:['notification_login','noteがログイン画面を表示しています'],
+    outside:['notification_page','確認済みの設定ページへ移動できません'],
+    ambiguous:['notification_ambiguous','招待通知のスイッチが複数あり、対象を特定できません'],
+    disabled:['notification_disabled','招待通知のスイッチが操作できない状態です'],
+    unknown:['notification_unknown','招待通知のスイッチを見つけましたがON/OFFを読めません'],
+    script_error:['notification_script','設定画面の読み取り処理を完了できません'],
+    missing:['notification_control','招待通知のスイッチを読み取れません']
+  };
+  const detail=nav==='ambiguous'?['notification_navigation','メール通知への移動先が複数あり、特定できません']:
+    nav==='disabled'?['notification_navigation','メール通知のタブが操作できない状態です']:
+    nav==='missing' && state==='missing'?['notification_navigation','メール通知へのリンク・タブを読み取れません']:
+    reasons[state]||reasons.missing;
+  return {reason:detail[0],message:'「クリエイターからの招待・プレゼント」の設定を確認待ち：'+detail[1]+'。OFFとは判定していません。'};
+}
 async function prepareJoinAccount520(io,target,id,steps,mark,mayAct) {
   const {command,evaluate,blocked,poll}=io;
   const identity=async()=>{const who=await evaluate(noteIdentityJS);return who?.id===id && who.name==='43__' && !blocked() && await mayAct();};
-  const code=recommendationControlJS.replace('account|reaction|reactions','account|notification|notifications');
+  const code=recommendationControlJS;
   const labels=['クリエイターからの招待・プレゼント'];
+  const paths=['/settings/account','/settings/notification','/settings/notifications'],visited=[noteSettingsURL];
+  let observed='missing',navigation='',tabNavigation=false,moved=false;
   await command('Page.navigate',{url:noteSettingsURL});
-  const read=()=>evaluate('('+code+')('+JSON.stringify(labels)+',"read")');
+  const control=action=>evaluate('('+code+')('+JSON.stringify(labels)+','+JSON.stringify(action)+','+JSON.stringify(paths)+')');
+  const read=async()=>{try {
+    if(tabNavigation){
+      const path=await evaluate(`(()=>location.origin==='https://note.com' && /^\\/settings\\/[a-zA-Z0-9/_-]+\\/?$/.test(location.pathname)?location.pathname.replace(/\\/$/,''):null)()`);
+      if(path && !paths.includes(path))paths.push(path);
+    }
+    observed=await control('read');return observed;
+  }catch(error){observed='script_error';throw error;}};
   let state=await poll(read,v=>['on','off'].includes(v));
-  if(!state && !blocked()){
-    const url=await evaluate(`(()=>{if(location.origin!=='https://note.com'||!location.pathname.startsWith('/settings/'))return null;
-      const xs=[...document.querySelectorAll('a[href]')].filter(a=>a.getClientRects().length && ['通知','通知設定','メール通知'].includes(a.textContent.trim()));
-      const urls=[...new Set(xs.map(a=>a.href).filter(h=>{const u=new URL(h);return u.origin===location.origin&&/^\\/settings\\/(?:notification|notifications)\\/?$/.test(u.pathname)}))];
-      return urls.length===1?urls[0]:null;})()`);
-    if(url)await command('Page.navigate',{url});
-    else await evaluate(`(()=>{if(location.origin!=='https://note.com'||!location.pathname.startsWith('/settings/'))return false;
-      const bs=[...document.querySelectorAll('[role=tab]')].filter(b=>b.getClientRects().length&&!b.disabled&&['通知','通知設定'].includes(b.textContent.trim()));
-      if(bs.length!==1)return false;bs[0].click();return true;})()`);
+  for(let hop=0;!state && !blocked() && hop<3 && ['missing','outside'].includes(observed);hop++){
+    let next;
+    try {next=await poll(async()=>{
+      try {const value=await evaluate('('+joinNotificationNavigationJS16930+')('+JSON.stringify(visited)+')');navigation=value?.state||'missing';return value;}
+      catch {observed='script_error';return {state:'script_error'};}
+    },value=>['navigate','tab','ambiguous','disabled','outside','script_error'].includes(value?.state));}
+    catch {observed='script_error';break;}
+    navigation=next?.state||navigation||'missing';
+    if(next?.state==='navigate'){
+      const url=new URL(next.url);
+      if(url.origin!=='https://note.com' || !/^\/settings\/[a-zA-Z0-9/_-]+\/?$/.test(url.pathname))break;
+      paths.push(url.pathname.replace(/\/$/,''));visited.push(url.href);
+      moved=true;
+      await command('Page.navigate',{url:url.href});
+    }else if(next?.state==='tab'){
+      visited.push('tab:'+next.label);
+      moved=true;
+      // A native tab may change the settings route. Accept only that observed
+      // same-origin settings path, then re-authenticate before trusting it.
+      tabNavigation=true;
+    }else break;
     state=await poll(read,v=>['on','off'].includes(v));
+    tabNavigation=false;
   }
-  if(!await identity())return {message:'招待通知の設定中に本人・待機状態を再確認待ち'};
+  if(!await identity())return {reason:'notification_identity',message:'招待通知の設定中に本人・待機状態を再確認待ち'};
   if(state==='off'){
-    if(steps.notify && steps.notify>Date.now()-D520)return {message:'招待通知の保存結果を再確認待ち（1日以内の再操作なし）'};
-    if(!await mark('notify'))return {message:'招待通知の変更を保留'};
-    const result=await evaluate('('+code+')('+JSON.stringify(labels)+',"enable")');
-    return {prepared:result==='clicked',message:'招待通知ONの操作を記録・次回に保存結果を確認'};
+    if(steps.notify && steps.notify>Date.now()-D520)return {reason:'notification_off',message:'招待通知はOFF。保存結果を再確認待ち（1日以内の再操作なし）'};
+    if(!await mark('notify'))return {reason:'notification_guard',message:'招待通知の変更を保留'};
+    const result=await control('enable');
+    if(result==='clicked')return {prepared:true,reason:'notification_saved',message:'招待通知ONの操作を記録・次回に保存結果を確認'};
+    if(result==='on')return {prepared:true,reason:'notification_saved',message:'招待通知はON。切り替えず、次回に保存状態を再確認'};
+    return joinNotificationFailure16930(result,navigation);
   }
-  if(state!=='on')return {message:'「クリエイターからの招待・プレゼント」の設定を確認待ち'};
+  if(state!=='on')return joinNotificationFailure16930(observed,moved && navigation==='missing'?'':navigation);
   if(!target.follow)return null;
   await command('Page.navigate',{url:'https://note.com/'+target.owner});
   const follow=action=>evaluate('('+BROWSER_SOURCES520.joinFollowDOM520+')('+JSON.stringify(target.owner)+','+JSON.stringify(action)+')');
