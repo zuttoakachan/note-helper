@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.33';
+const VERSION = 'v16.9.34';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1207,10 +1207,10 @@ export default {
     if (!original.ADMIN_KEY) return page('CloudflareのADMIN_KEYが設定されていません。','1',null,503);
     let slot = '1', action = '', message = '';
     try {
-      const body = await request.text();
-      if (body.length > 100000) return reply('入力が長すぎます。',false,413);
+      const body = await readAdminBody16934(request,100000);
       const form = new URLSearchParams(body);
-      if (form.get('key') !== original.ADMIN_KEY) return reply('管理用の鍵が違います。',false,403);
+      const denied=await adminKeyDenied16934(request,original,form.get('key'),(m,s)=>reply(m,false,s));
+      if(denied)return denied;
       slot = form.get('account') || '1';
       action = form.get('action');
       if (!SLOTS.includes(slot) || !['status','start','stop','check','save','settings','export','tg_pair','tg_connect','tg_test','tg_off'].includes(action)) return reply('操作を選んでください。',false,400);
@@ -1243,6 +1243,7 @@ export default {
       const settings=await getSettings(original);
       return page(await dashboard(original,settings,message),slot,settings);
     } catch (error) {
+      if(error instanceof AdminInputError16934)return reply(error.message,false,error.status);
       if (error instanceof Trouble) {
         try {
           const settings = await getSettings(original);
@@ -1277,6 +1278,11 @@ export class NoteScheduler {
   async fetch(request) {
     if (request) {
       const path = new URL(typeof request === 'string' ? request : request.url).pathname;
+      if(path==='/security/admin-key'){
+        if(request.method!=='POST')return deskJson({error:'Method not allowed'},405);
+        try{return deskJson(adminGuardDecision16934(this.ctx.storage,JSON.parse(await readAdminBody16934(request,2048))));}
+        catch{return deskJson({error:'Authentication guard unavailable'},503);}
+      }
       if(path==='/patrol/status')return Response.json(this.env[PATROL_LOCAL16931].read());
       if (path === '/desk/tick' || path === '/desk/admin' || path === '/desk/invitation') {
         this.desk ||= new Desk520(this.ctx.storage,this.env);
@@ -1449,8 +1455,9 @@ async function deskRoute(request,env) {
   try {
     let input,editing='';
     if(isForm){
-      const form=new URLSearchParams(await read520body(request,2000000));
-      if(form.get('key')!==env.ADMIN_KEY)return failure('管理用の鍵が違います。入力し直してください。',403);
+      const form=new URLSearchParams(await readAdminBody16934(request,2000000));
+      const denied=await adminKeyDenied16934(request,env,form.get('key'),failure);
+      if(denied)return denied;
       editing=form.get('edit_target')||'';
       if(['reserve_link','cancel_link','preview_link'].includes(form.get('work_action'))){
         const change=form.get('editing')||'';
@@ -1477,9 +1484,9 @@ async function deskRoute(request,env) {
         input={action:'status',offset};
       }
     }else{
-      if(request.headers.get('Authorization')!=='Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)))
-        return failure('管理用の鍵が違います。入力し直してください。',403);
-      input=JSON.parse(await read520body(request,2000000));
+      const denied=await adminKeyDenied16934(request,env,request.headers.get('Authorization'),failure,true);
+      if(denied)return denied;
+      input=JSON.parse(await readAdminBody16934(request,2000000));
     }
     if(!env.SCHEDULER)return failure('作品管理の保存先 SCHEDULER が設定されていません。',503);
     const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
@@ -1495,7 +1502,7 @@ async function deskRoute(request,env) {
     return deskPage(data,data.correctionMessage||(editing?'選んだ予約の日時を表示しました。':'記録を開きました。'),200,editing);
   } catch(e) {
     const bad=e instanceof Input520 || e instanceof SyntaxError;
-    return failure(e instanceof Input520?e.message:bad?'入力または応答の形式を確認できません。':'作品管理の保存先に接続できません。少し待ってから、もう一度開いてください。',bad?400:503);
+    return failure(e instanceof Input520?e.message:bad?'入力または応答の形式を確認できません。':'作品管理の保存先に接続できません。少し待ってから、もう一度開いてください。',e instanceof AdminInputError16934?e.status:bad?400:503);
   }
 }
 function xmlValue520(raw) {
@@ -6198,8 +6205,9 @@ async function tutaRoute520(request,env) {
   if(!env.ADMIN_KEY)return tutaPage520(null,'CloudflareのADMIN_KEYが設定されていません。',503);
   if(request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase()!=='application/x-www-form-urlencoded')return tutaPage520(null,'Tuta接続画面のボタンから操作してください。',415);
   try {
-    const form=new URLSearchParams(await read520body(request,24000));
-    if(form.get('key')!==env.ADMIN_KEY)return tutaPage520(null,'管理用の鍵が違います。',403);
+    const form=new URLSearchParams(await readAdminBody16934(request,24000));
+    const denied=await adminKeyDenied16934(request,env,form.get('key'),(m,s)=>tutaPage520(null,m,s));
+    if(denied)return denied;
     const actions={status:'tuta_status',connect:'tuta_connect',check:'tuta_check',off:'tuta_off',resume:'tuta_resume'};
     const action=form.get('action')||'status';
     need520(Object.hasOwn(actions,action),'操作を選んでください。');
@@ -6212,7 +6220,7 @@ async function tutaRoute520(request,env) {
     if(!data.tuta)throw Error('Tuta status');
     return tutaPage520(data.tuta,data.correctionMessage||'保存された確認結果を表示しました。接続成功かどうかは下の記録で確認してください。');
   } catch(error) {
-    return tutaPage520(null,error instanceof Input520?error.message:'作品管理の保存先に接続できません。保存済みかどうかは「接続結果を見る」で確認してください。',error instanceof Input520?400:503);
+    return tutaPage520(null,error instanceof Input520?error.message:'作品管理の保存先に接続できません。保存済みかどうかは「接続結果を見る」で確認してください。',error instanceof AdminInputError16934?error.status:error instanceof Input520?400:503);
   }
 }
 Object.assign(Desk520.prototype,{
@@ -8258,15 +8266,16 @@ async function productionTestRoute16920(request,env){
   if(request.headers.get('Origin')!==new URL(request.url).origin)return fail('操作画面を開き直してください。',403);
   if(!env.ADMIN_KEY || !env.SCHEDULER)return fail('ADMIN_KEY・SCHEDULERの設定を確認してください。',503);
   try{
-    const f=new URLSearchParams(await read520body(request,20000));
-    if(f.get('key')!==env.ADMIN_KEY)return fail('管理用の鍵が違います。',403);
+    const f=new URLSearchParams(await readAdminBody16934(request,20000));
+    const denied=await adminKeyDenied16934(request,env,f.get('key'),fail);
+    if(denied)return denied;
     if(!['run','status'].includes(f.get('action')))return fail('操作を選んでください。',400);
     const slot=f.get('account')||'1';if(!SLOTS.includes(slot))return fail('アカウントを選んでください。',400);
     const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:f.get('action')==='run'?'production_test_start':'production_test_status',slot})}));
     if(!res.ok)return fail('テストの記録に接続できません。処理を開始済みの場合は「結果を確認」で確認してください。',503);
     const view=await res.json();
     return json?deskJson(view):productionTestPage16920(view);
-  }catch{return fail('接続・保存を確認できません。「結果を確認」で保存済みの結果を確認してください。',503);}
+  }catch(error){return fail(error instanceof AdminInputError16934?error.message:'接続・保存を確認できません。「結果を確認」で保存済みの結果を確認してください。',error instanceof AdminInputError16934?error.status:503);}
 }
 function productionTestText16920(v){
   if(!v?.started)return 'テストの記録はまだありません。';
@@ -9997,4 +10006,94 @@ function reachRecord16933(v){
         }).join('\n'):'\n旧作の比較記録はまだありません。');
     }).join('\n\n'):'\n本人確認後、既存の取得枠内で記録を始めます。')+
     '\n初回のスキ数は増加に数えません。巡回の評価に加えるのは、前回の全件確認時にはいなかった相手のスキを、送信確認後に観測できた場合だけです。部分取得や失敗を反応0と扱いません。候補選択は送信成功ではなく、スキの原因・訪問経路は未確認です。';
+}
+
+// Management security is isolated from the patrol object and its alarms/history.
+// One private instance of the existing class; no binding or migration is added.
+const ADMIN_GUARD16934 = 'note-helper-admin-guard-16934';
+class AdminInputError16934 extends Input520 {
+  constructor(message,status=400){super(message);this.status=status;}
+}
+async function readAdminBody16934(request,limit,timeoutMs=10000){
+  const cancel=body=>{try{void body?.cancel().catch(()=>{});}catch{}};
+  if(Number(request.headers.get('Content-Length'))>limit){
+    cancel(request.body);throw new AdminInputError16934('入力が大きすぎます。1回の登録量を減らしてください。',413);
+  }
+  const reader=request.body?.getReader();
+  if(!reader)throw new AdminInputError16934('入力が空です。操作画面から送信してください。');
+  let timer,size=0,text='';
+  const decoder=new TextDecoder('utf-8',{fatal:true});
+  const deadline=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new AdminInputError16934('入力の受信が時間切れになりました。画面からもう一度操作してください。',408)),timeoutMs);});
+  try{
+    for(;;){
+      const {value,done}=await Promise.race([reader.read(),deadline]);
+      if(done)break;
+      size+=value.byteLength;
+      if(size>limit)throw new AdminInputError16934('入力が大きすぎます。1回の登録量を減らしてください。',413);
+      text+=decoder.decode(value,{stream:true});
+    }
+    return text+decoder.decode();
+  }catch(error){
+    cancel(reader);
+    if(error instanceof AdminInputError16934)throw error;
+    throw new AdminInputError16934('入力を読み取れません。操作画面からもう一度送信してください。');
+  }finally{clearTimeout(timer);reader.releaseLock();}
+}
+async function adminSameKey16934(provided,expected){
+  const encoder=new TextEncoder();
+  const [a,b]=await Promise.all([provided,expected].map(s=>crypto.subtle.digest('SHA-256',encoder.encode(s))));
+  if(typeof crypto.subtle.timingSafeEqual==='function')return crypto.subtle.timingSafeEqual(a,b);
+  // Standards-only runtime fallback: use native HMAC verification, not a string
+  // comparison or a JavaScript byte loop with secret-dependent early exits.
+  const key=await crypto.subtle.importKey('raw',b,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
+  return crypto.subtle.verify('HMAC',key,await crypto.subtle.sign('HMAC',key,a),b);
+}
+async function adminKeyDenied16934(request,env,provided,reject,bearer=false){
+  try{
+    if(!env.SCHEDULER || typeof env.ADMIN_KEY!=='string' || !env.ADMIN_KEY)
+      return reject('管理画面の認証を確認できません。SCHEDULER・ADMIN_KEYの設定を確認してください。',503);
+    const expected=bearer?'Bearer '+b64(new TextEncoder().encode(env.ADMIN_KEY)):env.ADMIN_KEY;
+    const candidate=typeof provided==='string'&&provided.length<=32768?provided:'';
+    const valid=await adminSameKey16934(candidate,expected);
+    // Cloudflare supplies this header. Do not trust caller-selected forwarding
+    // headers. Persist only a keyed digest; never the IP, key or submitted value.
+    const raw=request.headers.get('CF-Connecting-IP')||'';
+    const ip=raw.length>0&&raw.length<=128?raw:'unknown';
+    const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.ADMIN_KEY),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+    const digest=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode('note-helper:admin-ip:v1\0'+ip));
+    const client=Array.from(new Uint8Array(digest),x=>x.toString(16).padStart(2,'0')).join('');
+    const stub=env.SCHEDULER.get(env.SCHEDULER.idFromName(ADMIN_GUARD16934));
+    const response=await stub.fetch(new Request('https://scheduler.internal/security/admin-key',{
+      method:'POST',body:JSON.stringify({client,valid})}));
+    if(!response.ok)throw Error('guard unavailable');
+    const verdict=await response.json();
+    if(verdict?.allowed===true&&valid)return null;
+    if(verdict?.allowed!==false)throw Error('guard response');
+    if(Number.isSafeInteger(verdict.retry)&&verdict.retry>0&&verdict.retry<=900){
+      const result=reject('管理用の鍵の入力失敗が続いたため、この接続元からの操作を一時停止しています。'+Math.ceil(verdict.retry/60)+'分後に再度お試しください。',429);
+      result.headers.set('Retry-After',String(verdict.retry));return result;
+    }
+    if(valid)throw Error('guard response');
+    return reject('管理用の鍵が違います。入力し直してください。',403);
+  }catch{return reject('管理画面の認証を確認できません。保存・操作は実行していません。少し待ってから再度お試しください。',503);}
+}
+function adminGuardDecision16934(storage,input,now=Date.now()){
+  if(!input||typeof input.valid!=='boolean'||!/^([a-f0-9]{64})$/.test(input.client||''))throw Error('guard input');
+  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
+  rows('CREATE TABLE IF NOT EXISTS admin_guard16934(client TEXT PRIMARY KEY,failures INTEGER NOT NULL,first_at INTEGER NOT NULL,blocked_until INTEGER NOT NULL,expires INTEGER NOT NULL)');
+  rows('CREATE INDEX IF NOT EXISTS admin_guard_expiry16934 ON admin_guard16934(expires)');
+  return storage.transactionSync(()=>{
+    rows('DELETE FROM admin_guard16934 WHERE client IN (SELECT client FROM admin_guard16934 WHERE expires<=? ORDER BY expires LIMIT 64)',now);
+    const row=rows('SELECT * FROM admin_guard16934 WHERE client=?',input.client)[0];
+    // Blocked attempts do not extend the deadline. Legitimate requests from
+    // another address and all scheduled patrols continue independently.
+    if(row?.blocked_until>now)return {allowed:false,retry:Math.min(900,Math.ceil((row.blocked_until-now)/1000))};
+    if(input.valid){if(row)rows('DELETE FROM admin_guard16934 WHERE client=?',input.client);return {allowed:true};}
+    const active=row&&row.first_at>now-600000;
+    const failures=active?row.failures+1:1,first=active?row.first_at:now;
+    const blocked=failures>=8?now+900000:0;
+    if(!row&&rows('SELECT COUNT(*) n FROM admin_guard16934')[0].n>=2048)return {allowed:false,retry:60};
+    rows('INSERT INTO admin_guard16934 VALUES(?,?,?,?,?) ON CONFLICT(client) DO UPDATE SET failures=excluded.failures,first_at=excluded.first_at,blocked_until=excluded.blocked_until,expires=excluded.expires',input.client,failures,first,blocked,blocked||first+600000);
+    return {allowed:false,retry:blocked?900:0};
+  });
 }
