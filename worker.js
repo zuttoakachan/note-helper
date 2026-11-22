@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.35';
+const VERSION = 'v16.9.36';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -285,7 +285,7 @@ async function telegram(env, method, body) {
     throw new Trouble('Telegram通信エラー：'+reason+'。トークン不正かどうかは未確認です');
   }
   let data;
-  try { data = await response.json(); }
+  try { data = JSON.parse(await read520body(response,2*1024*1024)); }
   catch {
     throw new Trouble('Telegram応答エラー：HTTP '+response.status+'。JSON形式の応答を取得できませんでした。トークンの正否は未確認です', 'notification', 0, response.status);
   }
@@ -319,12 +319,20 @@ async function telegramAction(env, action) {
   const row = await sql(env,'SELECT * FROM nh_v14_telegram WHERE id=1').first();
   if (action === 'tg_connect') {
     if (!row.nonce || row.expires<Date.now()) return '連携コードを発行し直してください。';
-    const updates = await telegram(env,'getUpdates',{timeout:0,limit:100,allowed_updates:['message']});
-    const match = updates.find(u=>{
-      const m=u.message;
-      return m?.chat?.type==='private' && !m.from?.is_bot && String(m.chat.id)===String(m.from?.id) &&
-        m.text?.trim()==='/start '+row.nonce && m.date*1000>=row.expires-15*60000;
-    });
+    let match=null,offset;
+    for(let page=0;page<4 && !match;page++){
+      const updates=await telegram(env,'getUpdates',{timeout:0,limit:100,allowed_updates:['message'],...(offset===undefined?{}:{offset})});
+      if(!Array.isArray(updates))throw new Trouble('Telegramの連携確認の応答形式を確認できません','notification');
+      match=updates.find(u=>{
+        const m=u.message;
+        return m?.chat?.type==='private' && !m.from?.is_bot && String(m.chat.id)===String(m.from?.id) &&
+          m.text?.trim()==='/start '+row.nonce && m.date*1000>=row.expires-15*60000;
+      });
+      if(match || updates.length<100)break;
+      const last=Math.max(...updates.map(u=>Number.isSafeInteger(u.update_id)?u.update_id:-1));
+      if(last<0 || (offset!==undefined && last<offset))break;
+      offset=last+1;
+    }
     if (!match) return '連携コードのメッセージが見つかりません。自分のBotの個人チャットに表示された /start の行を送信してから、再確認してください。';
     const result = await sql(env,"UPDATE nh_v14_telegram SET chat_id=?,nonce='',expires=0,message='連携済み。通知テストを押してください' WHERE id=1 AND nonce=? AND expires>=?",String(match.message.chat.id),row.nonce,Date.now()).run();
     return result.meta.changes ? 'Telegramと連携しました。「通知をテスト」を押してください。' : 'コードが期限切れか更新済みです。連携コードを発行し直してください。';
@@ -443,7 +451,7 @@ async function api(env, path, post = false, referer = 'https://note.com/') {
   }
   if (post) { await response.body?.cancel().catch(() => {}); return; }
   try {
-    const json = await response.json(), data = json?.data ?? json;
+    const json = JSON.parse(await read520body(response,3*1024*1024)), data = json?.data ?? json;
     if (!data || typeof data !== 'object') throw new Error();
     return data;
   } catch { throw new Trouble('応答形式を確認できません', 'response'); }
@@ -938,13 +946,13 @@ async function run(original,slot) {
     await auxiliaryWrites16917(env,'metrics',()=>learningPersist16913(env));
     if(trace.auxFault)message+='／追加機能だけ保留（AUX17/'+trace.auxFault.component+'/'+trace.auxFault.reason+'）';
     const nextAt=Date.now()+(settings?.interval_seconds*1000 || INTERVAL);
-    await env.DB.batch([
+    const saved=await env.DB.batch([
       ...metrics(),
       ...statItems(env,activeTag,success ? 'sent' : 'skips'),
       sql(env,'UPDATE nh_control SET message=?,next_at=? WHERE id=1 AND token=?',message,nextAt,token),
-      sql(env,"UPDATE nh_health SET errors=CASE WHEN ? THEN 0 ELSE errors END,kind='',rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END,success_at=CASE WHEN ? THEN ? ELSE success_at END WHERE id=1",+success,+success,+success,Date.now())
+      sql(env,"UPDATE nh_health SET errors=CASE WHEN ? THEN 0 ELSE errors END,kind='',rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END,success_at=CASE WHEN ? THEN ? ELSE success_at END WHERE id=1 AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=?)",+success,+success,+success,Date.now(),token)
     ]);
-    patrol={...patrol,outcome:success?'success':'skipped',next_at:nextAt,wait_saved:true};
+    patrol={...patrol,outcome:success?'success':'skipped',next_at:nextAt,wait_saved:!!saved.at(-2)?.meta?.changes};
   };
   try {
     const snapshot=await runSnapshot16913(env);
@@ -952,19 +960,23 @@ async function run(original,slot) {
     checkingSend = Boolean(state.inflight);
     env = await loadCookie(env,state.account);
     if (await account(env)!==state.account) throw new Trouble('登録済みのnoteとログイン情報が一致しません','auth');
-    await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0',slot).run();
+    await sql(env,'UPDATE nh_v14_alerts SET pending=0 WHERE slot=? AND pending<>0 AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=?)',slot,token).run();
     if (state.inflight) {
       stage='前回送信の確認';
       const data=await article(env,state.inflight), liked=likeState16928(data);
       const before=await sql(env,'SELECT status FROM nh_seen WHERE key=?',state.inflight).first();
       const add=liked && before?.status!=='liked';
+      const at=Date.now(),guard='EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=? AND lease>? AND account=? AND inflight=?)';
+      const ownership=[token,at,state.account,state.inflight];
       const items=[
-        sql(env,'INSERT INTO nh_seen VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET status=excluded.status',state.inflight,liked?'liked':'uncertain',Date.now()),
-        sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=?",+add,token),
-        sql(env,"UPDATE nh_v1697_discovery SET readers=readers+?,reader_pending='',message=? WHERE slot=? AND reader_pending=?",+add,liked?'前回の読者経由の記事スキを確認':'前回の読者経由の記事は再送せず除外',slot,state.inflight)
+        sql(env,'INSERT INTO nh_seen SELECT ?,?,? WHERE '+guard+' ON CONFLICT(key) DO UPDATE SET status=excluded.status',state.inflight,liked?'liked':'uncertain',at,...ownership),
+        sql(env,"UPDATE nh_v1697_discovery SET readers=readers+?,reader_pending='',message=? WHERE slot=? AND reader_pending=? AND "+guard,+add,liked?'前回の読者経由の記事スキを確認':'前回の読者経由の記事は再送せず除外',slot,state.inflight,...ownership)
       ];
-      if (add) { items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,state.inflight,day(),Date.now())); bump('recovered'); }
-      await env.DB.batch(items);
+      if(add)items.push(sql(env,'INSERT OR IGNORE INTO nh_v13_success SELECT ?,?,?,? WHERE '+guard,slot,state.inflight,day(),at,...ownership));
+      items.push(sql(env,"UPDATE nh_control SET inflight='',total=total+? WHERE id=1 AND token=? AND lease>? AND account=? AND inflight=?",+add,...ownership));
+      const recovered=await env.DB.batch(items);
+      if(!recovered.at(-1)?.meta?.changes){patrol={...patrol,outcome:'skipped',stage:'前回送信の確認・使用権の終了'};return true;}
+      if(add)bump('recovered');
       await auxiliaryWrites16917(env,'confirmed',()=>learningConfirmed16913(env,state.inflight,liked));
       await finish(liked?'前回の記事のスキを確認しました。次回から候補を確認します':'前回の記事は再送せず除外しました',liked);
       return true;
@@ -1114,14 +1126,14 @@ async function run(original,slot) {
     const message=(retryRead || retryInternal ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error)+
       (!(error instanceof Trouble)?'（RUN17/'+auxReason16917(error)+'）':'');
     bump('errors');
-    await env.DB.batch([
+    const saved=await env.DB.batch([
       ...metrics(), ...statItems(env,activeTag,'errors'),
-      sql(env,'UPDATE nh_health SET rate_fail=?,errors=?,kind=? WHERE id=1',rates,errors,kind),
+      sql(env,'UPDATE nh_health SET rate_fail=?,errors=?,kind=? WHERE id=1 AND EXISTS(SELECT 1 FROM nh_control WHERE id=1 AND token=?)',rates,errors,kind,token),
       sql(env,'UPDATE nh_control SET next_at=?,message=? WHERE id=1 AND token=?',Date.now()+wait,message,token),
       sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+serverWait,slot)
     ]);
-    patrol.wait_saved=true;
-    if (['auth','config'].includes(kind)) await queueAlert(env,kind,message);
+    patrol.wait_saved=!!saved.at(-2)?.meta?.changes;
+    if (patrol.wait_saved && ['auth','config'].includes(kind)) await queueAlert(env,kind,message);
     return true;
   } finally {
     try {await release(env,token);}
@@ -1876,9 +1888,9 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
     const identity=await evaluate(noteIdentityJS);
     if(blocked())return blockedResult();
     if(identity?.id!==accountId || identity?.name!=='43__')return {message:'520本人を確認できず・変更なし'};
-    if(state==='on')return {message:lastAttempt?'ONを再確認済み':'すでにON・本人の設定で確認済み',done:true};
+    if(state==='on')return {message:lastAttempt?'ONを再確認済み':'すでにON・本人の設定で確認済み',done:true,observed:true};
     const retryAt=lastAttempt+Math.min(7,2**Math.min(3,Math.max(0,tries-1)))*D520;
-    if(lastAttempt && Date.now()<retryAt)return {message:'再確認時はOFF・間隔を空けて自動再試行',retryAt};
+    if(lastAttempt && Date.now()<retryAt)return {message:'再確認時はOFF・間隔を空けて自動再試行',retryAt,observed:true};
     if(blocked())return blockedResult();
     // A crash after clicking must never blindly toggle the setting a second time.
     if(!await markAttempt())return {message:'停止・待機または本人の処理期限により設定変更を保留'};
@@ -1887,7 +1899,7 @@ async function browserRecommendation(binding, accountId, cookie, lastAttempt, tr
     await pause520(1400);
     if(blocked())return blockedResult();
     // Verification is a separate Cron run and a separately acquired browser session.
-    return {message:'ON操作済み・別のブラウザー起動で保存結果を確認待ち',verify:true};
+    return {message:'ON操作済み・別のブラウザー起動で保存結果を確認待ち',verify:true,observed:true};
   });
 }
 const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
@@ -2069,19 +2081,20 @@ async function readDraftCover(key,accountId,hashBody) {
 async function inspectDraftDirectory(binding,cookie,id,queries){
   return inNoteBrowser(binding,cookie,false,async ({command,evaluate,blocked,blockedResult})=>{
     let url='https://note.com/notes';
+    const end=Date.now()+30000;
     const pages=new Set(),found=queries.map(()=>new Map()),uncertain=new Set();
     for(let page=0;url && page<4;page++){
       if(pages.has(url))break;
       pages.add(url);
       await command('Page.navigate',{url});
       let loaded=false;
-      for(let n=0;n<6 && !blocked();n++){
+      for(let n=0;n<40 && !blocked() && Date.now()<end;n++){
         try{loaded=await evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')');}catch{}
         if(loaded)break;
-        await pause520(180);
+        await pause520(200);
       }
       if(blocked())return blockedResult();
-      if(!loaded)return {};
+      if(!loaded)return {retryable:true,message:'下書き一覧の読み込み待ち'};
       const who=await evaluate(noteIdentityJS);
       if(blocked())return blockedResult();
       if(who?.id!==id || who.name!=='43__')return {};
@@ -2121,7 +2134,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
     let cover=null,hash=null;
     const page=job.kind==='publish'?'https://note.com/notes':'https://note.com/43__/n/'+job.key;
     await navigate(page);
-    const identity=await poll(()=>evaluate(noteIdentityJS),v=>!!v);
+    const identity=await poll(()=>evaluate(noteIdentityJS),v=>!!v,40);
     if(blocked())return blockedResult();
     if(identity?.id!==accountId || identity.name!=='43__')return {message:'520本人のログインを確認待ち'};
     let finalStep;
@@ -2144,7 +2157,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
         visited.add(url);
         if(i)await navigate(url);
         // Wait for this exact page's article list to mount before reading its next link.
-        const loaded=await poll(()=>evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')'),v=>v===true);
+        const loaded=await poll(()=>evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')'),v=>v===true,40);
         if(!loaded)return blocked()?blockedResult():{message:'下書きの一覧を読み込み待ち'};
         const result=await frame('findDraft',arg);
         if(result?.state==='found'){
@@ -2710,6 +2723,7 @@ class Desk520 {
     };
     const [c,[rss,a]]=await Promise.all([creator(),feed()]);
     this.rows('UPDATE desk_probe SET rss=?,creator=?,article=? WHERE id=1',rss,c,a);
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   registerEntries(entries,now,alreadyStored=false) {
     const since=this.one('SELECT started FROM desk_growth WHERE id=1').started;
@@ -2779,6 +2793,7 @@ class Desk520 {
     if(expired) value=null;
     const state=value!==null?'記録済み':expired?'欠測':'再確認待ち';
     this.rows('INSERT INTO desk_follower(d,value,at,state) VALUES(?,?,?,?) ON CONFLICT(d) DO UPDATE SET value=excluded.value,at=excluded.at,state=excluded.state',d,value,value===null?null:at,state);
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async measure(now) {
     this.rows("UPDATE desk_sample SET state='欠測' WHERE state='待機' AND due<=?",now-WINDOW520);
@@ -2796,6 +2811,7 @@ class Desk520 {
         } catch {}
       }));
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   initGrowth(now) {
     this.storage.transactionSync(()=>{
@@ -2884,13 +2900,14 @@ class Desk520 {
     });
     if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
     const cfg=this.one('SELECT enabled,due FROM desk_directory WHERE id=1');
-    if(cfg.enabled && cfg.due<=now){await this.discoverMagazines(now);return;}
+    if(cfg.enabled && cfg.due<=now)return await this.discoverMagazines(now);
     const inspect=this.one(`SELECT i.id,i.url,i.managed,i.name,CASE WHEN o.id IS NULL THEN sc.id END AS scouted
       FROM desk_member m JOIN desk_import i ON i.id=m.id LEFT JOIN desk_scout_mag sc ON sc.id=m.id
       LEFT JOIN desk_owner_source o ON o.id=m.id WHERE m.mode IN ('check','auto') AND m.due<=?
       ORDER BY (m.mode='auto') DESC,(o.id IS NULL),(sc.id IS NOT NULL),m.due,m.id LIMIT 1`,now);
     const rule=this.one('SELECT id,due FROM desk_import WHERE allowed=1 AND due<=? ORDER BY due,id LIMIT 1',now);
     // Alternate when both queues are non-empty; large public lists cannot starve rule updates.
+    if(!inspect && !rule)return;
     if(inspect && (!rule || (!inspect.scouted && (Math.floor(now/(4*M520))%2)===0))){
       await this.checkEditorial(inspect,now);
       // An observed issue is evidence of publication, independently of 520's editorial rights.
@@ -2899,6 +2916,7 @@ class Desk520 {
         this.recordReferences(items,noteLink161(inspect.url),inspect.name,Date.now());
       }catch{}
     }else if(rule)await this.reviewMagazine(rule.id,now);
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   linkObserved(work) {
     const start=jstStart(work.d);
@@ -2998,6 +3016,7 @@ class Desk520 {
       this.rows('UPDATE desk_catalog SET due=?,message=? WHERE id=1',now+HOUR,page+'ページ目を取得できません（'+publicReadReason(error)+'）。RSSと公開ページでも作品を確認します。');
       await this.archiveLinks(now);
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async archiveLinks(now){
     const c=this.one('SELECT page,due FROM desk_public_pages WHERE id=1');
@@ -3056,6 +3075,7 @@ class Desk520 {
       if(error instanceof PublicReadError && /HTTP (404|410)$/.test(error.message)) this.rows('DELETE FROM desk_reaction_work WHERE article=?',a.article);
       this.rows("UPDATE desk_archive SET due=?,state='詳細取得待ち',verified=0 WHERE article=?",now+D520,a.article);
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   archiveFits(article,magazines,now) {
     if(!article.verified || article.verified<now-8*D520)return [];
@@ -3081,6 +3101,7 @@ class Desk520 {
       const pick=this.chooseMagazine520(fits,genre,now,row);
       this.rows('UPDATE desk_archive SET pick_due=?,pick_rev=?,choice=? WHERE article=?',now+(pick?D520:HOUR),rev,pick?.url??null,article);
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   archivePage(offset,now) {
     const magazines=this.eligibleMags(now);
@@ -3358,6 +3379,7 @@ class Desk520 {
         }
       }
     }finally{if(lease)await release(base,lease);}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async resolveDraftDirectory(now){
     if(browserWait16916(this.env.BROWSER))return;
@@ -3377,7 +3399,7 @@ class Desk520 {
     if(this.publicationPriority16916(Date.now()))return;
     this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',now+HOUR);
     const result=await inspectDraftDirectory(this.env.BROWSER,cleanCookie(env.NOTE_SESSION),a.id,[...works,...links]);
-    if(result.browserDeferred)this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',Math.max(Date.now()+M520,result.retryAt));
+    if(result.browserDeferred || result.retryable)this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',browserRetryAt16936(result));
     if(result.hold){
       this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',now+result.hold);
       await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',now+result.hold,a.slot).run();
@@ -3393,6 +3415,7 @@ class Desk520 {
       }
     });
     }finally{await release(base,lease);}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async previewDraft(key,now,expected=null){
     need520(typeof key==='string' && /^n[a-z0-9]{1,64}$/.test(key),'下書きの共有用リンクを確認してください。');
@@ -3564,6 +3587,7 @@ class Desk520 {
       if(job.kind==='mag')this.rows("UPDATE desk_archive SET mag_due=MAX(mag_due,?) WHERE article=? AND EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND subject=? AND phase='wait')",Date.now()+5*M520,job.key,job.subject);
       }finally{if(lease)await release(env,lease);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   recordReactionTitle(key,title,pub,now) {
     if (!/^n[a-z0-9]{1,64}$/.test(key) || !text520(title,300) || !Number.isFinite(pub) || pub<=0 || pub>now) return;
@@ -3627,6 +3651,10 @@ class Desk520 {
       };
       const result=await syncArticleReactionSettings(this.env.BROWSER,account.id,cookie,titles,maySave,reserve);
       message=result.message;
+      if(result.browserDeferred){
+        this.rows('UPDATE desk_reactions SET used=MAX(0,used-1) WHERE id=1 AND utc_day=?',day);
+        due=browserRetryAt16936(result);return;
+      }
       if (Number.isSafeInteger(result.limit) && result.limit>0) this.rows('UPDATE desk_reactions SET char_limit=? WHERE id=1',Math.min(result.limit,300));
       if (result.verified) {
         this.rows("UPDATE desk_reactions SET confirmed=?,checked=?,pending='' WHERE id=1",desired,Date.now());
@@ -3648,6 +3676,7 @@ class Desk520 {
       try{this.rows('UPDATE desk_reactions SET message=?,due=? WHERE id=1',message,due);}
       finally{if(token)await release(env,token);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async ensureRecommendation(now) {
     if(browserWait16916(this.env.BROWSER))return;
@@ -3663,7 +3692,7 @@ class Desk520 {
     }
     // Reserve the work locally before any await; network errors survive restarts.
     this.rows("UPDATE desk_recommend SET due=?,message='520のおすすめ設定を確認中' WHERE id=1",now+HOUR);
-    let message='520の登録・接続状態を確認できず・再確認待ち',due=now+6*HOUR,done=0,recommendEnv,recommendLease;
+    let message='520の登録・接続状態を確認できず・再確認待ち',due=now+6*HOUR,done=state.done,checked=state.checked,recommendEnv,recommendLease;
     try {
       let profile;
       try {profile=(await this.publicRead('https://note.com/api/v2/creators/43__','json'))?.data;} catch {}
@@ -3699,7 +3728,12 @@ class Desk520 {
         this.rows("UPDATE desk_recommend SET attempted=?,tries=tries+1,message='ON操作の保存結果を確認待ち' WHERE id=1",at);
         return true;
       });
-      message=result.message;done=Number(!!result.done);
+      message=result.message;
+      if(result.browserDeferred){
+        this.rows('UPDATE desk_recommend SET used=MAX(0,used-1) WHERE id=1 AND utc_day=?',today);
+        due=browserRetryAt16936(result);return;
+      }
+      if(result.observed){done=Number(!!result.done);checked=Date.now();}
       due=result.retryAt??(now+(result.verify?4*M520:D520));
       if(result.hold>0){
         due=Math.max(due,Date.now()+result.hold);
@@ -3709,9 +3743,10 @@ class Desk520 {
     } catch(error) {
       if(readLimit(error)){message='D1の読み取り枠更新後に再確認';due=(Math.floor(now/D520)+1)*D520+60000;}
     } finally {
-      try{this.rows('UPDATE desk_recommend SET done=?,due=?,message=?,checked=? WHERE id=1',done,due,message,Date.now());}
+      try{this.rows('UPDATE desk_recommend SET done=?,due=?,message=?,checked=? WHERE id=1',done,due,message,checked);}
       finally{if(recommendLease)await release(recommendEnv,recommendLease);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async frontPageBackup(now) {
     const row=this.one('SELECT fallback_at FROM desk_recommend WHERE id=1');
@@ -3727,6 +3762,7 @@ class Desk520 {
       const newDue=this.storage.transactionSync(()=>this.registerEntries(entries,now));
       if(newDue)await this.measure(Date.now());
     } catch {}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   async verifyLinkCover(now){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
@@ -3758,9 +3794,12 @@ class Desk520 {
         this.rows('UPDATE '+table+' SET result=?,check_at=? WHERE article=?',result,!expired && (after===null || (proof && !actualHash))?now+HOUR:null,p.article);
       });
     }catch{ /* A failed read leaves the result unknown; it never queues another publication. */ }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
   taskHealth16928(name,failed,message=''){
     const at=Date.now();
+    this.taskHealthEpoch16936 ||= new Map();
+    if(failed)this.taskHealthEpoch16936.set(name,(this.taskHealthEpoch16936.get(name)||0)+1);
     try{
       if(failed)this.rows('INSERT INTO desk_task_health(task,at,failed,message) VALUES(?,?,1,?) ON CONFLICT(task) DO UPDATE SET at=excluded.at,failed=1,message=excluded.message',name,at,message);
       else this.rows("UPDATE desk_task_health SET failed=0,at=?,message='' WHERE task=? AND failed<>0",at,name);
@@ -3781,13 +3820,14 @@ class Desk520 {
   }
   async task520(name, work) {
     let result;
+    const epoch=this.taskHealthEpoch16936?.get(name)||0;
     try {result=await work();}
     catch(error) {
       const message=readLimit(error)?'D1の読み取り枠更新待ち':error instanceof PublicReadError?publicReadReason(error):'読み取り・保存・接続の途中で失敗しました。次回に再確認します';
       this.taskHealth16928(name,true,message);
       return null;
     }
-    this.taskHealth16928(name,false);
+    if(result!==undefined && result!==null && (this.taskHealthEpoch16936?.get(name)||0)===epoch)this.taskHealth16928(name,false);
     return result;
   }
   async tick() {
@@ -3848,6 +3888,7 @@ class Desk520 {
     if(hourly || magUpdated || cfg.rss_at>0 && cfg.rss_at<=now) this.match(now);
     if(hourly) this.weekly(Date.now());
     if(!cfg.tick_at || jstDay(cfg.tick_at)!==jstDay(now)) this.planTimes(now);
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 }
 // Keep only JPEG image-coding segments. Drop APP0–APP15, COM and everything after EOI.
@@ -4218,8 +4259,8 @@ function deskRecordText(s) {
   if(s.reactions) {
     const r=s.reactions;
     lines.push('【記事にスキした読者へのお礼】'+(s.deliveryOn && s.cfg.enabled?'':'（自動更新は休止中）'),
-      r.message,'更新候補　'+(JSON.parse(r.desired).join(' ／ ')||'公開作品の取得待ち'));
-    if(r.checked)lines.push('noteで最後に確認したタイトル（'+tm(r.checked)+'）　'+JSON.parse(r.confirmed).join(' ／ '));
+      r.message,'更新候補　'+(savedList16936(r.desired,v=>typeof v==='string').join(' ／ ')||'公開作品の取得待ち'));
+    if(r.checked)lines.push('noteで最後に確認したタイトル（'+tm(r.checked)+'）　'+savedList16936(r.confirmed,v=>typeof v==='string').join(' ／ '));
   }
   if(s.magazineProgress){
     const p=s.magazineProgress;
@@ -5044,11 +5085,12 @@ Object.assign(Desk520.prototype,{
     const c=this.one('SELECT enabled,mail_at,due FROM desk_join_cfg WHERE id=1');
     const blocked=this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked;
     const applicationAt=this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next;
-    const items=this.rows(`SELECT t.definition,j.phase,j.at,j.message,j.proof,j.due,c.checked,c.reason,
+    const items=this.rows(`SELECT t.id,t.definition,j.phase,j.at,j.message,j.proof,j.due,c.checked,c.reason,
       EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') invitation
       FROM desk_join_target t JOIN desk_join j ON j.id=t.id LEFT JOIN desk_join_check16930 c ON c.id=j.id
       ORDER BY j.at DESC,j.id LIMIT 40`).map(row=>{
-      const target=JSON.parse(row.definition);
+      const target=savedJson16936(row.definition,null,t=>t?.id===row.id && validJoinTarget520(t));
+      if(!target)return {phase:row.phase,at:row.at,message:'保存された参加先の情報を読み戻せず・操作保留',proof:0,name:row.id,rule:'',comment:'',active:false,checked:0,reason:'saved_data',restricted:true,nextAt:0};
       return {phase:row.phase,at:row.at,message:row.message,proof:row.proof,name:target.name,rule:target.rule,comment:target.comment,active:this.joinActive520(target.id),
         checked:row.checked||0,reason:row.reason||'',restricted:!!target.restricted,
         nextAt:Math.max(row.due||0,c.due||0,blocked||0,row.phase==='wait'&&!row.invitation?applicationAt||0:0)};
@@ -5179,6 +5221,10 @@ Object.assign(Desk520.prototype,{
           });
         },live);
       probe?.result?.(result);
+      if(result.browserDeferred && !attempt){
+        this.rows('UPDATE desk_join_cfg SET used=MAX(0,used-1),due=? WHERE id=1 AND day=?',browserRetryAt16936(result),today);
+        reason='browser_wait';message=result.message;due=browserRetryAt16936(result);return;
+      }
       reason=result.reason || (result.joined?'joined':result.existing?'invitation_wait':result.sent?'application_sent':result.hold?'server_wait':result.noFollow?'follow_required':'browser_check');
       message=result.message;due=Date.now()+(result.noFollow?30*D520:attempt||result.prepared?4*M520:kind==='check'||kind==='verify'?6*HOUR:2*HOUR);
       this.storage.transactionSync(()=>{
@@ -5211,6 +5257,7 @@ Object.assign(Desk520.prototype,{
       }
       finally{if(lease)await release(env,lease);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 });
 function joinRecord520(j) {
@@ -5516,7 +5563,7 @@ Object.assign(Desk520.prototype,{
     if(!ids.length){
       // Opaque links can be matched only against actual, outstanding applications, not the entire discovered web.
       targets=this.rows("SELECT t.definition FROM desk_join_target t JOIN desk_join j ON j.id=t.id WHERE j.phase IN ('sent','applied','accepting') AND j.at>?",Date.now()-30*D520)
-        .map(r=>JSON.parse(r.definition)).filter(t=>validJoinTarget520(t)&&plain.includes(t.match));
+        .map(r=>savedJson16936(r.definition,null,t=>!!t&&validJoinTarget520(t))).filter(t=>t&&plain.includes(t.match));
     }
     targets=targets.filter(t=>plain.includes(t.match));
     need520(targets.length===1,'招待の対象誌を特定できません。');
@@ -5563,6 +5610,7 @@ Object.assign(Desk520.prototype,{
       });
       message='フォロー不要・無料の参加申請先に追加。掲載条件は別に確認します';
     }finally{this.rows('UPDATE desk_join_discovery SET message=?,due=? WHERE id=?',message,now+7*D520,row.id);}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   async scoutLiterary(now){
     const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled AS directory FROM desk_cfg c JOIN desk_directory d ON d.id=c.id WHERE c.id=1');
@@ -5637,6 +5685,7 @@ Object.assign(Desk520.prototype,{
         this.rows("INSERT INTO desk_scout(url,kind,due) VALUES(?,'owner',?) ON CONFLICT(url) DO UPDATE SET due=MIN(due,excluded.due)",url,now);
       this.rows("UPDATE desk_directory SET enabled=1,due=?,token='',message='520の公開一覧を継続探索に追加しました' WHERE id=1",now+D520);
     });
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 });
 
@@ -5708,11 +5757,13 @@ Object.assign(Desk520.prototype,{
         return !!this.one('UPDATE desk_popular SET attempt=? WHERE id=1 AND (attempt=0 OR attempt<=?) RETURNING id',at,at-D520);
       });
       message=result.message;
+      if(result.browserDeferred){due=browserRetryAt16936(result);return;}
       if(result.verified){this.rows('UPDATE desk_popular SET checked=? WHERE id=1',Date.now());due=now+7*D520;}
       else if(result.sent)due=now+30*M520;
       if(result.hold>0){const until=Date.now()+result.hold;due=Math.max(due,until);this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);await sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,a.slot).run();}
     }catch(error){message=readLimit(error)?'D1の読み取り枠更新後に再確認':'人気記事設定の読み戻しを再確認待ち';if(readLimit(error))due=(Math.floor(Date.now()/D520)+1)*D520+M520;}
     finally{try{this.rows('UPDATE desk_popular SET due=?,message=? WHERE id=1',due,message);}finally{if(lease)await release(env,lease);}}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 });
 
@@ -6191,6 +6242,7 @@ Object.assign(Desk520.prototype,{
       this.rows('DELETE FROM desk_tuta_seen WHERE at<?',at-30*D520);
       }finally{this.rows("UPDATE desk_tuta SET lease=0,token='' WHERE id=1 AND token=?",token);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 });
 
@@ -6397,7 +6449,11 @@ async function readObservation1698(binding,jobs) {
       if(hold || denied)break;
       results.push({job,result:result||{state:'unknown',reason:'screen'}});
     }
-  }catch { /* Only fixed diagnostics are shown. An error never becomes a negative observation. */ }
+  }catch(error) {
+    const deferred=browserDeferred16916(error);
+    if(deferred)return {...deferred,results,hold,denied};
+    // Only fixed diagnostics are shown. An error never becomes a negative observation.
+  }
   finally {
     clearTimeout(deadline);try{socket?.close();}catch{}
     if(session)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
@@ -6486,6 +6542,17 @@ Object.assign(Desk520.prototype,{
       this.rows('DELETE FROM desk_observe_log WHERE at<?',now-30*D520);
     });
     const read=await readObservation1698(this.env.BROWSER,jobs);
+    if(read.browserDeferred){
+      const retry=browserRetryAt16936(read);
+      this.storage.transactionSync(()=>{
+        this.rows('UPDATE desk_observe_state SET next=?,used=MAX(0,used-1),message=? WHERE id=1 AND day=?',retry,read.message,today);
+        for(const job of jobs){
+          if(job.kind==='keyword')this.rows('UPDATE desk_observe_keyword SET due=?,state=? WHERE keyword=? AND mode=? AND attempted=?',retry,read.message,job.subject,job.mode,now);
+          else this.rows('UPDATE desk_observe_footer SET due=?,state=? WHERE article=? AND attempted=?',retry,read.message,job.subject,now);
+        }
+      });
+      return;
+    }
     if(read.hold>0)this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',Date.now()+read.hold);
     for(const job of jobs){
       const result=read.results.find(r=>r.job.kind===job.kind && r.job.subject===job.subject && r.job.mode===job.mode)?.result;
@@ -6493,6 +6560,7 @@ Object.assign(Desk520.prototype,{
     }
     this.rows('UPDATE desk_observe_state SET next=MAX(next,?),message=? WHERE id=1',Date.now()+read.hold,
       read.hold?'noteの待機・応答制限を確認。次回へ延期':read.results.some(r=>r.result.state==='observed')?'今回の公開ページの観測結果を保存しました':'画面の読み取りは未確認。次回に自動再確認します');
+    return true; // Completed this pass; an early return above is only a wait/skip.
   }
 });
 function observationText1698(s) {
@@ -6502,13 +6570,13 @@ function observationText1698(s) {
     'ログアウト状態での観測です。閲覧者による表示の違い・キーワード別のアクセス数・全体順位は計測できません。'];
   for(const k of v.keywords){
     lines.push(k.keyword+' ／ '+(k.mode==='new'?'新着':'人気')+' ／ '+k.state+' ／ 最終試行 '+time(k.attempted));
-    if(k.observed)lines.push('  最後に読み取れた記録 '+time(k.observed)+' ／ '+k.cards+'カード ／ 520 '+JSON.parse(k.hits).length+'作品'+(k.complete?'':'（一部未確認）'));
+    if(k.observed)lines.push('  最後に読み取れた記録 '+time(k.observed)+' ／ '+k.cards+'カード ／ 520 '+savedList16936(k.hits).length+'作品'+(k.complete?'':'（一部未確認）'));
   }
   lines.push('【520の記事を一覧で確認した記録・最新30件】');
   for(const h of v.hits)lines.push(h.title+' ／ '+h.keyword+'・'+(h.mode==='new'?'新着':'人気')+' ／ 初回 '+time(h.first_at)+' ／ 最終 '+time(h.last_at));
   if(!v.hits.length)lines.push('実際の掲載を確認できた記録はまだありません。');
   lines.push('【記事ページ下部の案内・最新30件】','下部リンクの表示を記録しています。キーワード一覧の掲載や、note内部の分類全体を示すものではありません。');
-  for(const f of v.footers)lines.push(f.title+' ／ '+f.state+(f.observed?' ／ 前回確認 '+time(f.observed)+' ／ '+JSON.parse(f.topics).map(t=>t.label).join(' → '):''));
+  for(const f of v.footers)lines.push(f.title+' ／ '+f.state+(f.observed?' ／ 前回確認 '+time(f.observed)+' ／ '+savedList16936(f.topics,t=>typeof t?.label==='string').map(t=>t.label).join(' → '):''));
   if(!v.footers.length)lines.push('公開作品の取得・観測待ち');
   return lines.join('\n');
 }
@@ -7218,6 +7286,7 @@ Object.assign(Desk520.prototype,{
       this.rows("UPDATE desk_join_handoff16913 SET due=?,message='編集権限・掲載条件・最新号を確認済み。対象作品を次の掲載枠で照合' WHERE id=?",at+D520,j.id);
       this.match(at);this.planArchive(at);
     });
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   async verifyPlacement16913(now,selected=null){
     if(!this.pipelineActive16913())return;
@@ -7269,6 +7338,7 @@ Object.assign(Desk520.prototype,{
     }
     if(!this.pipelineActive16913())return;
     this.rows('UPDATE desk_mag_verify16913 SET attempts=attempts+?,done=?,message=? WHERE article=? AND id=?',+read,proved?1:0,proved?'公開表示で掲載を確認済み':reason,p.article,p.id);
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   pipelineView16913(){
     const rows=this.rows(`SELECT j.id,i.name,j.phase,j.proof,j.message,i.allowed,i.state,i.reason,m.mode,
@@ -7440,6 +7510,7 @@ Object.assign(Desk520.prototype,{
       const result=await browserTraffic16913(this.env.BROWSER,cleanCookie(credential.NOTE_SESSION),identity.id,live);
       if(failure)throw failure;
       message=result.message;
+      if(result.browserDeferred){this.rows('UPDATE desk_traffic16913 SET due=? WHERE id=1',browserRetryAt16936(result));return;}
       if(result.hold>0){
         const until=Date.now()+result.hold;
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
@@ -7463,10 +7534,12 @@ Object.assign(Desk520.prototype,{
       try{this.rows('UPDATE desk_traffic16913 SET message=? WHERE id=1',message);}
       finally{if(token)await release(env,token);}
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   trafficView16913(){
     const row=this.one('SELECT * FROM desk_traffic16913 WHERE id=1');
-    return {...row,payload:JSON.parse(row.payload)};
+    const payload=savedJson16936(row.payload,null,p=>!!p&&!Array.isArray(p)&&Object.hasOwn(p,'current')&&(!p.current||trafficValid16913(p.current))&&(!p.previous||trafficValid16913(p.previous)));
+    return {...row,message:payload?row.message:'保存されたアクセス集計を読み戻せず・再取得待ち',payload:payload||{current:null,previous:null}};
   }
 });
 function trafficRecord16913(row) {
@@ -7655,6 +7728,16 @@ class BrowserWait16916 extends Error {
 const BROWSER_WAIT16916={spacing:'前のブラウザー起動との間隔待ち',busy:'別のブラウザー処理の終了待ち',publication:'予約作品の公開を優先して待機中',daily:'Cloudflareのブラウザー日次枠の更新待ち',rate:'Cloudflareのブラウザー回数制限・再試行待ち',startup:'Cloudflareのブラウザー起動を確認できず・再試行待ち',storage:'ブラウザーの予約記録を確認できず・再試行待ち'};
 function browserDeferred16916(error) {
   return error instanceof BrowserWait16916?{browserDeferred:true,browserReason:error.reason,retryAt:error.at,message:BROWSER_WAIT16916[error.reason]||BROWSER_WAIT16916.startup}:null;
+}
+function savedJson16936(raw,fallback,valid) {
+  try{const value=JSON.parse(raw);return valid(value)?value:fallback;}catch{return fallback;}
+}
+function savedList16936(raw,valid=()=>true) {
+  return savedJson16936(raw,[],Array.isArray).filter(valid);
+}
+function browserRetryAt16936(result,now=Date.now()) {
+  const at=Number(result?.retryAt);
+  return Math.max(now+M520,Number.isSafeInteger(at)&&at>0?at:now+4*M520);
 }
 const LOCAL_BROWSERS16921=new WeakMap();
 function browserWait16916(binding,purpose) {
@@ -8017,7 +8100,7 @@ Object.assign(Desk520.prototype,{
   productionTestView16920(){
     const r=this.one('SELECT * FROM desk_test16920 WHERE id=1');
     return {version:VERSION,slot:r.slot,started:r.started,finished:r.finished,active:!!r.token&&r.phase<5&&!r.finished,
-      step:TEST_STEPS16920[r.phase]||'',due:r.due,nextTest:r.next_test,results:JSON.parse(r.results)};
+      step:TEST_STEPS16920[r.phase]||'',due:r.due,nextTest:r.next_test,results:savedList16936(r.results,r=>!!r&&typeof r==='object')};
   },
   startProductionTest16920(slot){
     const now=Date.now();
@@ -8669,6 +8752,7 @@ Object.assign(Desk520.prototype,{
     }catch(error){
       this.rows('UPDATE desk_network16922 SET message=? WHERE id=1',error instanceof PublicReadError?publicReadReason(error):'作品の公開元・本文を確認できず、従来の巡回を継続');
     }
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   networkMagazineScore16922(id,feature,now){
     const m=this.one('SELECT * FROM desk_network_mag16922 WHERE id=? AND last_at>=?',id,now-28*D520);if(!m||!feature)return null;
@@ -9117,10 +9201,16 @@ Object.assign(Desk520.prototype,{
     if(!manual){message('既存の応募件数を全件確認できず保留');return;}
     if(manual.includes(before.key)||new Set([...manual,...this.rows('SELECT article FROM desk_contest_entry16923 WHERE contest=?',rule.id).map(r=>r.article)]).size>=p.max){message('手動応募を含む応募済み作品・応募上限を確認');return;}
     const binding=browserPurpose16916(this.env.BROWSER,'normal');
-    if(browserWait16916(binding,'normal')){message('既存のブラウザー処理の終了を待機中');return;}
+    const deferBrowser=result=>{
+      const at=browserRetryAt16936(result);
+      this.rows('UPDATE desk_contest_rule16923 SET cursor=?,due=? WHERE id=?',rule.cursor,at,rule.id);
+      this.rows('UPDATE desk_contest16923 SET due=?,message=? WHERE id=1',at,result?.message||'既存のブラウザー・アカウント処理の終了待ち');
+    };
+    const waiting=browserWait16916(binding,'normal');
+    if(waiting){deferBrowser(waiting);return;}
     let lease,env=scoped(this.env,account.slot);
     try{
-      lease=await acquireBackground16931(env);if(!lease)return;
+      lease=await acquireBackground16931(env);if(!lease){deferBrowser({retryAt:Date.now()+4*M520});return;}
       const credentials=await loadCookie(env,account.id),cookie=cleanCookie(credentials.NOTE_SESSION);
       const mayAct=async()=>{
         const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,c.enabled,c.inflight,h.kind,n.hold_until,d.pending comment_pending,o.pending outreach_pending FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? LEFT JOIN nh_v1697_discovery d ON d.slot=n.slot LEFT JOIN nh_v16910_state o ON o.slot=n.slot WHERE c.id=1',account.slot).first();
@@ -9130,6 +9220,7 @@ Object.assign(Desk520.prototype,{
       if(!await mayAct()){message('停止・ほかの操作の結果・待機終了を確認してから応募します');return;}
       const result=await contestBrowser16923(binding,cookie,before,p,async()=>await mayAct()&&this.contestReserve16923(rule,p,before,manual),mayAct,plainDraft16914(own.body),async()=>{const fresh=(await this.contestRead16923("https://note.com/api/v3/notes/"+before.key))?.data;const saved=await contestSnapshot16923(fresh,account.id);return contestSame16923(before,saved,p.tag)||contestSame16923(before,saved,p.tag,true);});
       message(result.message);
+      if(result.browserDeferred){deferBrowser(result);return;}
       this.rows("UPDATE desk_contest_entry16923 SET message=? WHERE contest=? AND article=? AND phase='sent'",result.message,rule.id,before.key);
       if(result.hold||[401,403,429].includes(result.code)){
         const until=Date.now()+Math.max(result.hold||0,HOUR);
@@ -9137,6 +9228,7 @@ Object.assign(Desk520.prototype,{
         await sql(this.env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',until,account.slot).run();
       }
     }finally{if(lease)await release(env,lease);}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   contestView16923(){
     try{this.initContest16923();return {state:this.one('SELECT * FROM desk_contest16923 WHERE id=1'),
@@ -9478,6 +9570,7 @@ Object.assign(Desk520.prototype,{
     if(!plan)return;
     try{await this.publicRead(plan,'issue');}
     catch{this.rssTry16926(()=>this.rows("UPDATE desk_rss16926 SET message='時間帯の観測は再確認待ち。確認できた区間だけ比較します' WHERE id=1"));}
+    return true; // Completed this pass; an early return above is only a wait/skip.
   },
   rssRates16926(id,now){
     return this.rows('SELECT hour,COUNT(DISTINCT day) days,SUM(finish-start) duration,SUM(added) added FROM desk_rss_window16926 WHERE id=? AND finish>=? GROUP BY hour',id,now-21*D520)
@@ -9569,7 +9662,11 @@ Object.assign(Desk520.prototype,{
       if(!this.contestActive16923(now)||this.one('SELECT due FROM desk_rss16926 WHERE id=1').due>now)return;
       this.rows('UPDATE desk_rss16926 SET due=? WHERE id=1',now+30*M520);
       const b=this.one('SELECT * FROM desk_rss_brief16926 WHERE previous=1 AND checked>=? AND due<=? ORDER BY due,source LIMIT 1',now-2*D520,now);if(!b)return;
-      let policy;try{policy=JSON.parse(b.policy);}catch{return;}
+      let policy;try{policy=JSON.parse(b.policy);}catch{
+        this.rows('UPDATE desk_rss_brief16926 SET due=? WHERE source=?',now+6*HOUR,b.source);
+        this.taskHealth16928('RSSと既刊の照合',true,'保存された募集条件を読み戻せず。ほかの掲載先の確認を続けます');
+        return;
+      }
       const mag=b.kind==='mag'?this.eligibleMags(now).find(m=>noteLink161(m.url)?.id===b.source):null;
       const candidates=this.rows(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method,n.feature,n.seen feature_at FROM desk_archive a
         LEFT JOIN desk_work w ON w.article=a.article LEFT JOIN desk_network_work16922 n ON n.article=a.article AND n.owner='43__'
@@ -9598,6 +9695,7 @@ Object.assign(Desk520.prototype,{
         this.rows('UPDATE desk_rss_brief16926 SET cursor=?,due=? WHERE source=?',candidates.length===24?candidates.at(-1).article:'',now+(candidates.length===24?30*M520:6*HOUR),b.source);
         this.rssTrim16926(now);
       });
+      return true;
     });
   },
   rssView16926(){
