@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.31';
+const VERSION = 'v16.9.32';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1798,7 +1798,7 @@ async function syncArticleReactionSettings(binding, accountId, cookie, titles, m
     if (identity?.id!==accountId || identity?.name!=='43__') return {message:'520の本人確認待ち'};
     if (state.limit>0 && titles.some(t=>t.length>state.limit)) return {limit:state.limit,message:'noteの文字数上限に合わせて選び直します'};
     if (state.same) return {verified:true,limit:state.limit,message:'noteで確認済み'};
-    if (!maySave()) return {message:'設定の再確認待ち'};
+    if (!await maySave()) return {message:'設定の再確認待ち'};
     for (let i=0;i<24;i++) {
       if (blocked()) return blockedResult();
       state=await form('edit');
@@ -1809,8 +1809,8 @@ async function syncArticleReactionSettings(binding, accountId, cookie, titles, m
     }
     await pause520(300);
     if (blocked()) return blockedResult();
-    if (state?.state!=='filled' || !maySave())return {message:'入力内容の確認待ち'};
-    reserve();
+    if (state?.state!=='filled' || !await maySave())return {message:'入力内容の確認待ち'};
+    if (await reserve()===false)return {message:'保存直前に休止・待機状態が変わったため再確認待ち'};
     if ((await form('save')).state!=='sent')return {message:'保存ボタンの確認待ち'};
     await pause520(1000);
     if (blocked()) return blockedResult();
@@ -2597,7 +2597,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.taskHealthRows16928(),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,circulation:this.circulationView16932(now),rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.taskHealthRows16928(),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -2986,23 +2986,25 @@ class Desk520 {
   }
   async observeArchive(now) {
     if(this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked>now)return;
+    // Reuse the existing detail slot; alternate fresh releases with the backlog.
+    const fresh=this.circulationTry16932(()=>this.freshArchive16932(now));
     const hint=this.one('SELECT article FROM desk_archive_hint WHERE due<=? ORDER BY due,article LIMIT 1',now);
-    if(hint && (!this.one('SELECT article FROM desk_archive WHERE due<=? LIMIT 1',now) || Math.floor(now/(4*M520))%2===0)){
+    if(!fresh && hint && (!this.one('SELECT article FROM desk_archive WHERE due<=? LIMIT 1',now) || Math.floor(now/(4*M520))%2===0)){
       try {
         const n=(await this.publicRead('https://note.com/api/v3/notes/'+hint.article,'json'))?.data;
-        if(n?.key!==hint.article || n.user?.urlname!=='43__' || (n.status && n.status!=='published'))throw Error('unverified');
+        if(!isPublishedBy520(n) || n.key!==hint.article || n.user?.urlname!=='43__')throw Error('unverified');
         if(n.name?.trim()!=='521' && !this.rememberPublic(n.key,n.name,Date.parse(n.publishAt||n.publish_at||n.publishedAt)))throw Error('unverified');
         this.rows('DELETE FROM desk_archive_hint WHERE article=?',hint.article);
       }catch{this.rows('UPDATE desk_archive_hint SET due=? WHERE article=?',now+D520,hint.article);}
       return;
     }
-    const a=this.one('SELECT article,pub FROM desk_archive WHERE due<=? ORDER BY due,article LIMIT 1',now);
+    const a=fresh||this.one('SELECT article,pub FROM desk_archive WHERE due<=? ORDER BY due,article LIMIT 1',now);
     if(!a)return;
     try{
       const n=(await this.publicRead('https://note.com/api/v3/notes/'+a.article,'json'))?.data;
       if(n?.key===a.article && (n.name?.trim()==='521' || (n.status && n.status!=='published') || (n.user?.urlname && n.user.urlname!=='43__')))
         this.rows('DELETE FROM desk_reaction_work WHERE article=?',a.article);
-      if(n?.user?.urlname!=='43__' || n.key!==a.article || !text520(n.name,300) || n.name.trim()==='521' || (n.status && n.status!=='published'))throw Error('not verified');
+      if(!isPublishedBy520(n) || n.user?.urlname!=='43__' || n.key!==a.article || !text520(n.name,300) || n.name.trim()==='521')throw Error('not verified');
       if(isPublishedBy520(n))this.recordReactionTitle(a.article,n.name,a.pub,now);
       const value=count520(n,['likeCount','like_count']);
       const tags=Array.isArray(n.hashtags)?n.hashtags.map(t=>String(typeof t==='string'?t:t?.hashtag?.name??t?.name??'').replace(/^#/,'')):[];
@@ -3033,6 +3035,9 @@ class Desk520 {
     const rev=this.one('SELECT rev FROM desk_pick_meta WHERE id=1').rev;
     const keys=this.rows('SELECT article FROM desk_archive WHERE pick_rev<? ORDER BY pick_rev,article LIMIT 8',rev);
     if(keys.length<8)keys.push(...this.rows('SELECT article FROM desk_archive WHERE pick_due<=? AND pick_rev=? ORDER BY pick_due,article LIMIT ?',now,rev,8-keys.length));
+    const fresh=this.circulationTry16932(()=>this.rows(`SELECT article FROM desk_archive WHERE pub BETWEEN ? AND ? AND verified>0 AND mag_at=0
+      AND (pick_rev<? OR pick_due<=?) ORDER BY pub DESC,article LIMIT 2`,now-3*D520,now,rev,now),[]);
+    if(fresh.length)keys.splice(0,keys.length,...[...new Map([...fresh,...keys].map(r=>[r.article,r])).values()].slice(0,8));
     if(!keys.length)return;
     const mags=this.eligibleMags(now);
     for(const {article} of keys){
@@ -3564,8 +3569,17 @@ class Desk520 {
       if (!token) {message='520の使用中・次回再確認';due=now+4*M520;return;}
       const cookie=cleanCookie((await loadCookie(env,account.id)).NOTE_SESSION);
       this.rows('UPDATE desk_reactions SET used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END,utc_day=? WHERE id=1',day,day);
-      const maySave=()=>!!active() && !(state.pending===desired && now-state.sent<2*HOUR);
-      const reserve=()=>this.rows('UPDATE desk_reactions SET pending=?,sent=? WHERE id=1',desired,Date.now());
+      const maySave=async()=>{
+        if(!active())return false;
+        const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1',account.slot).first();
+        const at=Date.now(),pending=this.one('SELECT pending,sent FROM desk_reactions WHERE id=1');
+        return !!active() && live?.account===account.id && live.token===token && live.lease>at && live.hold_until<=at &&
+          (!live.kind || live.next_at<=at) && !(pending.pending && at-pending.sent<2*HOUR);
+      };
+      const reserve=async()=>{
+        if(!await maySave())return false;
+        this.rows('UPDATE desk_reactions SET pending=?,sent=? WHERE id=1',desired,Date.now());return true;
+      };
       const result=await syncArticleReactionSettings(this.env.BROWSER,account.id,cookie,titles,maySave,reserve);
       message=result.message;
       if (Number.isSafeInteger(result.limit) && result.limit>0) this.rows('UPDATE desk_reactions SET char_limit=? WHERE id=1',Math.min(result.limit,300));
@@ -3596,7 +3610,6 @@ class Desk520 {
     if(state.due>now || (state.done && state.checked>now-7*D520))return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return;
-    if(!this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) || this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const binding=this.env?.BROWSER;
     if(typeof binding?.acquire!=='function'){
@@ -4151,6 +4164,7 @@ function deskRecordText(s) {
   if(s.repeat)lines.push(repeatRecord16923(s.repeat));
   if(s.contests)lines.push(contestRecord16923(s.contests));
   lines.push(rssRecord16926(s.rssIntelligence));
+  if(s.circulation)lines.push(circulationRecord16932(s.circulation));
   if(s.pipeline)lines.push(pipelineRecord16913(s.pipeline));
   if(s.traffic)lines.push(trafficRecord16913(s.traffic));
   if(s.shelf)lines.push(shelfRecord520(s.shelf));
@@ -7799,11 +7813,13 @@ Object.assign(Desk520.prototype,{
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
     // Least recently circulated works go first. New works and backlist alternate.
     for(const old of [oldFirst,!oldFirst]){
-      const keys=this.rows('SELECT article FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub '+(old?'<=?':'>?')+
-        ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT 8',now,now-30*D520);
-      for(const {article} of keys){
+      const keys=this.circulationTry16932(()=>this.circulationCandidates16932(now,old))||
+        this.rows('SELECT article FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub '+(old?'<=?':'>?')+
+          ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT 8',now,now-30*D520);
+      for(const candidate of keys){
+        const {article}=candidate;
         const job=this.eligiblePlacement(article,now);
-        if(job)return job;
+        if(job){this.circulationTry16932(()=>this.recordCirculation16932(job,candidate,now));return job;}
         // A blocked publisher cannot monopolize the head of the queue.
         this.rows('UPDATE desk_archive SET mag_due=?,pick_due=MIN(pick_due,?) WHERE article=?',now+HOUR,now+HOUR,article);
       }
@@ -9686,4 +9702,112 @@ function patrolDisplay16931(data){
       (e?'\n最後のエラー '+time(e.finished||e.started)+'／'+e.stage+'／'+(kinds[e.kind]||'内部処理')+(e.code?'（HTTP '+e.code+'）':'')+'\nその時点の再確認予定 '+time(e.next_at)+(e.wait_saved?'':'（保存は未確認）'):'\nこの版で完了時に記録できたエラーはありません');
   }).join('\n\n'):'この版での実行記録はまだありません。')+
     '\n成功後も最後のエラー記録を残します。記録は各アカウント直近256回。「設定と実績を保存」にも含まれます。受け取ったスキの数ではありません。';
+}
+
+// Local planning only: no recommendation-rank API, extra note requests, or new
+// action budget. Execution still goes through the existing authority, pause,
+// rate-limit, pair-deduplication and read-back checks.
+function risingBacklist16932(a,now){
+  if(![a.likes,a.previous].every(n=>Number.isSafeInteger(n)&&n>=0) ||
+    ![a.at,a.prior_at,a.pub].every(n=>Number.isFinite(n)&&n>0) ||
+    a.at>now || a.at<now-7*D520 || a.at-a.prior_at<6*D520 || a.at-a.prior_at>8*D520 ||
+    a.pub>a.prior_at-30*D520 || a.likes-a.previous<2)return 0;
+  return (a.likes-a.previous)*D520/(a.at-a.prior_at);
+}
+Object.assign(Desk520.prototype,{
+  initCirculation16932(){
+    if(this.circulationReady16932)return;
+    this.storage.transactionSync(()=>{
+      this.rows('CREATE TABLE IF NOT EXISTS desk_circulation16932(id INTEGER PRIMARY KEY,refresh_turn INTEGER NOT NULL DEFAULT 0)');
+      this.rows('INSERT OR IGNORE INTO desk_circulation16932(id) VALUES(1)');
+      this.rows(`CREATE TABLE IF NOT EXISTS desk_circulation_pick16932(article TEXT NOT NULL,id TEXT NOT NULL,
+        reason TEXT NOT NULL,related TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(article,id))`);
+      this.rows('CREATE INDEX IF NOT EXISTS desk_circulation_pick_age16932 ON desk_circulation_pick16932(at,article,id)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_archive_fresh16932 ON desk_archive(pub DESC,article) WHERE verified=0');
+    });
+    this.circulationReady16932=true;
+  },
+  circulationTry16932(work,fallback=null){
+    if(this.circulationFault16932>Date.now())return fallback;
+    try{this.initCirculation16932();return work();}
+    catch{this.circulationFault16932=Date.now()+HOUR;return fallback;}
+  },
+  freshArchive16932(now){
+    const row=this.one(`SELECT article,pub FROM desk_archive WHERE verified=0 AND due<=? AND pub BETWEEN ? AND ?
+      ORDER BY pub DESC,article LIMIT 1`,now,now-3*D520,now);
+    if(!row)return null;
+    const turn=this.one('SELECT refresh_turn FROM desk_circulation16932 WHERE id=1').refresh_turn;
+    this.rows('UPDATE desk_circulation16932 SET refresh_turn=? WHERE id=1',(turn+1)%2);
+    return turn===0?row:this.one('SELECT article,pub FROM desk_archive WHERE due<=? AND pub<? ORDER BY due,article LIMIT 1',now,now-3*D520)||null;
+  },
+  circulationCandidates16932(now,old){
+    const base=this.rows('SELECT a.* FROM desk_archive a WHERE choice IS NOT NULL AND mag_due<=? AND pub<=? AND pub '+(old?'<=?':'>?')+
+      ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT ?',now,now,now-30*D520,old?32:8);
+    const ordinary=a=>({...a,reason:old?(a.mag_at?'長く紹介していない旧作を順番に再紹介':'この機能でまだ紹介していない旧作'):
+      !a.mag_at&&a.pub>=now-3*D520?'新作の初回紹介（公開72時間以内）':'公開30日未満の作品を順番に紹介',related:''});
+    // Reuse the already-persisted alternating old-work turn. It advances only
+    // in the existing magazine action reservation, never on a UI read or poll.
+    if(!old || !this.one('SELECT older FROM desk_scout_state WHERE id=1')?.older)return base.slice(0,8).map(ordinary);
+    const rising=this.rows(`SELECT * FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub<=?
+      AND prior_at IS NOT NULL AND at BETWEEN ? AND ? AND likes>=previous+2
+      ORDER BY at DESC,article LIMIT 24`,now,now-30*D520,now-7*D520,now);
+    const recent=this.rows(`SELECT a.article,a.title,n.feature FROM desk_archive a JOIN desk_network_work16922 n ON n.article=a.article
+      WHERE a.pub BETWEEN ? AND ? AND a.verified BETWEEN ? AND ? AND n.owner='43__' AND n.full=1 AND n.seen BETWEEN ? AND ?
+      ORDER BY a.pub DESC,a.article LIMIT 2`,now-14*D520,now,now-8*D520,now,now-28*D520,now)
+      .map(a=>({...a,feature:networkParseFeature16922(a.feature)})).filter(a=>a.feature?.full);
+    const pool=[...new Map([...base,...rising].map(a=>[a.article,a])).values()],ranked=[];
+    for(const a of pool){
+      if(a.verified<now-8*D520 || a.verified>now || !a.verified || a.mag_at>now-7*D520)continue;
+      const rate=risingBacklist16932(a,now),row=recent.length?this.one(`SELECT feature FROM desk_network_work16922
+        WHERE article=? AND owner='43__' AND full=1 AND seen BETWEEN ? AND ?`,a.article,now-28*D520,now):null;
+      const feature=networkParseFeature16922(row?.feature);
+      const nearest=recent.map(n=>({...n,score:networkSimilarity16922(feature,n.feature)})).sort((a,b)=>b.score-a.score)[0];
+      const related=nearest?.score>=0.22?nearest:null;
+      if(!rate && !related)continue;
+      const reason=[rate?'約1週間のスキ増加を観測（+'+(a.likes-a.previous)+'）':'',related?'新作「'+related.title+'」と本文の語句・テーマが近い':''].filter(Boolean).join(' ／ ');
+      ranked.push({...a,reason,related:related?.article||'',score:(related?.score||0)+Math.min(0.5,rate/10)});
+    }
+    ranked.sort((a,b)=>a.mag_at-b.mag_at||b.score-a.score||a.pub-b.pub||a.article.localeCompare(b.article));
+    // At most four signal-based candidates; keep the fair queue behind them.
+    // Missing evidence falls back to the original ordering, never to zero scores
+    // presented as a positive effect or to a relaxation of publication rules.
+    const seen=new Set();
+    return [...ranked.slice(0,4),...base.slice(0,8).map(ordinary)]
+      .filter(a=>{if(seen.has(a.article))return false;seen.add(a.article);return true;}).slice(0,12);
+  },
+  recordCirculation16932(job,candidate,now){
+    this.rows(`INSERT INTO desk_circulation_pick16932 VALUES(?,?,?,?,?) ON CONFLICT(article,id)
+      DO UPDATE SET reason=excluded.reason,related=excluded.related,at=excluded.at`,job.key,job.target,candidate.reason||'従来の紹介順',candidate.related||'',now);
+    this.rows(`DELETE FROM desk_circulation_pick16932 WHERE (article,id) IN
+      (SELECT article,id FROM desk_circulation_pick16932 ORDER BY at DESC,article,id LIMIT -1 OFFSET 64)`);
+  },
+  circulationView16932(now){
+    return this.circulationTry16932(()=>{
+      const cfg=this.one('SELECT c.enabled,c.blocked,d.enabled delivery FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1');
+      const counts=this.one(`SELECT COUNT(*) total,COALESCE(SUM(pub<=?),0) old,COALESCE(SUM(pub>?),0) recent
+        FROM desk_archive WHERE pub<=? AND trim(title)<>'521'`,now-30*D520,now-3*D520,now);
+      const recommendation=this.one('SELECT done,checked,message FROM desk_recommend WHERE id=1');
+      const picks=this.rows(`SELECT p.*,a.title,j.phase,r.observed FROM desk_circulation_pick16932 p
+        LEFT JOIN desk_archive a ON a.article=p.article
+        LEFT JOIN desk_job j ON j.kind='mag' AND j.article=p.article AND j.target=p.id
+        LEFT JOIN desk_ref r ON r.article=p.article AND r.id=p.id
+        ORDER BY p.at DESC,p.article,p.id LIMIT 8`).map(p=>({...p,
+          state:p.observed?'誌面で掲載確認':p.phase==='sent'||p.phase==='seen'?'操作後の掲載確認待ち':p.phase==='confirmed'?'追加結果を確認':'候補選択・掲載前の条件照合待ち'}));
+      return {available:true,enabled:!!(cfg.enabled&&cfg.delivery),blocked:cfg.blocked,counts,recommendation,picks};
+    },{available:false});
+  }
+});
+function circulationRecord16932(v){
+  if(!v?.available)return '【旧作・新作の自動紹介】\n紹介候補の比較を再確認待ち。従来の紹介順で続けます。';
+  const r=v.recommendation,now=Date.now();
+  const on=!!r?.done&&r.checked>0&&r.checked<=now&&r.checked>now-7*D520;
+  const setting=on?'ONを読み戻して確認（'+time(r.checked)+'）':
+    r?.done?'再確認待ち（前回の記録 '+time(r.checked)+'）':(r?.message||'未確認');
+  return '【旧作・新作の自動紹介】'+(v.enabled?'ON':'休止中')+
+    '\n登録済み作品 '+v.counts.total+'本 ／ 公開30日以上 '+v.counts.old+'本 ／ 公開72時間以内 '+v.counts.recent+'本'+
+    '\n新作の初回確認を優先。旧作は順番の紹介と、最近のスキ増加・新作との内容の近さによる選び直しを交互に行います。'+
+    '\n記事下の相互おすすめ設定：'+setting+
+    (v.blocked>now?'\nnote指定の待機 '+time(v.blocked)+'まで':'')+
+    (v.picks.length?'\n'+v.picks.map(p=>(p.title||p.article)+' ／ '+p.reason+'\n'+p.state+' ／ '+time(p.at)).join('\n'):'\n紹介先と作品の条件がそろうのを待っています。')+
+    '\n共同誌は参加・編集権限と掲載条件を確認できた先が対象です。候補選択は掲載成功ではありません。スキ増加の原因・訪問経路は未確認です。note内のおすすめ順位や表示回数は指定できません。';
 }
