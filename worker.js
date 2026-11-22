@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.39';
+const VERSION = 'v16.9.40';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1674,7 +1674,11 @@ async function deskRoute(request,env) {
         input={action:'status',offset};
       }
     }else{
-      const denied=await adminKeyDenied16934(request,env,request.headers.get('Authorization'),failure,true);
+      // The browser sends a Base64 bearer. HTTPS clients using secret injection
+      // can pass the same key verbatim without encoding the proxy placeholder.
+      const bearer=request.headers.get('Authorization');
+      const directKey=new URL(request.url).protocol==='https:'?request.headers.get('X-Note-Helper-Admin-Key'):null;
+      const denied=await adminKeyDenied16934(request,env,bearer??directKey,failure,bearer!==null);
       if(denied)return denied;
       input=JSON.parse(await readAdminBody16934(request,2000000));
     }
@@ -3551,7 +3555,8 @@ class Desk520 {
     if(gate>now && (!key || gate>now+4*M520))return;
     const pending=key?this.rows('SELECT article FROM desk_link_plan WHERE article=? AND title IS NULL AND pub IS NULL AND title_due<=?',key,now):
       this.rows(`SELECT l.article FROM desk_link_plan l WHERE l.pub IS NULL AND l.scheduled>? AND l.title_due<=?
-        AND (l.title IS NULL OR EXISTS (SELECT 1 FROM desk_work_schedule w WHERE w.key IS NULL AND w.pub IS NULL AND w.title=l.title AND w.scheduled=l.scheduled))
+        AND (l.title IS NULL OR (l.title,l.scheduled) IN (
+          SELECT w.title,w.scheduled FROM desk_work_schedule w WHERE w.key IS NULL AND w.pub IS NULL))
         ORDER BY l.title_due,l.scheduled LIMIT 4`,now,now);
     if(!pending.length)return;
     this.rows('UPDATE desk_scout_state SET title_due=? WHERE id=1',now+4*M520);
@@ -4042,7 +4047,12 @@ class Desk520 {
     const now=Date.now();
     const publication=this.duePublication(now);
     const task=(name,work)=>this.task520(name,work);
+    const checkJoins=()=>task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
     if(publication)await task('予約作品の公開',()=>this.dispatch(now));
+    // A due check that lost the browser to another task gets one turn on
+    // the next ordinary tick. Its own gates are checked again before use.
+    const joinTurn=!publication && this.one('DELETE FROM desk_join_turn WHERE id=1 AND due<=? RETURNING id',now);
+    if(joinTurn)await checkJoins();
     await Promise.allSettled([
       task('作品とフォロワーの記録',()=>this.tickRecords()),
       task('共同誌の編集権限・募集条件',()=>this.automaticDirectory(now)),
@@ -4063,7 +4073,7 @@ class Desk520 {
     await task('文芸誌の探索',()=>this.scoutLiterary(Date.now()));
     if(!publication)await task('参加先の募集確認',()=>this.expandJoin520(Date.now()));
     if(!publication)await task('Tutaの招待確認',()=>this.tutaTick520(Date.now()));
-    if(!publication)await task('参加申請・招待の承認',()=>this.joinTick520(Date.now()));
+    if(!publication && !joinTurn)await checkJoins();
     if(!publication)await task('参加後の掲載準備',()=>this.handoffJoined16913(Date.now()));
     await task('共同誌の追加結果',()=>this.verifyPlacement16913(Date.now()));
     if(!publication)await task('人気記事の入口',()=>this.popularTick520(Date.now()));
@@ -5289,6 +5299,7 @@ Object.assign(Desk520.prototype,{
     });
     // Preserve j.at: it is an application/acceptance timestamp, not a read time.
     this.rows("CREATE TABLE IF NOT EXISTS desk_join_check16930(id TEXT PRIMARY KEY,checked INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '')");
+    this.rows('CREATE TABLE IF NOT EXISTS desk_join_turn(id INTEGER PRIMARY KEY,due INTEGER NOT NULL)');
   },
   joinActive520(id=JOIN520.id) {
     return !!this.one(`SELECT 1 FROM desk_join_cfg j JOIN desk_cfg c ON c.id=j.id JOIN desk_delivery d ON d.id=j.id
@@ -5340,8 +5351,12 @@ Object.assign(Desk520.prototype,{
     const n=(await this.publicRead('https://note.com/api/v3/notes/'+target.article,'json'))?.data;
     return joinFree520(payload,html,target,n);
   },
+  rememberJoinTurn(due){
+    this.rows('INSERT INTO desk_join_turn(id,due) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET due=MAX(due,excluded.due)',due);
+  },
   async joinTickUnlocked16920(now,probe=null) {
-    if(browserWait16916(this.env.BROWSER))return;
+    const wait=browserWait16916(this.env.BROWSER);
+    if(wait && (probe || !['spacing','busy'].includes(wait.browserReason)))return;
     const cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
     if((!probe && cfg.due>now) || !this.joinActive520(''))return;
     // The publication window and existing account lease take priority over participation.
@@ -5349,19 +5364,29 @@ Object.assign(Desk520.prototype,{
       this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const applicationRoom=(this.one('SELECT applications FROM desk_join_budget WHERE day=?',jstDay(now))?.applications||0)<DISTRIBUTION16918.applications &&
       this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next<=now;
-    const rows=this.rows(`SELECT j.* FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE (j.due<=? OR ?) AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')
-      AND (j.phase<>'wait' OR ? OR EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait')) AND (?='' OR j.id=?)
-      ORDER BY EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') DESC,
-      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 16`,now,+!!probe,+applicationRoom,probe?.target||'',probe?.target||'');
-    const canRank=rows[0]?.phase==='wait'&&!this.one("SELECT 1 FROM desk_invite WHERE id=? AND phase='wait'",rows[0].id);
+    const conditions=["NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')",
+      "(j.phase<>'wait' OR ? OR EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait'))"];
+    const args=[+applicationRoom];
+    if(!probe){conditions.push('j.due<=?');args.push(now);}
+    if(probe?.target){conditions.push('j.id=?');args.push(probe.target);}
+    const eligible=' FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE '+conditions.join(' AND ');
+    const order=` ORDER BY EXISTS(SELECT 1 FROM desk_invite v WHERE v.id=j.id AND v.phase='wait') DESC,
+      CASE WHEN j.phase='wait' THEN 0 WHEN j.phase='accepting' THEN 1 WHEN j.phase IN ('sent','applied') THEN 2 ELSE 3 END,j.due,j.at,j.id LIMIT 16`;
+    const rows=this.rows(wait?'SELECT 1'+eligible+' LIMIT 1':'SELECT j.*'+eligible+order,...args);
+    if(!rows.length)return;
+    const today=jstDay(now),used=cfg.day===today?cfg.used:0;
+    if(used>=DISTRIBUTION16918.checks){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
+    if(wait){
+      this.rememberJoinTurn(wait.retryAt);
+      return;
+    }
+    const canRank=rows[0].phase==='wait'&&!this.one("SELECT 1 FROM desk_invite WHERE id=? AND phase='wait'",rows[0].id);
     const row=canRank?this.networkTry16922(()=>this.networkRecruitment16922(rows.filter(j=>j.phase==='wait'),now,cfg.used),rows[0]):rows[0];
     if(!row)return;
     if(probe?.verify && !['sent','applied','accepting','joined'].includes(row.phase))return;
     const target=this.joinTarget520(row.id);
     if(!target)return;
     probe?.capture?.({id:row.id,phase:row.phase,name:target.name});
-    const today=jstDay(now),used=cfg.day===today?cfg.used:0;
-    if(used>=DISTRIBUTION16918.checks){this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',jstStart(today)+D520+M520);return;}
     this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1',now+15*M520);
     let env,lease,message='参加申請・招待の確認を再試行待ち',due=now+2*HOUR,attempt='',reason='retry';
     try {
@@ -5436,8 +5461,10 @@ Object.assign(Desk520.prototype,{
         },live);
       probe?.result?.(result);
       if(result.browserDeferred && !attempt){
-        this.rows('UPDATE desk_join_cfg SET used=MAX(0,used-1),due=? WHERE id=1 AND day=?',browserRetryAt16936(result),today);
-        reason='browser_wait';message=result.message;due=browserRetryAt16936(result);return;
+        due=browserRetryAt16936(result);
+        this.rows('UPDATE desk_join_cfg SET used=MAX(0,used-1),due=? WHERE id=1 AND day=?',due,today);
+        if(!probe && ['spacing','busy'].includes(result.browserReason))this.rememberJoinTurn(due);
+        reason='browser_wait';message=result.message;return;
       }
       reason=result.reason || (result.joined?'joined':result.existing?'invitation_wait':result.sent?'application_sent':result.hold?'server_wait':result.noFollow?'follow_required':'browser_check');
       message=result.message;due=Date.now()+(result.noFollow?30*D520:attempt||result.prepared?4*M520:kind==='check'||kind==='verify'?6*HOUR:2*HOUR);
