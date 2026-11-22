@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.37';
+const VERSION = 'v16.9.38';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -2430,6 +2430,7 @@ class Desk520 {
   async admin(req,ctx) {
     try {
       const input=await req.json();
+      if(input.action==='production_test_records')return deskJson(await this.savedProductionRecords());
       this.init();
       const now=Date.now();
       let correctionMessage='';
@@ -8181,6 +8182,23 @@ Object.assign(Desk520.prototype,{
     return {version:VERSION,slot:r.slot,started:r.started,finished:r.finished,active:!!r.token&&r.phase<5&&!r.finished,
       step:TEST_STEPS16920[r.phase]||'',due:r.due,nextTest:r.next_test,results:savedList16936(r.results,r=>!!r&&typeof r==='object')};
   },
+  async savedProductionRecords(){
+    // A diagnostic read on a new or older object must not initialize tables or wake an alarm.
+    const tables=new Set(this.rows("SELECT name FROM sqlite_master WHERE type='table'").map(r=>r.name));
+    const test=tables.has('desk_test16920') && this.one('SELECT id FROM desk_test16920 WHERE id=1')
+      ? this.productionTestView16920() : {version:VERSION,active:false,started:0,results:[]};
+    const history=[];
+    if(tables.has('desk_join'))history.push(...this.rows(
+      "SELECT '共同誌参加' AS feature,id AS subject,at,phase AS state,message FROM desk_join WHERE at>0 ORDER BY at DESC LIMIT 40"));
+    if(tables.has('desk_job'))history.push(...this.rows(
+      "SELECT kind AS feature,at,phase AS state,message FROM desk_job WHERE at>0 ORDER BY at DESC LIMIT 24"));
+    if(tables.has('desk_task_health'))history.push(...this.rows(
+      "SELECT task AS feature,at,CASE WHEN failed=1 THEN '失敗' ELSE '復旧' END AS state,message FROM desk_task_health ORDER BY at DESC LIMIT 40"));
+    let diagnostics;
+    try{diagnostics=await diagnosticRecord16915(this.env);}
+    catch{diagnostics='D1の機能別記録を取得できませんでした。';}
+    return {...test,history:history.sort((a,b)=>b.at-a.at),diagnostics};
+  },
   startProductionTest16920(slot){
     const now=Date.now();
     return this.storage.transactionSync(()=>{
@@ -8475,12 +8493,16 @@ async function productionTestRoute16920(request,env){
     const f=new URLSearchParams(await readAdminBody16934(request,20000));
     const denied=await adminKeyDenied16934(request,env,f.get('key'),fail);
     if(denied)return denied;
-    if(!['run','status'].includes(f.get('action')))return fail('操作を選んでください。',400);
+    const operation={run:'production_test_start',status:'production_test_status',records:'production_test_records'};
+    const action=f.get('action');
+    if(!Object.hasOwn(operation,action))return fail('操作を選んでください。',400);
     const slot=f.get('account')||'1';if(!SLOTS.includes(slot))return fail('アカウントを選んでください。',400);
-    const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:f.get('action')==='run'?'production_test_start':'production_test_status',slot})}));
+    const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify({action:operation[action],slot})}));
     if(!res.ok)return fail('テストの記録に接続できません。処理を開始済みの場合は「結果を確認」で確認してください。',503);
     const view=await res.json();
-    return json?deskJson(view):productionTestPage16920(view);
+    if(json)return deskJson(view);
+    const history=action==='records'?[view.diagnostics,...view.history.map(r=>[time(r.at),r.feature,r.subject,r.state,r.message].filter(Boolean).join(' ／ '))].join('\n\n'):'';
+    return productionTestPage16920(view,'',200,history);
   }catch(error){return fail(error instanceof AdminInputError16934?error.message:'接続・保存を確認できません。「結果を確認」で保存済みの結果を確認してください。',error instanceof AdminInputError16934?error.status:503);}
 }
 function productionTestText16920(v){
@@ -8490,7 +8512,7 @@ function productionTestText16920(v){
     ...v.results.map(r=>'【'+r.label+'】'+(TEST_LABELS16920[r.state]||'未確認')+'\n'+r.message+'\n'+time(r.at)),
     '次の新しいテスト：'+time(v.nextTest)+' 以降'].join('\n\n');
 }
-function productionTestPage16920(view=null,message='',status=200){
+function productionTestPage16920(view=null,message='',status=200,history=''){
   const nonce=crypto.randomUUID().replaceAll('-','');
   return new Response(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>今すぐ本番テスト ${VERSION}</title><style>body{font:17px system-ui;max-width:740px;margin:24px auto;padding:0 18px;line-height:1.7}input,select,button{font:inherit;padding:12px;box-sizing:border-box}input,select{width:100%}label{display:block;margin:12px 0}button{margin:8px 6px 8px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}</style>
@@ -8499,8 +8521,8 @@ function productionTestPage16920(view=null,message='',status=200){
 <p>実際に参加希望コメント・招待承認・掲載を行う場合があります。無料・募集条件・編集権限を確認し、既存の送信間隔・回数制限・停止設定を守ります。記事の新規公開、スキ送信、フォローはこのテストでは行いません。</p>
 <form method="post" action="/test" id="testform"><label>管理用の鍵（ADMIN_KEY）<input type="password" name="key" required autocomplete="off" autocapitalize="none" spellcheck="false"></label>
 <label>追加機能の読み取りを試すアカウント<select name="account"><option value="1"${view?.slot==='2'?'':' selected'}>1</option><option value="2"${view?.slot==='2'?' selected':''}>2</option></select></label>
-<button name="action" value="run">今すぐテスト</button><button name="action" value="status">結果を確認</button></form>
-<p id="message" role="status">${esc(message)}</p><pre id="testresult">${esc(productionTestText16920(view))}</pre>
+<button name="action" value="run">今すぐテスト</button><button name="action" value="status">結果を確認</button><button name="action" value="records">保存済みの結果・履歴を読む</button></form>
+<p id="message" role="status">${esc(message)}</p><pre id="testresult">${esc(productionTestText16920(view))}</pre>${history?'<h2>保存済みの実行記録</h2><pre>'+esc(history)+'</pre>':''}
 <p>1回のテストは通常数分です。処理中は結果を自動表示します。画面を閉じても保存された順番で続けます。申請の相手方承認、閲覧数、スキ返しは保証できません。Tutaの受信接続は今回のテスト対象外です。</p>
 <script nonce="${nonce}">(()=>{const f=document.getElementById('testform'),out=document.getElementById('testresult'),msg=document.getElementById('message');let busy=false,timer;
 const tm=n=>typeof n==='number'&&n>0&&Number.isFinite(new Date(n).getTime())?new Date(n).toLocaleString('ja-JP',{timeZone:'Asia/Tokyo'}):'未記録';
@@ -8510,7 +8532,7 @@ const res=await fetch('/test',{method:'POST',headers:{Accept:'application/json'}
 out.textContent=!s.started?'テストの記録はまだありません。':['開始 '+tm(s.started)+' ／ 読み取り対象：アカウント '+s.slot,s.active?'処理中：'+s.step+'（自動で続けます）':'テスト終了。各項目の結果を確認してください。',...s.results.map(r=>'【'+r.label+'】'+(states[r.state]||'未確認')+'\\n'+r.message+'\\n'+tm(r.at)),'次の新しいテスト：'+tm(s.nextTest)+' 以降'].join('\\n\\n');
 msg.textContent=s.active?'テスト中です。結果は自動で表示します。':'保存された結果を表示しました。';if(s.active)timer=setTimeout(()=>send('status'),4000);
 }catch(e){msg.textContent=e.message||'通信を確認できません。「結果を確認」を押してください。';}finally{busy=false;}}
-f.addEventListener('submit',e=>{e.preventDefault();if(f.reportValidity())send(e.submitter?.value||'status');});})();</script></html>`,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
+f.addEventListener('submit',e=>{if(e.submitter?.value==='records'){clearTimeout(timer);return;}e.preventDefault();if(f.reportValidity())send(e.submitter?.value||'status');});})();</script></html>`,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
     'Content-Security-Policy':"default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"}});
 }
 
