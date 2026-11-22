@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.38';
+const VERSION = 'v16.9.39';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -601,7 +601,13 @@ async function noteRead16937(kind,arg) {
   const path='/'+arg.owner+(kind==='readers'?'/n/'+arg.key:'');
   const samePage=()=>{
     try{
-      const c=new URL(document.querySelector('link[rel="canonical"]')?.href);
+      const canonical=document.querySelector('link[rel~="canonical"]');
+      // Some profile templates expose only og:url. Use it only when the
+      // verified recruitment article supplies an independent numeric owner ID.
+      const url=canonical?.href || (!canonical && kind==='follow' && /^[1-9]\d{0,19}$/.test(arg.ownerId||'')
+        ? document.querySelector('meta[property="og:url"]')?.content : null);
+      if(!url)return false;
+      const c=new URL(url);
       return location.origin==='https://note.com'&&location.pathname.replace(/\/$/,'')===path&&c.origin===location.origin&&c.pathname.replace(/\/$/,'')===path;
     }catch{return false;}
   };
@@ -631,7 +637,7 @@ async function noteRead16937(kind,arg) {
     const d=j.data??j;
     if(!d||typeof d!=='object'||Array.isArray(d))return {state:'shape'};
     if(kind==='follow'){
-      if(d.urlname!==arg.owner || !/^[1-9]\d{0,19}$/.test(String(d.id)))return {state:'owner'};
+      if(d.urlname!==arg.owner || !/^[1-9]\d{0,19}$/.test(String(d.id)) || arg.ownerId && String(d.id)!==arg.ownerId)return {state:'owner'};
       const values=[d.isFollowing,d.is_following,d.followings?.actively].filter(v=>typeof v==='boolean');
       if(!values.length)return {state:'relationship'};
       if(!values.every(v=>v===values[0]))return {state:'conflict'};
@@ -1342,25 +1348,107 @@ export default {
     }
   },
   async scheduled(event, original, ctx) {
-    // Cronは予約の復旧専用。
-    ctx.waitUntil(wakeScheduler(original));
-    ctx.waitUntil(deskTick(original));
+    // The provider can refuse a DO invocation before its own handler runs.
+    let gate=cronReadGates.get(original.DB);
+    if(!gate){gate=new ObjectReadGate(original.DB);cronReadGates.set(original.DB,gate);}
+    await gate.restore();
+    if(gate.until>Date.now())return;
+    for(const run of [wakeScheduler,deskTick])ctx.waitUntil(run(original).catch(error=>{
+      if(!dailyObjectReadsExceeded(error))throw error;
+      gate.record(error,ctx);
+    }));
   }
 };
 async function wakeScheduler(env) {
   if (!env.SCHEDULER) throw new Error('Scheduler binding missing');
   const id = env.SCHEDULER.idFromName('note-helper-210-seconds');
   const response = await env.SCHEDULER.get(id).fetch('https://scheduler.internal/wake');
-  if (!response.ok) throw new Error('Scheduler unavailable');
+  checkSchedulerResponse(response,'Scheduler unavailable');
+}
+function checkSchedulerResponse(response,failure){
+  if(response.ok)return;
+  if(response.headers.get('X-Note-Helper-Limit')==='do-daily-reads'){
+    const error=Error('DO daily row read limit');
+    error.resumeAt=Number(response.headers.get('X-Note-Helper-Resume-At'));
+    throw error;
+  }
+  throw Error(failure);
+}
+// Remember a confirmed account-wide SQLite row-read limit outside the exhausted
+// storage. One point lookup per cold object; repeated alarms and polls use memory.
+const objectReadGates=new WeakMap(),cronReadGates=new WeakMap();
+function dailyObjectReadsExceeded(error){
+  const text=errorText(error);
+  return !/D1_ERROR|D1_EXEC_ERROR/i.test(text) &&
+    /rows? (?:read|reads)|read rows?|row[- ]reads?/i.test(text) &&
+    /limit|quota|exceed/i.test(text) && /daily|per day|today|midnight|free (?:tier|plan)/i.test(text);
+}
+class ObjectReadGate {
+  constructor(db,ctx=null){
+    this.ctx=ctx;this.db=db;this.until=0;
+    if(ctx)objectReadGates.set(ctx.storage,this);
+  }
+  async restore(){
+    this.loaded ||= (async()=>{
+      try{
+        const row=await this.db.prepare('SELECT resume_at FROM nh_do_read_limit WHERE id=1').first();
+        if(Number.isSafeInteger(row?.resume_at))this.until=Math.max(this.until,row.resume_at);
+      }catch{
+        // An untouched database has no marker table. If D1 is unavailable as
+        // well, the first actual DO quota rejection still closes the local gate.
+      }
+    })();
+    await this.loaded;
+  }
+  record(error,ctx=this.ctx){
+    if(this.until>Date.now() || !dailyObjectReadsExceeded(error))return;
+    const now=Date.now();
+    const reset=(Math.floor(now/86400000)+1)*86400000+5000;
+    // A response crossing midnight still carries the original reset deadline.
+    const until=Number.isSafeInteger(error?.resumeAt) && error.resumeAt>0?Math.min(error.resumeAt,reset):reset;
+    if(until<=now)return;
+    this.until=until;
+    ctx.waitUntil((async()=>{
+      try{
+        await this.db.batch([
+          this.db.prepare('CREATE TABLE IF NOT EXISTS nh_do_read_limit(id INTEGER PRIMARY KEY,resume_at INTEGER NOT NULL)'),
+          this.db.prepare('INSERT INTO nh_do_read_limit VALUES(1,?) ON CONFLICT(id) DO UPDATE SET resume_at=MAX(resume_at,excluded.resume_at)').bind(until)
+        ]);
+      }catch{console.warn('note-helper: DO daily read limit recorded in memory only');}
+    })());
+  }
+  response(){
+    return Response.json({error:'Durable Objects の日次読み取り枠の更新待ちです。'},{
+      status:503,headers:{'Cache-Control':'no-store','X-Note-Helper-Limit':'do-daily-reads','X-Note-Helper-Resume-At':String(this.until),'Retry-After':String(Math.max(1,Math.ceil((this.until-Date.now())/1000)))}
+    });
+  }
+}
+function objectRows(storage,query,...args){
+  const gate=objectReadGates.get(storage);
+  if(gate?.until>Date.now())throw Error('DO daily row read limit');
+  try{return storage.sql.exec(query,...args).toArray();}
+  catch(error){gate?.record(error);throw error;}
 }
 export class NoteScheduler {
   constructor(ctx, env) {
-    this.ctx=ctx;this.busy=false;
+    this.ctx=ctx;this.busy=false;this.readGate=new ObjectReadGate(env.DB,ctx);
     const browser=coordinatedBrowser16916(env.BROWSER,ctx.storage,()=>!!this.desk?.ready&&this.desk.publicationPriority16916(Date.now()));
     const patrol=patrolCoordinator16931(ctx.storage);
     this.env=new Proxy(env,{get:(target,key,receiver)=>key==='BROWSER'?browser:key===PATROL_LOCAL16931?patrol:Reflect.get(target,key,receiver)});
   }
   async fetch(request) {
+    await this.readGate.restore();
+    if(this.readGate.until>Date.now())return this.readGate.response();
+    try{
+      const result=await this.handleRequest(request);
+      return this.readGate.until>Date.now()?this.readGate.response():result;
+    }catch(error){
+      this.readGate.record(error);
+      if(this.readGate.until>Date.now())return this.readGate.response();
+      throw error;
+    }
+  }
+  async handleRequest(request) {
     if (request) {
       const path = new URL(typeof request === 'string' ? request : request.url).pathname;
       if(path==='/security/admin-key'){
@@ -1400,8 +1488,10 @@ export class NoteScheduler {
     return new Response('OK');
   }
   async alarm() {
+    await this.readGate.restore();
     this.busy = true;
     try {
+      if(this.readGate.until>Date.now())return;
       await this.ctx.storage.setAlarm(Date.now() + 120000);
       await prepare(this.env);
       await sql(this.env,'UPDATE nh_v15_runtime SET heartbeat=? WHERE id=1',Date.now()).run();
@@ -1410,6 +1500,7 @@ export class NoteScheduler {
         this.desk.init();
         if(this.desk.duePublication(Date.now()))await this.desk.task520('予約作品の公開',()=>this.desk.dispatch(Date.now(),true));
       } catch { console.error('note-helper: publication preparation deferred'); }
+      if(this.readGate.until>Date.now())return;
       const schedule = await schedulerState(this.env);
       const due = schedule.active.find(s=>s.eligible<=Date.now());
       if (due) {
@@ -1453,12 +1544,22 @@ export class NoteScheduler {
         catch {console.error('note-helper: desk fallback deferred');}
       }
     } catch (error) {
+      this.readGate.record(error);
+      if(this.readGate.until>Date.now())return;
       if (!readLimit(error)) throw new Error('note-helper: scheduler storage/runtime failure');
       const nextReset = (Math.floor(Date.now()/(24*HOUR))+1)*24*HOUR;
       // D1に触れず、同じDOの予約を翌UTC日へ。OFF・lease・next_atは次回にも確認する。
       await this.ctx.storage.setAlarm(nextReset + 5000);
       console.warn('note-helper: D1 daily row read limit; alarm deferred to UTC reset');
-    } finally { this.busy = false; }
+    } finally {
+      this.busy=false;
+      if(this.readGate.until>Date.now()){
+        // Some limits reject alarm writes too. The existing four-minute cron
+        // will restore the alarm after reset; a rejected alarm need not retry now.
+        try{await this.ctx.storage.setAlarm(this.readGate.until);}
+        catch(error){if(!dailyObjectReadsExceeded(error))console.warn('note-helper: deferred alarm will recover via cron');}
+      }
+    }
   }
 }
 // 作品の公開情報は既存DOのSQLiteに記録。設定の確認と、本人の下書きの公開・参加済み共同誌への追加に既存の認証を使う。
@@ -1501,7 +1602,7 @@ function stub520(env) {
 }
 async function deskTick(env) {
   const r=await stub520(env).fetch('https://scheduler.internal/desk/tick');
-  if (!r.ok) throw Error('520 tick unavailable');
+  checkSchedulerResponse(r,'520 tick unavailable');
 }
 async function read520body(res, limit) {
   if (Number(res.headers.get('content-length'))>limit) {
@@ -1989,6 +2090,11 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
       return ['https://editor.note.com','https://note.com'].includes(u.origin) && !u.username && !u.password && m ? {key:m[1],url:u.origin+u.pathname} : null;
     }catch{return null;}
   };
+  if(step==='draftListReady'){
+    const requested=new URL(arg.url),current=new URL(location.href);
+    return [requested,current].every(u=>u.origin==='https://note.com' && !u.username && !u.password && /^\/notes\/?$/.test(u.pathname)) &&
+      current.search===requested.search && all(document,'a[href]').some(a=>editorLink(a.href));
+  }
   if(location.origin==='https://note.com' && /^\/notes\/?$/.test(location.pathname)){
     if(step==='findDraft'){
       const hits=[];
@@ -2023,7 +2129,8 @@ const nativeScreenJS=String.raw`function noteNativeScreen(step, arg) {
      new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname)){
     const value=e=>'value' in e?e.value:e.innerText;
     const inspectDraft=()=>{
-      const titles=all(document,'textarea,input,[contenteditable=true]').filter(e=>/^(記事)?タイトル(を入力)?$/.test(e.getAttribute('placeholder')||e.getAttribute('aria-label')||e.getAttribute('data-placeholder')||''));
+      const titles=all(document,'textarea,input,[contenteditable=true]').filter(e=>
+        ['placeholder','aria-label','data-placeholder'].some(attr=>/^(記事)?タイトル(を入力)?$/.test((e.getAttribute(attr)||'').trim())));
       const title=unique(titles);
       if(!title)return {state:titles.length?'title_ambiguous':'title_unavailable'};
       const bodies=all(document,'[contenteditable=true].ProseMirror,[contenteditable=true][role=textbox],[contenteditable=true][data-placeholder]').filter(e=>e!==title);
@@ -2162,7 +2269,7 @@ async function inspectDraftDirectory(binding,cookie,id,queries){
       await command('Page.navigate',{url});
       let loaded=false;
       for(let n=0;n<40 && !blocked() && Date.now()<end;n++){
-        try{loaded=await evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')');}catch{}
+        try{loaded=await evaluate('('+nativeScreenJS+')("draftListReady",'+JSON.stringify({url})+')');}catch{}
         if(loaded)break;
         await pause520(200);
       }
@@ -2230,7 +2337,7 @@ async function browserDelivery(binding, accountId, cookie, job, markAttempt) {
         visited.add(url);
         if(i)await navigate(url);
         // Wait for this exact page's article list to mount before reading its next link.
-        const loaded=await poll(()=>evaluate('location.href.split("#")[0]==='+JSON.stringify(url)+' && !!document.querySelector(\'a[href*="/notes/"][href*="/edit"]\')'),v=>v===true,40);
+        const loaded=await poll(()=>frame('draftListReady',{url}),v=>v===true,40);
         if(!loaded)return blocked()?blockedResult():{message:'下書きの一覧を読み込み待ち'};
         const result=await frame('findDraft',arg);
         if(result?.state==='found'){
@@ -2319,7 +2426,7 @@ const scoutSeeds=[
 const scoutProfiles=['https://note.com/azoworks','https://note.com/studio_yoizuki','https://note.com/shitosatashimaya'];
 class Desk520 {
   constructor(storage,env) { this.env=env; this.storage=storage; this.ready=false; this.pendingReads=new Map(); }
-  rows(q,...a) { return this.storage.sql.exec(q,...a).toArray(); }
+  rows(q,...a) { return objectRows(this.storage,q,...a); }
   one(q,...a) { return this.rows(q,...a)[0]; }
   init() {
     if(this.ready) return;
@@ -2412,6 +2519,7 @@ class Desk520 {
         this.rows("UPDATE desk_import SET due=0 WHERE allowed=1 AND state='保留' AND token=''");
       });
     }
+    this.initScheduleRanges();
     this.initJoin520();
     this.initTuta520();
     this.initShelf520();
@@ -2426,6 +2534,28 @@ class Desk520 {
     this.initProductionTest16920();
     this.networkTry16922(()=>{this.initNetwork16922();this.initRepeat16923();this.initContest16923();});
     this.ready=true;
+  }
+  initScheduleRanges(){
+    if(this.one("SELECT 1 FROM sqlite_master WHERE type='view' AND name='desk_open_schedule16939'"))return;
+    this.storage.transactionSync(()=>{
+      // Each branch can seek into a time index. A shared link's time overrides
+      // the manuscript time even if it points outside the requested window.
+      const manuscriptTime="unixepoch(w.d||'T'||COALESCE(NULLIF(w.t,''),w.suggested)||':00+09:00')*1000";
+      this.rows("CREATE INDEX desk_manuscript_time16939 ON desk_work(unixepoch(d||'T'||COALESCE(NULLIF(t,''),suggested)||':00+09:00')*1000) WHERE pub IS NULL");
+      this.rows('CREATE INDEX desk_link_all_time16939 ON desk_link_plan(scheduled,article)');
+      this.rows(`CREATE VIEW desk_open_schedule16939 AS
+        SELECT w.*,COALESCE(NULLIF(w.draft,''),b.article) AS key,COALESCE(b.paused,0) AS paused,NULL AS link_at,${manuscriptTime} AS scheduled
+        FROM desk_work w INDEXED BY desk_manuscript_time16939 LEFT JOIN desk_draft_identity b ON b.seq=w.seq
+        WHERE w.pub IS NULL AND NOT EXISTS(SELECT 1 FROM desk_link_plan l WHERE l.article=COALESCE(NULLIF(w.draft,''),b.article))
+        UNION ALL
+        SELECT w.*,w.draft AS key,COALESCE(b.paused,0) AS paused,l.scheduled AS link_at,l.scheduled AS scheduled
+        FROM desk_link_plan l CROSS JOIN desk_work w LEFT JOIN desk_draft_identity b ON b.seq=w.seq
+        WHERE w.draft=l.article AND w.draft<>'' AND w.pub IS NULL
+        UNION ALL
+        SELECT w.*,b.article AS key,b.paused AS paused,l.scheduled AS link_at,l.scheduled AS scheduled
+        FROM desk_link_plan l CROSS JOIN desk_draft_identity b CROSS JOIN desk_work w
+        WHERE b.article=l.article AND w.seq=b.seq AND NULLIF(w.draft,'') IS NULL AND w.pub IS NULL`);
+    });
   }
   async admin(req,ctx) {
     try {
@@ -2718,7 +2848,7 @@ class Desk520 {
       now-7*D520,now,6*D520,8*D520,30*D520);
     const scoutBudget=this.one('SELECT day,used FROM desk_scout_budget WHERE id=1');
     const magazineProgress=this.magazineProgress(now,eligible);
-    return {cfg,backlist,reach:this.reachView16933(now),circulation:this.circulationView16932(now),rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.taskHealthRows16928(),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,Date.now()),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
+    return {cfg,backlist,reach:this.reachView16933(now),circulation:this.circulationView16932(now),rssIntelligence:this.rssView16926(),repeat:this.repeatView16923(),contests:this.contestView16923(),audience:this.networkView16922(),runtime:this.runtimeView16916(),pipeline:this.pipelineView16913(),traffic:this.trafficView16913(),observation:this.observationView1698(),join:this.joinView520(),shelf:this.shelfView520(),popular:this.one('SELECT message,checked FROM desk_popular WHERE id=1'),magazineProgress,magazineProgressText:magazineProgressText520(magazineProgress),taskFailures:this.taskHealthRows16928(),reactions:this.one('SELECT confirmed,desired,checked,message FROM desk_reactions WHERE id=1'),scout:{total:this.one('SELECT COUNT(*) n FROM desk_import').n,allowed:eligible.length,used:scoutBudget.day===jstDay(now)?scoutBudget.used:0,message:this.one('SELECT message FROM desk_scout_state WHERE id=1').message},linkPlans:schedules.linkPlans,deliveryOn:this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled,delivery:this.rows('SELECT kind,label,phase,at,message FROM desk_job ORDER BY at DESC LIMIT 24'),recommendation:this.one('SELECT checked,message FROM desk_recommend WHERE id=1'),archive:this.archivePage(offset,now,eligible),growth:this.growthView(),directory:this.one('SELECT message FROM desk_directory WHERE id=1'),
       imports:this.rows(`SELECT i.id,i.url,i.name,i.allowed,i.rules,i.state,i.reason,m.mode,m.reason memberReason,m.checked memberChecked,m.due memberDue,i.due ruleDue FROM desk_import i LEFT JOIN desk_member m ON m.id=i.id WHERE i.allowed=1 OR m.mode='excluded' OR NOT EXISTS(SELECT 1 FROM desk_scout_mag sm WHERE sm.id=i.id)
         OR i.id IN (SELECT id FROM desk_scout_mag ORDER BY id LIMIT 80) ORDER BY i.allowed DESC,i.name,i.id`),probe:this.one('SELECT at,rss,creator,article FROM desk_probe WHERE id=1'),works:schedules.works.map(w=>({...w,magazine:urls.has(w.magurl)?w.magazine:null})),
       placements:this.rows('SELECT seq,name,observed FROM desk_placement ORDER BY seq,name'),
@@ -3177,8 +3307,7 @@ class Desk520 {
     }
     return true; // Completed this pass; an early return above is only a wait/skip.
   }
-  archivePage(offset,now) {
-    const magazines=this.eligibleMags(now);
+  archivePage(offset,now,magazines=this.eligibleMags(now)) {
     const rows=this.rows(`SELECT a.*,w.genre work_genre,w.method,w.chars work_chars FROM desk_archive a
       LEFT JOIN desk_work w ON w.article=a.article ORDER BY a.pub DESC,a.article LIMIT 31 OFFSET ?`,offset);
     const more=rows.length===31;
@@ -3370,7 +3499,7 @@ class Desk520 {
   }
   dueManuscript(now,subject=null){
     const start=this.one('SELECT start FROM desk_delivery WHERE id=1').start;
-    const row=this.one(`SELECT w.* FROM desk_work_schedule w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0
+    const row=this.one(`SELECT w.* FROM desk_open_schedule16939 w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0
       AND w.scheduled BETWEEN ? AND ? AND (? IS NULL OR w.seq=?)
       AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=CAST(w.seq AS TEXT)
         AND (j.phase<>'wait' OR (? IS NULL AND j.next>?)))
@@ -3541,7 +3670,10 @@ class Desk520 {
     if(waiting)return;
     probe?.capture?.({article:job.key,id:job.target,name:job.name,title:job.title,fresh:true});
     const label=job.kind==='publish'?job.title:job.title+' → '+job.name;
-    this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,article,message) VALUES(?,?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+15*M520,job.kind==='mag'?job.key:'');
+    // A restart during preflight may retry a still-eligible draft. Only the
+    // durable 'sent' transition below authorizes a click and prohibits replay.
+    const preflightRetry=job.kind==='publish'?M520:15*M520;
+    this.rows("INSERT INTO desk_job(kind,subject,target,label,at,next,article,message) VALUES(?,?,?,?,?,?,?,'本人と条件を照合中') ON CONFLICT(kind,subject) DO UPDATE SET target=excluded.target,label=excluded.label,at=excluded.at,next=excluded.next,message=excluded.message WHERE phase='wait'",job.kind,job.subject,job.target,label,now,now+preflightRetry,job.kind==='mag'?job.key:'');
     this.rows('UPDATE desk_delivery SET due=? WHERE id=1',now+M520);
     let message='通信を確認待ち',slot,lease,env,attemptAt=0,retry=job.kind==='mag'?D520:M520;
     try{
@@ -3682,7 +3814,7 @@ class Desk520 {
     // Leave the account lease available just before a scheduled publication.
     const soon=now+6*M520;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon) ||
-       this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon)) {
+       this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon)) {
       this.rows('UPDATE desk_reactions SET due=? WHERE id=1',now+6*M520);
       return;
     }
@@ -3758,7 +3890,7 @@ class Desk520 {
     if(state.due>now || (state.done && state.checked>now-7*D520))return;
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return;
-    if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) || this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+    if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) || this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const binding=this.env?.BROWSER;
     if(typeof binding?.acquire!=='function'){
       this.rows("UPDATE desk_recommend SET due=?,message='ブラウザー未接続・note設定の確認待ち' WHERE id=1",now+HOUR);
@@ -3893,6 +4025,7 @@ class Desk520 {
     return [...new Map([...rows,...(this.taskHealthMemory16928?.values()||[])].map(r=>[r.task,r])).values()].sort((a,b)=>b.at-a.at);
   }
   async task520(name, work) {
+    if(objectReadGates.get(this.storage)?.until>Date.now())return null;
     let result;
     const epoch=this.taskHealthEpoch16936?.get(name)||0;
     try {result=await work();}
@@ -5055,15 +5188,20 @@ async function browserJoin520(binding,id,cookie,job,mark,mayAct) {
     const who=await poll(()=>evaluate(noteIdentityJS),x=>x?.id && x?.name);
     if(blocked())return blockedResult();
     if(who?.id!==id || who?.name!=='43__')return {message:'520本人のログインを確認待ち'};
-    const member=async()=>{
-      const data=await evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;
+    const membership=await evaluate(`(async()=>{if(location.origin!=='https://note.com')return null;
+      try{
         const r=await fetch('/api/v1/magazines/${target.id}',{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});
-        return r.ok?await r.json():null;})()`);
-      return !blocked() && editorialProof162({id:target.id},data,'',joinFree520(data,job.feeHtml||'',target,job.feeNote)).ok;
-    };
-    if(await member())return {joined:true,message:'520が共同運営メンバーであることを確認済み'};
+        return r.ok?await r.json():null;
+      }catch{return null;}})()`);
     if(blocked())return blockedResult();
-    if(job.kind==='verify')return {message:'共同運営メンバーへの反映を再確認待ち'};
+    const mag=membership?.data?.magazine??membership?.data;
+    if(!mag || mag.key!==target.id || mag.owner?.urlname && mag.owner.urlname!==target.owner)
+      return {reason:'membership_read',message:'対象誌の参加状態を取得できず・申請と招待操作を保留'};
+    const free=joinFree520(membership,job.feeHtml||'',target,job.feeNote);
+    if(!free)return {reason:'participation_fee',message:'対象誌の無料条件を再確認できず・申請と招待操作を保留'};
+    if(editorialProof162(target,membership,'',free).ok)
+      return {joined:true,message:'520が共同運営メンバーであることを確認済み'};
+    if(job.kind==='verify')return {reason:'editorial_unconfirmed',message:'対象誌の共同編集権限を確認できません。参加済みへの変更・掲載は保留'};
     if(job.kind==='invite') {
       if(!inviteUrl520(job.url,target.id) || !await mayAct())return {message:'招待の対象・待機・設定を再確認待ち'};
       // Opening a bearer invitation can itself accept it. Persist before navigation, not after it.
@@ -5091,7 +5229,7 @@ async function browserJoin520(binding,id,cookie,job,mark,mayAct) {
       return blocked()?blockedResult():{expired:screen==='expired',message:screen==='expired'?'招待リンクが期限切れです。新しい招待を受信すると再確認します。':screen==='paid'?'有料の参加画面を検出・承認を保留':'承認操作を記録・次回に参加状態を別の接続で確認'};
     }
     if(job.kind==='apply') {
-      const preparation=await prepareJoinAccount520({command,evaluate,blocked,poll},target,id,job.steps||{},mark,mayAct);
+      const preparation=await prepareJoinAccount520({command,evaluate,blocked,poll},target,id,job.steps||{},mark,mayAct,job.feeNote);
       if(preparation)return blocked()?blockedResult():preparation;
     }
     await command('Page.navigate',{url:target.rule});
@@ -5112,7 +5250,9 @@ async function browserJoin520(binding,id,cookie,job,mark,mayAct) {
       await pause520(250);result=await form('read');
     }
     if(result?.state==='existing')return {existing:true,message:'520の参加希望コメントを確認済み・招待待ち'};
-    if(job.kind==='check')return {message:'申請結果は未確認・同じ申請は自動再送しません'};
+    if(job.kind==='check')return job.phase==='applied'
+      ? {reason:'invitation_wait',message:'以前の本人確認で申請コメントを確認済み・招待待ち。同じ申請は再送しません'}
+      : {reason:'application_unconfirmed',message:'申請結果は未確認・同じ申請は自動再送しません'};
     if(result?.state!=='ready')return {message:'コメント欄と過去の参加申請を読み切れず・申請を保留'};
     if(blocked())return blockedResult();
     if((await form('fill')).state!=='filled')return {message:'参加希望コメントの入力欄を確認待ち'};
@@ -5206,7 +5346,7 @@ Object.assign(Desk520.prototype,{
     if((!probe && cfg.due>now) || !this.joinActive520(''))return;
     // The publication window and existing account lease take priority over participation.
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) ||
-      this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+      this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const applicationRoom=(this.one('SELECT applications FROM desk_join_budget WHERE day=?',jstDay(now))?.applications||0)<DISTRIBUTION16918.applications &&
       this.one('SELECT app_next FROM desk_distribution16918 WHERE id=1').app_next<=now;
     const rows=this.rows(`SELECT j.* FROM desk_join j JOIN desk_join_target t ON t.id=j.id WHERE (j.due<=? OR ?) AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=j.id AND m.mode='excluded')
@@ -5272,7 +5412,7 @@ Object.assign(Desk520.prototype,{
       const marker=crypto.randomUUID();
       this.rows('UPDATE desk_join_cfg SET day=?,used=? WHERE id=1',today,used+1);
       const result=await browserJoin520(this.env.BROWSER,accountInfo.id,cleanCookie(credential.NOTE_SESSION),
-        {kind,target:target.id,definition:target,feeNote:note?.data,feeHtml:html||'',hash:note?.data?await draftBodyHash(note.data.body):null,url:link,
+        {kind,phase:row.phase,target:target.id,definition:target,feeNote:note?.data,feeHtml:html||'',hash:note?.data?await draftBodyHash(note.data.body):null,url:link,
           steps:Object.fromEntries(this.rows('SELECT step,at FROM desk_join_steps WHERE id=?',target.id).map(r=>[r.step,r.at]))},async(step=null)=>{
           if(!await live())return false;
           return this.storage.transactionSync(()=>{
@@ -5349,20 +5489,31 @@ function joinRecord520(j) {
 }
 
 // An application may require these native account actions. Unknown controls hold the request.
-function joinFollowDOM520(owner,action) {
-  if(location.origin!=='https://note.com' || location.pathname.replace(/\/$/,'')!=='/'+owner)return 'page';
-  const canonical=document.querySelector('link[rel=canonical]')?.href;
-  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\/$/,'')!=='/'+owner)return 'page';
-  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');
-  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();
-  const roots=[...document.querySelectorAll('[data-testid="creator-header"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));
-  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];
-  if(controls.length!==1)return 'missing';
-  const b=controls[0];
-  if(name(b)==='フォロー中')return 'on';
+function joinFollowDOM520(owner) {
+  const path='/'+owner;
+  if(location.origin!=='https://note.com' || location.pathname.replace(/\/$/,'')!==path)return 'page';
+  const canonical=document.querySelector('link[rel~="canonical"]')?.href;
+  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\/$/,'')!==path)return 'page';
+  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]') && getComputedStyle(e).visibility!=='hidden';
+  const headers=[...document.querySelectorAll('[data-testid="creator-header"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile')];
+  const roots=(headers.some(visible)?headers:[...document.querySelectorAll('header')])
+    .filter(e=>visible(e) && e.querySelector('h1,h2') && !e.closest('aside,nav,article'));
+  const controls=new Set();
+  for(const root of roots)for(const b of root.querySelectorAll('button,[role=button]')){
+    if(!visible(b) || b.closest('aside,nav,article'))continue;
+    const labels=[b.getAttribute('aria-label'),b.innerText].map(v=>v?.trim());
+    const recognized=labels.filter(l=>['フォロー','フォローする','フォロー中'].includes(l));
+    if(recognized.length)controls.add(b);
+  }
+  if(controls.size!==1)return controls.size?'ambiguous':'missing';
+  const [b]=controls;
   if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';
-  // This function is deliberately read-only, regardless of action.
-  return 'off';
+  const labels=[b.getAttribute('aria-label'),b.innerText].map(v=>v?.trim());
+  const pressed=b.getAttribute('aria-pressed');
+  if(pressed!==null && pressed!=='true' && pressed!=='false')return 'unknown';
+  if(labels.includes('フォロー中') && (pressed==='false'||labels.includes('フォローする')||pressed===null&&labels.includes('フォロー')))return 'conflict';
+  if(pressed==='true' && labels.includes('フォローする'))return 'conflict';
+  return pressed==='true' || labels.includes('フォロー中')?'on':'off';
 }
 // Navigate only controls actually present on note's settings screen. The
 // discovered pathname is passed to the reader; no notification URL is guessed.
@@ -5404,7 +5555,7 @@ function joinNotificationFailure16930(state,nav) {
     reasons[state]||reasons.missing;
   return {reason:detail[0],message:'「クリエイターからの招待・プレゼント」の設定を確認待ち：'+detail[1]+'。OFFとは判定していません。'};
 }
-async function prepareJoinAccount520(io,target,id,steps,mark,mayAct) {
+async function prepareJoinAccount520(io,target,id,steps,mark,mayAct,recruitment) {
   const {command,evaluate,blocked,poll}=io;
   const identity=async()=>{const who=await evaluate(noteIdentityJS);return who?.id===id && who.name==='43__' && !blocked() && await mayAct();};
   const code=recommendationControlJS;
@@ -5457,18 +5608,24 @@ async function prepareJoinAccount520(io,target,id,steps,mark,mayAct) {
   if(state!=='on')return joinNotificationFailure16930(observed,moved && navigation==='missing'?'':navigation);
   if(!target.follow)return null;
   await command('Page.navigate',{url:'https://note.com/'+target.owner});
-  const follow=action=>evaluate('('+BROWSER_SOURCES520.joinFollowDOM520+')('+JSON.stringify(target.owner)+','+JSON.stringify(action)+')');
-  state=await poll(()=>follow('read'),v=>['on','off'].includes(v));
+  const ownerId=recruitment?.key===target.article && recruitment.status==='published' && recruitment.user?.urlname===target.owner
+    && /^[1-9]\d{0,19}$/.test(String(recruitment.user.id))?String(recruitment.user.id):null;
+  let domState='missing',previous=null;
+  state=await poll(async()=>{
+    domState=await evaluate('('+BROWSER_SOURCES520.joinFollowDOM520+')('+JSON.stringify(target.owner)+')');
+    const stable=previous===domState;previous=domState;
+    return stable?domState:null;
+  },v=>['on','off'].includes(v));
   let direct=null;
   if(!state && !blocked() && await identity()){
-    direct=await evaluate('('+BROWSER_SOURCES520.noteRead16937+')('+JSON.stringify('follow')+','+JSON.stringify({owner:target.owner})+')');
+    direct=await evaluate('('+BROWSER_SOURCES520.noteRead16937+')("follow",'+JSON.stringify({owner:target.owner,ownerId})+')');
     const hold=noteReadHold16937(direct);if(hold)return hold;
     if(['on','off'].includes(direct?.state))state=direct.state;
   }
-  if(!await identity())return {message:'既存のフォロー状態と本人・待機状態を再確認待ち'};
+  if(!await identity())return {reason:'follow_identity',message:'既存のフォロー状態と本人・待機状態を再確認待ち'};
   if(state==='on')return null;
-  if(state!=='off')return {reason:'follow_unreadable',message:'募集元の運営者の既存フォロー状態を確認待ち。画面・読者データから判定できません。JOIN37/follow/'+(direct?.code?'http_'+direct.code:direct?.state||'missing')};
-  return {noFollow:true,message:'参加に新しいフォローが必要なため申請を見送り。フォロー数は増やしません'};
+  if(state!=='off')return {reason:'follow_unreadable',message:'募集元の運営者の既存フォロー状態を確認待ち。JOIN39/follow/'+domState+'/'+(direct?.code?'http_'+direct.code:direct?.state||'missing')};
+  return {noFollow:true,reason:'follow_required',message:'募集元の運営者を未フォローと確認。新しいフォローが必要なため申請を見送り'};
 }
 
 // Previous shelf records are retained for inspection only; no creation or addition code remains.
@@ -5548,8 +5705,7 @@ Object.assign(Desk520.prototype,{
   }
 });
 Object.assign(Desk520.prototype,{
-  chooseMagazine520(valid,genre,now){
-    const choices=valid.filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now));
+  chooseMagazine520(choices,genre,now){
     if(!choices.length)return null;
     if(choices.length===1)return choices[0];
     const rows=choices.map(m=>{
@@ -5819,7 +5975,7 @@ Object.assign(Desk520.prototype,{
     const state=this.one('SELECT * FROM desk_popular WHERE id=1');
     if(state.due>now || !this.deliveryActive520())return;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520)||
-      this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+      this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     this.rows('UPDATE desk_popular SET due=? WHERE id=1',now+2*HOUR);
     let env,lease,due=now+6*HOUR,message='人気記事の表示を再確認待ち';
     try{
@@ -6272,7 +6428,7 @@ Object.assign(Desk520.prototype,{
     const row=this.one('SELECT * FROM desk_tuta WHERE id=1');
     if(!row.enabled||!row.ciphertext||row.due>now||row.hold_until>now||row.lease>now||!this.joinActive520(''))return;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520)||
-      this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+      this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     const today=jstDay(now),used=row.day===today?row.used:0;
     if(used>=24){this.rows("UPDATE desk_tuta SET due=?,message='本日のTuta確認24回に達しました。翌日に続けます。' WHERE id=1",jstStart(today)+D520+M520);return;}
     const token=crypto.randomUUID();
@@ -6599,7 +6755,7 @@ Object.assign(Desk520.prototype,{
     if(!cfg.enabled || !cfg.delivery || cfg.blocked>now || state.next>now)return;
     const soon=now+6*M520;
     if(this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon) ||
-       this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon))return;
+       this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND paused=0 AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,soon))return;
     const today=jstDay(now),used=state.day===today?state.used:0;
     if(used>=OBSERVE1698.daily){this.rows('UPDATE desk_observe_state SET next=? WHERE id=1',jstStart(today)+D520+M520);return;}
     if(typeof this.env.BROWSER?.acquire!=='function'){
@@ -7570,7 +7726,7 @@ Object.assign(Desk520.prototype,{
     const state=this.one('SELECT due FROM desk_traffic16913 WHERE id=1');
     const active=()=>!!this.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
     if(state.due>now || !active() || this.one('SELECT 1 FROM desk_link_plan WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520) ||
-      this.one('SELECT 1 FROM desk_work_schedule WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
+      this.one('SELECT 1 FROM desk_open_schedule16939 WHERE pub IS NULL AND scheduled BETWEEN ? AND ? LIMIT 1',now-5*M520,now+6*M520))return;
     this.rows('UPDATE desk_traffic16913 SET due=? WHERE id=1',now+6*HOUR);
     let message='アクセス状況の接続を再確認待ち',env,token;
     try{
@@ -7700,6 +7856,11 @@ Object.assign(Desk520.prototype,{
   async dispatch(now,publicationOnly=false,probe=null){
     // Cron and the alarm can arrive together. A single in-memory operation plus
     // durable job/account leases prevent duplicate publication across restarts.
+    if(publicationOnly && !probe && this.deliveryTask16915){
+      await this.deliveryTask16915;
+      now=Date.now();
+      if(!this.duePublication(now))return;
+    }
     if(this.deliveryTask16915)return probe?undefined:this.deliveryTask16915;
     const work=this.dispatchUnlocked16915(now,publicationOnly,probe);
     this.deliveryTask16915=work;
@@ -7711,7 +7872,7 @@ Object.assign(Desk520.prototype,{
     const row=this.one(`SELECT MIN(scheduled) at FROM (
       SELECT l.scheduled FROM desk_link_plan l WHERE l.pub IS NULL AND l.scheduled>? AND l.scheduled<=?
         AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=l.article AND j.phase<>'wait')
-      UNION ALL SELECT w.scheduled FROM desk_work_schedule w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled>? AND w.scheduled<=?
+      UNION ALL SELECT w.scheduled FROM desk_open_schedule16939 w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled>? AND w.scheduled<=?
         AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=CAST(w.seq AS TEXT) AND j.phase<>'wait'))`,now,now+120000,now,now+120000);
     return row?.at||null;
   }
@@ -7835,7 +7996,7 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
   if(LOCAL_BROWSERS16921.has(raw)||typeof raw?.acquire!=='function')return raw;
   let ready=false;
   const sessions=new Map();
-  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
+  const rows=(q,...a)=>objectRows(storage,q,...a);
   const one=(q,...a)=>rows(q,...a)[0];
   const init=()=>{
     if(ready)return;
@@ -7920,7 +8081,7 @@ Object.assign(Desk520.prototype,{
     const args=[now-5*M520,now+6*M520];
     return !!this.one(`SELECT 1 FROM desk_link_plan l WHERE l.pub IS NULL AND l.scheduled BETWEEN ? AND ?
       AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=l.article AND j.phase<>'wait') LIMIT 1`,...args)||
-      !!this.one(`SELECT 1 FROM desk_work_schedule w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled BETWEEN ? AND ?
+      !!this.one(`SELECT 1 FROM desk_open_schedule16939 w WHERE w.pub IS NULL AND w.locked=0 AND w.paused=0 AND w.scheduled BETWEEN ? AND ?
       AND NOT EXISTS(SELECT 1 FROM desk_job j WHERE j.kind='publish' AND j.subject=CAST(w.seq AS TEXT) AND j.phase<>'wait') LIMIT 1`,...args);
   },
   runtimeView16916(){
@@ -8004,20 +8165,22 @@ Object.assign(Desk520.prototype,{
     });
   },
   placementCandidates16918(article,magazines,now,activeTarget=null){
+    const fits=this.archiveFits(article,magazines,now);
+    if(!fits.length)return [];
     const done=new Set(this.rows('SELECT id FROM desk_ref WHERE article=? UNION SELECT id FROM desk_mag_send WHERE article=?',article.article,article.article).map(r=>r.id));
     const jobs=new Map(this.rows("SELECT subject,target,phase,next FROM desk_job WHERE kind='mag' AND article=?",article.article).map(j=>[j.target,j]));
-    return this.archiveFits(article,magazines,now).filter(m=>{
+    return fits.filter(m=>{
       const link=noteLink161(m.url),job=jobs.get(link?.id);
       return link && link.owner!=='43__' && !done.has(link.id) && (!activeTarget || link.id===activeTarget) &&
         (!job || job.phase==='wait' && (job.next<=now || activeTarget===link.id));
     });
   },
-  eligiblePlacement(key,now,activeTarget=null){
+  eligiblePlacement(key,now,activeTarget=null,magazines=null){
     const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
     if(!a?.choice || a.title.trim()==='521' || !activeTarget && a.mag_due>now)return null;
     const pacing=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1');
     if(pacing.mag_next>now)return null;
-    const mag=this.chooseMagazine520(this.placementCandidates16918(a,this.eligibleMags(now),now,activeTarget),a.work_genre||a.genre,now,a);
+    const mag=this.chooseMagazine520(this.placementCandidates16918(a,magazines??this.eligibleMags(now),now,activeTarget),a.work_genre||a.genre,now,a);
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
     const prior=this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
@@ -8028,13 +8191,14 @@ Object.assign(Desk520.prototype,{
   nextPlacement(now,oldFirst){
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
     // Least recently circulated works go first. New works and backlist alternate.
+    let magazines; // One synchronous selection only. The pre-send check reads eligibility again.
     for(const old of [oldFirst,!oldFirst]){
       const keys=this.circulationTry16932(()=>this.circulationCandidates16932(now,old))||
         this.rows('SELECT article FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub '+(old?'<=?':'>?')+
           ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT 8',now,now-30*D520);
       for(const candidate of keys){
         const {article}=candidate;
-        const job=this.eligiblePlacement(article,now);
+        const job=this.eligiblePlacement(article,now,null,magazines??=this.eligibleMags(now));
         if(job){this.circulationTry16932(()=>this.recordCirculation16932(job,candidate,now));return job;}
         // A blocked publisher cannot monopolize the head of the queue.
         this.rows('UPDATE desk_archive SET mag_due=?,pick_due=MIN(pick_due,?) WHERE article=?',now+HOUR,now+HOUR,article);
@@ -8184,20 +8348,22 @@ Object.assign(Desk520.prototype,{
   },
   async savedProductionRecords(){
     // A diagnostic read on a new or older object must not initialize tables or wake an alarm.
-    const tables=new Set(this.rows("SELECT name FROM sqlite_master WHERE type='table'").map(r=>r.name));
-    const test=tables.has('desk_test16920') && this.one('SELECT id FROM desk_test16920 WHERE id=1')
+    // Once initialization has completed, the required tables are known to exist.
+    const tables=this.ready?null:new Set(this.rows("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('desk_test16920','desk_join','desk_join_check16930','desk_job','desk_task_health')").map(r=>r.name));
+    const hasTable=name=>this.ready || tables.has(name);
+    const test=hasTable('desk_test16920') && this.one('SELECT id FROM desk_test16920 WHERE id=1')
       ? this.productionTestView16920() : {version:VERSION,active:false,started:0,results:[]};
     const history=[];
-    if(tables.has('desk_join') && tables.has('desk_join_check16930'))history.push(...this.rows(
+    if(hasTable('desk_join') && hasTable('desk_join_check16930'))history.push(...this.rows(
       `SELECT '共同誌参加' AS feature,j.id AS subject,MAX(j.at,COALESCE(c.checked,0)) AS at,
         j.phase AS state,j.message,c.reason,j.due AS nextAt FROM desk_join j LEFT JOIN desk_join_check16930 c ON c.id=j.id
         WHERE j.at>0 OR c.checked>0 OR j.due>0 OR j.message<>'募集方法を確認待ち'
         ORDER BY MAX(j.at,COALESCE(c.checked,0)) DESC,j.due DESC,j.id LIMIT 40`));
-    else if(tables.has('desk_join'))history.push(...this.rows(
+    else if(hasTable('desk_join'))history.push(...this.rows(
       "SELECT '共同誌参加' AS feature,id AS subject,at,phase AS state,message,due AS nextAt FROM desk_join WHERE at>0 OR due>0 OR message<>'募集方法を確認待ち' ORDER BY at DESC,due DESC,id LIMIT 40"));
-    if(tables.has('desk_job'))history.push(...this.rows(
+    if(hasTable('desk_job'))history.push(...this.rows(
       "SELECT kind AS feature,at,phase AS state,message FROM desk_job WHERE at>0 ORDER BY at DESC LIMIT 24"));
-    if(tables.has('desk_task_health'))history.push(...this.rows(
+    if(hasTable('desk_task_health'))history.push(...this.rows(
       "SELECT task AS feature,at,CASE WHEN failed=1 THEN '失敗' ELSE '復旧' END AS state,message FROM desk_task_health ORDER BY at DESC LIMIT 40"));
     let diagnostics;
     try{diagnostics=await diagnosticRecord16915(this.env);}
@@ -8940,7 +9106,7 @@ Desk520.prototype.publicRead=function(path,format){
 const networkChooseBefore16922=Desk520.prototype.chooseMagazine520;
 Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
   const baseline=networkChooseBefore16922.call(this,valid,genre,now);
-  return this.networkTry16922(()=>this.networkChoose16922(valid.filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now)),baseline,work,now),baseline);
+  return this.networkTry16922(()=>this.networkChoose16922(valid,baseline,work,now),baseline);
 };
 function networkRecord16922(v){
   if(!v)return '';
@@ -9727,7 +9893,7 @@ Object.assign(Desk520.prototype,{
     return this.rssTry16926(()=>{
       const sent=this.one('SELECT COUNT(*) n FROM desk_mag_send WHERE article=?',work.article).n;
       if(sent%4===0)return base;
-      const choices=[base,...valid.filter(m=>m.url!==base.url)].filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now)).slice(0,24);
+      const choices=[base,...valid.filter(m=>m.url!==base.url)].slice(0,24);
       const matches=this.rows(`SELECT m.source,m.score FROM desk_rss_match16926 m JOIN desk_rss_brief16926 b ON b.source=m.source AND b.hash=m.hash
         WHERE m.article=? AND m.ready=1 AND m.at>=? AND b.checked>=?`,work.article,now-2*D520,now-2*D520);
       const matched=matches.sort((a,b)=>b.score-a.score).map(r=>({r,mag:choices.find(m=>noteLink161(m.url)?.id===r.source)})).find(x=>x.mag);
@@ -9828,8 +9994,33 @@ Object.assign(Desk520.prototype,{
 });
 const rssInitBefore16926=Desk520.prototype.init;
 Desk520.prototype.init=function(){
+  if(this.schemaRecorded)return;
+  if(!this.ready){
+    this.rows('CREATE TABLE IF NOT EXISTS desk_schema_state(id INTEGER PRIMARY KEY,version TEXT NOT NULL)');
+    if(this.one('SELECT version FROM desk_schema_state WHERE id=1')?.version===VERSION){
+      // Only a completed initialization for this exact release sets the marker.
+      this.expansionReady=true;
+      this.networkReady16922=true;
+      this.repeatReady16923=true;
+      this.contestReady16923=true;
+      this.rssReady16926=true;
+      this.ready=true;
+      this.schemaRecorded=true;
+      return;
+    }
+  }
   const result=rssInitBefore16926.call(this);
+  if(!this.networkReady16922 || !this.repeatReady16923 || !this.contestReady16923){
+    this.networkTry16922(()=>{this.initRepeat16923();this.initContest16923();});
+  }
   this.rssTry16926(()=>true,false);
+  if(this.ready && this.networkReady16922 && this.repeatReady16923 && this.contestReady16923 && this.rssReady16926){
+    this.storage.transactionSync(()=>{
+      this.rows('CREATE INDEX IF NOT EXISTS desk_job_recent ON desk_job(at DESC)');
+      this.rows('INSERT INTO desk_schema_state(id,version) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version',VERSION);
+    });
+    this.schemaRecorded=true;
+  }
   return result;
 };
 const rssFetchBefore16926=Desk520.prototype.fetchPublic;
@@ -9856,8 +10047,9 @@ Desk520.prototype.sourceForMagazine=async function(row){
 };
 const rssChooseBefore16926=Desk520.prototype.chooseMagazine520;
 Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
-  const base=rssChooseBefore16926.call(this,valid,genre,now,work);
-  return this.rssChoose16926(valid,base,work,now);
+  const eligible=valid.filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now));
+  const base=rssChooseBefore16926.call(this,eligible,genre,now,work);
+  return this.rssChoose16926(eligible,base,work,now);
 };
 function rssRecord16926(v){
   if(!v)return '【RSSと既刊の活用】追加情報を再確認待ち。通常処理は継続';
@@ -9871,7 +10063,7 @@ function rssRecord16926(v){
 }
 
 const BROWSER_SOURCES520 = Object.freeze({
-  "noteRead16937": "async function noteRead16937(kind,arg) {\n  // Read a known note response when native controls cannot be located. The\n  // exact location/canonical is rechecked after the await to reject navigation.\n  if(!arg || !/^[\\w-]{1,80}$/.test(arg.owner||'') || !['readers','follow'].includes(kind))return {state:'input'};\n  if(kind==='readers'&&!/^n[a-z0-9]{1,64}$/.test(arg.key||''))return {state:'input'};\n  const path='/'+arg.owner+(kind==='readers'?'/n/'+arg.key:'');\n  const samePage=()=>{\n    try{\n      const c=new URL(document.querySelector('link[rel=\"canonical\"]')?.href);\n      return location.origin==='https://note.com'&&location.pathname.replace(/\\/$/,'')===path&&c.origin===location.origin&&c.pathname.replace(/\\/$/,'')===path;\n    }catch{return false;}\n  };\n  if(!samePage())return {state:'page'};\n  try{\n    const endpoint=kind==='readers'?'/api/v3/notes/'+arg.key+'/likes':'/api/v2/creators/'+encodeURIComponent(arg.owner);\n    const r=await fetch(endpoint,{method:'GET',credentials:'same-origin',cache:'no-store',redirect:'error',headers:{Accept:'application/json'},signal:AbortSignal.timeout(4500)});\n    const retryAfter=(r.headers.get('Retry-After')||'').slice(0,100);\n    if(!r.ok||retryAfter)return {state:'http',code:r.status,retryAfter};\n    if(r.redirected || r.url && new URL(r.url,location.origin).href!==location.origin+endpoint)return {state:'response_url'};\n    if(!/\\b(?:application|text)\\/(?:[\\w.-]+\\+)?json\\b/i.test(r.headers.get('Content-Type')||''))return {state:'format'};\n    const limit=1024*1024;\n    if(Number(r.headers.get('Content-Length'))>limit){try{await r.body.cancel();}catch{}return {state:'size'};}\n    const stream=r.body.getReader(),decoder=new TextDecoder();let text='',size=0;\n    try{\n      for(;;){\n        const {done,value}=await stream.read();if(done)break;\n        size+=value.byteLength;\n        if(size>limit){await stream.cancel();return {state:'size'};}\n        text+=decoder.decode(value,{stream:true});\n      }\n      text+=decoder.decode();\n    }finally{stream.releaseLock();}\n    if(!samePage())return {state:'page'};\n    let j;try{j=JSON.parse(text);}catch{return {state:'format'};}\n    if(!j||typeof j!=='object'||j.error||j.errors)return {state:'shape'};\n    const d=j.data??j;\n    if(!d||typeof d!=='object'||Array.isArray(d))return {state:'shape'};\n    if(kind==='follow'){\n      if(d.urlname!==arg.owner || !/^[1-9]\\d{0,19}$/.test(String(d.id)))return {state:'owner'};\n      const values=[d.isFollowing,d.is_following,d.followings?.actively].filter(v=>typeof v==='boolean');\n      if(!values.length)return {state:'relationship'};\n      if(!values.every(v=>v===values[0]))return {state:'conflict'};\n      return {state:values[0]?'on':'off',via:'response'};\n    }\n    if(!Array.isArray(d.likes)||d.likes.length>200)return {state:'shape'};\n    // The source is fixed by the request, not by an unrelated page user list.\n    if(d.note?.key!==undefined&&d.note.key!==arg.key || d.note?.user?.urlname!==undefined&&d.note.user.urlname!==arg.owner)return {state:'article'};\n    const rows=d.likes,names=[];let anonymous=false;\n    for(const row of rows){\n      const u=row?.user;\n      if(u===null || u?.is_no_urlname_user===true){anonymous=true;continue;}\n      if(!u || !/^[\\w-]{1,80}$/.test(u.urlname||'') || !/^[1-9]\\d{0,19}$/.test(String(u.id)))return {state:'shape'};\n      names.push(u.urlname);\n    }\n    const unique=[...new Set(names)],raw=d.extra_fields?.like_count??d.extra_fields?.likeCount;\n    if(raw!==undefined&&(!Number.isSafeInteger(raw)||raw<0))return {state:'count'};\n    const endings=[j.is_last_page,d.is_last_page].filter(v=>typeof v==='boolean');\n    if(endings.length&&!endings.every(v=>v===endings[0]))return {state:'pagination'};\n    const last=endings.length>0&&endings[0]===true;\n    if(!rows.length&&!last&&raw!==0)return {state:'empty_unconfirmed'};\n    const expected=arg.expectedLikes;\n    const complete=last&&!anonymous&&unique.length===names.length&&Number.isSafeInteger(expected)&&expected>=0&&expected<=200&&raw===expected&&unique.length===expected;\n    return {state:'ready',via:'response',likesRead:true,owners:unique.filter(n=>n!==arg.owner).slice(0,20),likeOwners:unique.filter(n=>n!==arg.owner).slice(0,20),\n      comments:0,likers:unique.length,modal:false,busy:false,sampleOwners:unique,sampleComplete:complete};\n  }catch{return {state:'request'};}\n}",
+  "noteRead16937": "async function noteRead16937(kind,arg) {\n  // Read a known note response when native controls cannot be located. The\n  // exact location/canonical is rechecked after the await to reject navigation.\n  if(!arg || !/^[\\w-]{1,80}$/.test(arg.owner||'') || !['readers','follow'].includes(kind))return {state:'input'};\n  if(kind==='readers'&&!/^n[a-z0-9]{1,64}$/.test(arg.key||''))return {state:'input'};\n  const path='/'+arg.owner+(kind==='readers'?'/n/'+arg.key:'');\n  const samePage=()=>{\n    try{\n      const canonical=document.querySelector('link[rel~=\"canonical\"]');\n      // Some profile templates expose only og:url. Use it only when the\n      // verified recruitment article supplies an independent numeric owner ID.\n      const url=canonical?.href || (!canonical && kind==='follow' && /^[1-9]\\d{0,19}$/.test(arg.ownerId||'')\n        ? document.querySelector('meta[property=\"og:url\"]')?.content : null);\n      if(!url)return false;\n      const c=new URL(url);\n      return location.origin==='https://note.com'&&location.pathname.replace(/\\/$/,'')===path&&c.origin===location.origin&&c.pathname.replace(/\\/$/,'')===path;\n    }catch{return false;}\n  };\n  if(!samePage())return {state:'page'};\n  try{\n    const endpoint=kind==='readers'?'/api/v3/notes/'+arg.key+'/likes':'/api/v2/creators/'+encodeURIComponent(arg.owner);\n    const r=await fetch(endpoint,{method:'GET',credentials:'same-origin',cache:'no-store',redirect:'error',headers:{Accept:'application/json'},signal:AbortSignal.timeout(4500)});\n    const retryAfter=(r.headers.get('Retry-After')||'').slice(0,100);\n    if(!r.ok||retryAfter)return {state:'http',code:r.status,retryAfter};\n    if(r.redirected || r.url && new URL(r.url,location.origin).href!==location.origin+endpoint)return {state:'response_url'};\n    if(!/\\b(?:application|text)\\/(?:[\\w.-]+\\+)?json\\b/i.test(r.headers.get('Content-Type')||''))return {state:'format'};\n    const limit=1024*1024;\n    if(Number(r.headers.get('Content-Length'))>limit){try{await r.body.cancel();}catch{}return {state:'size'};}\n    const stream=r.body.getReader(),decoder=new TextDecoder();let text='',size=0;\n    try{\n      for(;;){\n        const {done,value}=await stream.read();if(done)break;\n        size+=value.byteLength;\n        if(size>limit){await stream.cancel();return {state:'size'};}\n        text+=decoder.decode(value,{stream:true});\n      }\n      text+=decoder.decode();\n    }finally{stream.releaseLock();}\n    if(!samePage())return {state:'page'};\n    let j;try{j=JSON.parse(text);}catch{return {state:'format'};}\n    if(!j||typeof j!=='object'||j.error||j.errors)return {state:'shape'};\n    const d=j.data??j;\n    if(!d||typeof d!=='object'||Array.isArray(d))return {state:'shape'};\n    if(kind==='follow'){\n      if(d.urlname!==arg.owner || !/^[1-9]\\d{0,19}$/.test(String(d.id)) || arg.ownerId && String(d.id)!==arg.ownerId)return {state:'owner'};\n      const values=[d.isFollowing,d.is_following,d.followings?.actively].filter(v=>typeof v==='boolean');\n      if(!values.length)return {state:'relationship'};\n      if(!values.every(v=>v===values[0]))return {state:'conflict'};\n      return {state:values[0]?'on':'off',via:'response'};\n    }\n    if(!Array.isArray(d.likes)||d.likes.length>200)return {state:'shape'};\n    // The source is fixed by the request, not by an unrelated page user list.\n    if(d.note?.key!==undefined&&d.note.key!==arg.key || d.note?.user?.urlname!==undefined&&d.note.user.urlname!==arg.owner)return {state:'article'};\n    const rows=d.likes,names=[];let anonymous=false;\n    for(const row of rows){\n      const u=row?.user;\n      if(u===null || u?.is_no_urlname_user===true){anonymous=true;continue;}\n      if(!u || !/^[\\w-]{1,80}$/.test(u.urlname||'') || !/^[1-9]\\d{0,19}$/.test(String(u.id)))return {state:'shape'};\n      names.push(u.urlname);\n    }\n    const unique=[...new Set(names)],raw=d.extra_fields?.like_count??d.extra_fields?.likeCount;\n    if(raw!==undefined&&(!Number.isSafeInteger(raw)||raw<0))return {state:'count'};\n    const endings=[j.is_last_page,d.is_last_page].filter(v=>typeof v==='boolean');\n    if(endings.length&&!endings.every(v=>v===endings[0]))return {state:'pagination'};\n    const last=endings.length>0&&endings[0]===true;\n    if(!rows.length&&!last&&raw!==0)return {state:'empty_unconfirmed'};\n    const expected=arg.expectedLikes;\n    const complete=last&&!anonymous&&unique.length===names.length&&Number.isSafeInteger(expected)&&expected>=0&&expected<=200&&raw===expected&&unique.length===expected;\n    return {state:'ready',via:'response',likesRead:true,owners:unique.filter(n=>n!==arg.owner).slice(0,20),likeOwners:unique.filter(n=>n!==arg.owner).slice(0,20),\n      comments:0,likers:unique.length,modal:false,busy:false,sampleOwners:unique,sampleComplete:complete};\n  }catch{return {state:'request'};}\n}",
   "contestScreen16923": "function contestScreen16923(step,arg){\n  if(!['https://note.com','https://editor.note.com'].includes(location.origin)||\n    !new RegExp('^/notes/'+arg.key+'/(edit|publish|publish_setting|publish_settings)/?$').test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length&&!e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(root,sel)=>[...root.querySelectorAll(sel)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||'').trim();\n  const one=xs=>xs.length===1?xs[0]:null;\n  const button=(root,labels)=>one(all(root,'button,[role=button]').filter(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(name(e))));\n  const dialogs=all(document,'[role=dialog],dialog');\n  if(dialogs.length){\n    const dialog=one(dialogs),text=dialog?.innerText||'';\n    const ok=dialog&&button(dialog,['OK']);\n    if(!ok||!text.includes(arg.tag)||!/コンテスト.{1,160}に参加します/.test(text)||!/よろしいですか/.test(text)||/購入|支払|有料|料金|同意書/.test(text))return {state:'unknown_dialog'};\n    if(step==='confirm'){ok.click();return {state:'confirmed'};}\n    return {state:'confirmation'};\n  }\n  if(step==='settings'){\n    const go=button(document,['公開に進む','公開設定']);if(!go)return {state:'missing'};\n    go.click();return {state:'opened'};\n  }\n  const submit=button(document,['更新する']);if(!submit)return {state:'missing'};\n  const inputs=all(document,'input,textarea').filter(e=>/ハッシュタグ/.test(e.placeholder||e.getAttribute('aria-label')||''));\n  const field=one(inputs);if(!field||field.disabled||field.readOnly||field.value.trim())return {state:'tag_field'};\n  const selected=all(document,'[aria-checked=true],[aria-selected=true],[aria-pressed=true]').map(name);\n  for(const e of document.querySelectorAll('input:checked'))selected.push([...(e.labels||[])].map(name).join('')||name(e));\n  if(!selected.includes('無料')||selected.some(t=>/有料|メンバーシップ|日時指定|予約|SNS|Xに|Twitter/.test(t))||\n    all(document,'input[type=\"datetime-local\"],[name*=\"schedul\"][type=hidden]').some(e=>e.value))return {state:'settings'};\n  const expected=[...new Set(arg.tags)].sort();\n  const values=[];\n  for(const chip of document.querySelectorAll('[data-selected-tag],[data-tag],[class*=tagChip],[class*=TagChip],input[name=\"hashtags[]\"]')){\n    const raw=chip.getAttribute('data-selected-tag')||chip.getAttribute('data-tag')||chip.value||chip.innerText||'';\n    const clean=raw.replace(/(?:削除|外す|取り消す|[×✕])\\s*$/,'').replace(/^#/,'').trim();\n    if(clean&&!/\\n/.test(clean))values.push(clean);\n  }\n  for(const el of all(document,'[aria-label]')){\n    const label=el.getAttribute('aria-label')||'';\n    const m=/^ハッシュタグ\\s*#?(.+?)(?:\\s*を)?(?:削除|外す)$/.exec(label);if(m)values.push(m[1].trim());\n  }\n  const actual=[...new Set(values)].sort();\n  const tags=JSON.stringify(actual)===JSON.stringify(expected)?actual:null;\n  if(!tags)return {state:'tags'};\n  if(step==='ready'&&!tags.includes(arg.tag)&&tags.length>=10)return {state:'tag_limit'};\n  if(step==='ready'||step==='updatedReady')return {state:'ready'};\n  if(step==='add'){\n    if(tags.includes(arg.tag))return {state:'already'};\n    if(tags.length>=10)return {state:'tag_limit'};\n    const proto=field.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\n    const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return {state:'tag_field'};\n    setter.call(field,arg.tag);field.dispatchEvent(new Event('input',{bubbles:true}));\n    field.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));\n    field.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));\n    return {state:'added'};\n  }\n  if(step==='update'){submit.click();return {state:'clicked'};}\n  return {state:'unknown'};\n}",
   "contestBrowserRead16923": "async function contestBrowserRead16923(key){\n  if(location.origin!=='https://note.com'||!/^n[a-z0-9]{1,64}$/.test(key))return null;\n  const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(4500)});\n  if(!r.ok)return null;\n  const n=(await r.json())?.data;return n?.key===key?n:null;\n}",
   "trafficScreen16913": "function trafficScreen16913(step='read') {\n  if(location.origin!=='https://note.com' || !/^\\/dashboard\\/?$/.test(location.pathname))return {state:'page'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const root=document.querySelector('main,[role=\"main\"]')||document.body;\n  if(!root)return {state:'loading'};\n  const clean=t=>(t||'').normalize('NFKC').replace(/[\\u200b\\u200e\\u200f]/g,'').trim();\n  const all=s=>[...root.querySelectorAll(s)].filter(visible);\n  const text=clean(root.innerText),header=text.split(/直近1[ヶかケ]月のまとめ|あなたへの提案|記事の流入元/)[0];\n  if(!/アクセス状況/.test(text) || !/インプレッション/.test(header) || !/ページビュー/.test(header))return {state:'layout'};\n  if(/この期間のデータはありません|集計中|読み込み中/.test(header))return {state:'loading'};\n  const stamps=[...header.matchAll(/(\\d{4})[\\/年.-](\\d{1,2})[\\/月.-](\\d{1,2})日?\\s*(?:〜|～|~|–|−|—|-|から)\\s*(?:(\\d{4})[\\/年.-])?(\\d{1,2})[\\/月.-](\\d{1,2})日?/g)];\n  const dates=[...new Set(stamps.map(m=>JSON.stringify([m[1]+'-'+m[2].padStart(2,'0')+'-'+m[3].padStart(2,'0'),(m[4]||m[1])+'-'+m[5].padStart(2,'0')+'-'+m[6].padStart(2,'0')])))] ;\n  if(dates.length!==1)return {state:'period'};\n  const [start,end]=JSON.parse(dates[0]);\n  if(step==='previous'){\n    // Only the displayed dashboard's period navigation, never account settings.\n    const controls=all('button').filter(b=>!b.disabled && b.getAttribute('aria-disabled')!=='true' &&\n      /^(?:前の期間(?:へ|に移動|を表示)?|前期間|Previous period)$/i.test(clean(b.getAttribute('aria-label')||b.getAttribute('title')||b.innerText)));\n    if(controls.length!==1)return {state:'previous_missing'};\n    controls[0].click();return {state:'moved',start,end};\n  }\n  const values={},labels={impressions:'インプレッション',pageviews:'ページビュー',likes:'スキ',comments:'コメント'};\n  const nodes=all('span,p,dt,dd,div,button,strong,h2,h3');\n  for(const [key,label] of Object.entries(labels)){\n    const found=new Set();\n    for(const el of nodes.filter(e=>clean(e.innerText)===label)){\n      // Summary metric cards have one label and one exact count. Article rows,\n      // charts, menus and comparison percentages cannot pass this whole match.\n      for(let p=el.parentElement,n=0;p&&p!==root&&n<4;p=p.parentElement,n++){\n        const value=clean(p.innerText).replace(/\\s/g,'');\n        const match=new RegExp('^(?:'+label+'([0-9,]+|[-−–—])(?:回|件)?|([0-9,]+|[-−–—])(?:回|件)?'+label+')$').exec(value);\n        if(match){\n          const raw=match[1]||match[2];\n          if(/^[0-9]+$|^[1-9][0-9]{0,2}(?:,[0-9]{3})+$/.test(raw))found.add(Number(raw.replaceAll(',','')));\n          // note documents '-' as zero for the modern metrics. Do not apply it\n          // to pre-2021 impressions or missing/unavailable data.\n          else if(/^[-−–—]$/.test(raw) && start>='2021-05-01')found.add(0);\n          break;\n        }\n      }\n    }\n    if(found.size!==1 || !Number.isSafeInteger([...found][0]))return {state:'metrics',field:key};\n    values[key]=[...found][0];\n  }\n  const updated=[...header.matchAll(/(\\d{4}[\\/年.-]\\d{1,2}[\\/月.-]\\d{1,2}日?\\s+\\d{1,2}:\\d{2}(?::\\d{2})?)\\s*集計/g)].map(m=>m[1]);\n  const refText=text.split('記事の流入元').slice(1).join('記事の流入元'),referrers=[];\n  const pattern=/((?:[a-z0-9-]+\\.)+[a-z]{2,63}|no referrer|other|流入元不明|X|Facebook|Google|Instagram)\\s+(\\d+(?:\\.\\d+)?)\\s*%\\s*\\(\\s*([\\d,]+)\\s*PV\\s*\\)/gi;\n  for(const m of refText.matchAll(pattern)){\n    const count=Number(m[3].replaceAll(',','')),share=Number(m[2]),name=m[1];\n    if(Number.isSafeInteger(count)&&count>=0&&share>=0&&share<=100&&!referrers.some(r=>r.name===name))referrers.push({name,pageviews:count,share});\n  }\n  if(referrers.length>12)return {state:'referrers'};\n  return {state:'ready',start,end,...values,updated:updated.length===1?updated[0]:'',referrers,\n    referrersRead:referrers.length>0,signature:JSON.stringify([start,end,values,updated,referrers])};\n}",
@@ -9884,7 +10076,7 @@ const BROWSER_SOURCES520 = Object.freeze({
   "readDraftCover": "async function readDraftCover(key,accountId,hashBody) {\n  if(location.origin!=='https://note.com' || !/^n[a-z0-9]{1,64}$/.test(key))return null;\n  try {\n    const r=await fetch('/api/v3/notes/'+key,{credentials:'same-origin',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(4500)});\n    if(!r.ok)return null;\n    const n=(await r.json())?.data;\n    if(!n || n.key!==key)return null;\n    if(n.user?.urlname && n.user.urlname!=='43__' || n.user?.id && String(n.user.id)!==accountId || ['published','reserved','scheduled'].includes(n.status) ||\n       [n.scheduledPublishAt,n.scheduled_publish_at,n.publishAt,n.publish_at].some(t=>t && Date.parse(t)>Date.now()))return {unsafe:true};\n    if(n.status!=='draft' || n.user?.urlname!=='43__' || String(n.user.id)!==accountId)return null;\n    const full=n.is_limited!==true && n.is_paid!==true && !(Number(n.price)>0);\n    return {name:n.name,hash:full?await hashBody(n.body):null,...(Object.hasOwn(n,'eyecatch')?{cover:n.eyecatch}:{})};\n  }catch{return null;}\n}",
   "draftBodyHash": "async function draftBodyHash(body){\n  if(typeof body!=='string' || !body.trim() || body.length>2500000)return null;\n  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(body));\n  return Array.from(new Uint8Array(digest),v=>v.toString(16).padStart(2,'0')).join('');\n}",
   "noteJoinDOM520": "function noteJoinDOM520(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.article)return {state:'page'};\n  const canonical=document.querySelector('link[rel=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.value||'').trim();\n  const fields=[...document.querySelectorAll('textarea')].filter(e=>visible(e) && !e.disabled && !e.readOnly && /コメント/.test([e.placeholder,e.getAttribute('aria-label'),...Array.from(e.labels||[],l=>l.textContent)].join(' ')));\n  if(fields.length!==1)return {state:'composer'};\n  const field=fields[0];\n  const nodes=[...document.querySelectorAll('[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-commentList__item,.m-commentList__item')].filter(visible);\n  const cards=nodes.filter(n=>!nodes.some(other=>other!==n && other.contains(n)));\n  for(const card of cards) {\n    const own=[...card.querySelectorAll('a[href]')].some(a=>{try{const u=new URL(a.href);return u.origin===location.origin && u.pathname.replace(/\\/$/,'')==='/43__';}catch{return false;}});\n    if(own && /参加(?:を)?希望|参加したい|招待/.test(card.innerText))return {state:'existing'};\n  }\n  const load=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>visible(e) && /^(?:もっと見る|さらに表示|コメントをすべて見る|すべてのコメントを表示|以前のコメントを表示|次のコメント)$/.test(name(e)) &&\n    (e.closest('[class*=\"comment\"],[class*=\"Comment\"],[data-testid*=\"comment\"]')));\n  if(step==='more' && load.length===1){load[0].click();return {state:'loading'};}\n  // An incomplete comment history cannot establish that this account has not already applied.\n  if(!Number.isSafeInteger(arg.count) || arg.count<0 || cards.length!==arg.count || load.length)return {state:'history'};\n  if(step==='read')return {state:'ready'};\n  let scope=field.closest('form')||field.parentElement;\n  let buttons=[];\n  for(let depth=0;scope && depth<5;depth++,scope=scope.parentElement) {\n    if(scope.querySelectorAll('textarea').length!==1)break;\n    buttons=[...scope.querySelectorAll('button,input[type=submit],[role=button]')].filter(e=>visible(e) && name(e)==='送信');\n    if(buttons.length)break;\n  }\n  if(buttons.length!==1 || field.closest('[role=dialog]'))return {state:'composer'};\n  if(step==='fill') {\n    if(field.value && field.value!==arg.comment)return {state:'draft'};\n    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(field,arg.comment);\n    field.dispatchEvent(new Event('input',{bubbles:true}));field.dispatchEvent(new Event('change',{bubbles:true}));\n    return {state:'filled'};\n  }\n  if(step==='send') {\n    if(field.value!==arg.comment || buttons[0].disabled || buttons[0].getAttribute('aria-disabled')==='true')return {state:'composer'};\n    buttons[0].click();return {state:'clicked'};\n  }\n  return {state:'page'};\n}",
-  "joinFollowDOM520": "function joinFollowDOM520(owner,action) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const canonical=document.querySelector('link[rel=canonical]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!=='/'+owner)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]');\n  const name=e=>(e.getAttribute('aria-label')||e.textContent||'').trim();\n  const roots=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile,header')].filter(e=>visible(e)&&e.querySelector('h1,h2'));\n  const controls=[...new Set(roots.flatMap(root=>[...root.querySelectorAll('button')]).filter(e=>visible(e)&&['フォロー','フォローする','フォロー中'].includes(name(e))))];\n  if(controls.length!==1)return 'missing';\n  const b=controls[0];\n  if(name(b)==='フォロー中')return 'on';\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  // This function is deliberately read-only, regardless of action.\n  return 'off';\n}",
+  "joinFollowDOM520": "function joinFollowDOM520(owner) {\n  const path='/'+owner;\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!==path)return 'page';\n  const canonical=document.querySelector('link[rel~=\"canonical\"]')?.href;\n  if(!canonical || new URL(canonical).origin!==location.origin || new URL(canonical).pathname.replace(/\\/$/,'')!==path)return 'page';\n  const visible=e=>e.getClientRects().length>0 && !e.closest('[hidden],[aria-hidden=true]') && getComputedStyle(e).visibility!=='hidden';\n  const headers=[...document.querySelectorAll('[data-testid=\"creator-header\"],.o-creatorProfile,.o-creatorHeader,.m-creatorProfile')];\n  const roots=(headers.some(visible)?headers:[...document.querySelectorAll('header')])\n    .filter(e=>visible(e) && e.querySelector('h1,h2') && !e.closest('aside,nav,article'));\n  const controls=new Set();\n  for(const root of roots)for(const b of root.querySelectorAll('button,[role=button]')){\n    if(!visible(b) || b.closest('aside,nav,article'))continue;\n    const labels=[b.getAttribute('aria-label'),b.innerText].map(v=>v?.trim());\n    const recognized=labels.filter(l=>['フォロー','フォローする','フォロー中'].includes(l));\n    if(recognized.length)controls.add(b);\n  }\n  if(controls.size!==1)return controls.size?'ambiguous':'missing';\n  const [b]=controls;\n  if(b.disabled || b.getAttribute('aria-disabled')==='true')return 'disabled';\n  const labels=[b.getAttribute('aria-label'),b.innerText].map(v=>v?.trim());\n  const pressed=b.getAttribute('aria-pressed');\n  if(pressed!==null && pressed!=='true' && pressed!=='false')return 'unknown';\n  if(labels.includes('フォロー中') && (pressed==='false'||labels.includes('フォローする')||pressed===null&&labels.includes('フォロー')))return 'conflict';\n  if(pressed==='true' && labels.includes('フォローする'))return 'conflict';\n  return pressed==='true' || labels.includes('フォロー中')?'on':'off';\n}",
   "tutaScreen520": "async function tutaScreen520(step,arg={}) {\n  if(location.origin!=='https://app.tuta.com')return {state:'outside'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const all=(selector,root=document)=>[...root.querySelectorAll(selector)].filter(visible);\n  const name=e=>(e.getAttribute('aria-label')||e.innerText||e.textContent||e.value||'').trim();\n  const label=e=>[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.name,\n    ...(e.getAttribute('aria-labelledby')||'').split(/\\s+/).filter(Boolean).map(id=>document.getElementById(id)?.textContent),\n    ...Array.from(e.labels||[],name)].filter(Boolean).join(' ');\n  const unique=xs=>xs.length===1?xs[0]:null;\n  const input=(e,v)=>{\n    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\n    e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));\n  };\n  const buttons=(root=document)=>all('button,[role=\"button\"],input[type=\"submit\"]',root).filter(e=>!e.disabled && e.getAttribute('aria-disabled')!=='true');\n  const passwords=all('input[type=\"password\"]').filter(e=>!e.disabled);\n  const emails=all('input[type=\"email\"],input[autocomplete=\"username\"],input[type=\"text\"]')\n    .filter(e=>!e.disabled && (e.type==='email'||e.autocomplete==='username'||/e-?mail|メールアドレス/i.test(label(e))));\n  const otp=all('input').filter(e=>!e.disabled && e.type!=='hidden' && (e.autocomplete==='one-time-code'||/TOTP|authentication code|認証コード|authentifizierungscode/i.test(label(e))));\n  const captcha=all('iframe[src*=\"captcha\"],input[name*=\"captcha\"]');\n  if(captcha.length)return {state:'challenge'};\n  if(['login','loginReady','loginSubmit'].includes(step)) {\n    if(!/^\\/(?:login)?\\/?$/.test(location.pathname))return {state:'outside'};\n    const email=unique(emails),pass=unique(passwords.filter(e=>!otp.includes(e)));\n    if(!email||!pass)return {state:'page',reason:'login_fields'};\n    if(step==='login'){\n      input(email,arg.email);input(pass,arg.password);\n      return email.value===arg.email&&pass.value===arg.password?{state:'filled'}:{state:'page',reason:'login_values'};\n    }\n    const submit=unique(buttons().filter(e=>/^(?:log\\s?in|sign in|ログイン|anmelden)$/i.test(name(e))));\n    if(email.value!==arg.email||!pass.value)return {state:'page',reason:'login_values'};\n    if(!submit)return {state:'page',reason:'login_button'};\n    if(step==='loginReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(['otp','otpReady','otpSubmit'].includes(step)) {\n    const field=unique(otp),root=field?.closest('[role=\"dialog\"],dialog,form')||document;\n    if(!field)return {state:'challenge'};\n    if(step==='otp'){\n      if(!/^\\d{6}$/.test(arg.code||''))return {state:'challenge'};\n      input(field,arg.code);return {state:'filled'};\n    }\n    const submit=unique(buttons(root).filter(e=>/^(?:verify|confirm|ok|log\\s?in|確認|認証|ログイン|bestätigen)$/i.test(name(e))));\n    if(!/^\\d{6}$/.test(field.value))return {state:'page',reason:'otp_values'};\n    if(!submit)return {state:'page',reason:'otp_button'};\n    if(step==='otpReady')return {state:'ready'};\n    submit.click();return {state:'sent'};\n  }\n  if(otp.length)return {state:'otp'};\n  if(passwords.length && emails.length)return {state:'login'};\n\n  // Mithril stores its vnode tree on its mount element. Walk only vnode edges;\n  // email HTML and DOM attributes cannot create an application model here.\n  const queue=[];\n  for(const el of [document.documentElement,document.body,...Array.from(document.querySelectorAll('div')).slice(0,300)]) {\n    const nodes=Object.getOwnPropertyDescriptor(el||{},'vnodes')?.value;\n    if(Array.isArray(nodes))queue.push(...nodes);\n  }\n  const seen=new Set(),models=new Set();\n  for(let i=0;i<queue.length && i<12000;i++) {\n    const node=queue[i];if(!node||typeof node!=='object'||seen.has(node))continue;seen.add(node);\n    for(const container of [node.attrs,node.state]) {\n      const model=container?.mailViewModel;\n      if(model && typeof model.onSingleSelection==='function' && typeof model.getConversationViewModel==='function' && model.listModel)models.add(model);\n    }\n    if(node.instance)queue.push(node.instance);\n    if(Array.isArray(node.children))queue.push(...node.children);\n  }\n  const model=unique([...models]);if(!model)return {state:'page',reason:models.size?'model_ambiguous':'model_missing'};\n  const list=model.listModel;\n  if(!list)return {state:'loading'};\n  // Only the trusted application's selected mailbox model supplies mail data.\n  // Older stream-based state and wrapped rows coexist with newer mails getters.\n  const read=(object,name)=>{try{return object?.[name];}catch{return undefined;}};\n  let state=read(list,'state');\n  if(typeof state==='function'){try{state=state.call(list);}catch{state=null;}}\n  const direct=read(list,'mails'),visibleItems=read(list,'items');\n  const raw=Array.isArray(direct)?direct:Array.isArray(state?.items)?state.items:Array.isArray(visibleItems)?visibleItems:null;\n  if(!raw)return {state:!state&&!direct&&!visibleItems?'loading':'page',reason:'list_contract'};\n  const mailValue=value=>{\n    const valid=m=>Array.isArray(m?._id)&&m._id.length===2 && m._id.every(x=>typeof x==='string'&&x.length<200) &&\n      typeof m.subject==='string' && typeof m.sender?.address==='string' && Number.isFinite(new Date(m.receivedDate).getTime());\n    if(valid(value))return value;\n    // No recursive scan through mail bodies, attachments or untrusted HTML.\n    if(valid(value?.mail))return value.mail;\n    return null;\n  };\n  const items=raw.map(mailValue).filter(Boolean);\n  let complete=false,legacy=false;\n  if(typeof list.isLoadedCompletely==='function'){\n    const done=list.isLoadedCompletely();\n    if(typeof done!=='boolean')return {state:'page',reason:'list_contract'};\n    complete=done;legacy=Array.isArray(state?.items);\n  }else if(typeof list.isEmptyAndDone==='function'){\n    const empty=list.isEmptyAndDone();\n    if(typeof empty!=='boolean'||empty&&raw.length)return {state:'page',reason:'list_contract'};\n    complete=empty;\n  }\n  if(raw.length && !items.length)return {state:'page',reason:'list_contract'};\n  if(items.length!==raw.length)complete=false;\n\n  // Locate the signed-in controller through the trusted application's own model\n  // dependencies. Never infer identity from text in an email or a screen label.\n  const dependencies=[{object:model,depth:0}],checked=new Set();let identity=false,wrong=false;\n  for(let i=0;i<dependencies.length && i<600;i++) {\n    const {object,depth}=dependencies[i];\n    if(!object || typeof object!=='object' || checked.has(object) || object instanceof Node)continue;\n    checked.add(object);\n    if(typeof object.getUserController==='function') {\n      try{\n        const email=object.getUserController()?.userGroupInfo?.mailAddress;\n        if(typeof email==='string'){if(email.toLowerCase()===arg.email)identity=true;else wrong=true;}\n      }catch{}\n    }\n    if(depth<4)for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {\n      if(descriptor.value && typeof descriptor.value==='object')dependencies.push({object:descriptor.value,depth:depth+1});\n    }\n  }\n  if(wrong || !identity)return {state:'identity',reason:wrong?'account_mismatch':'account_unconfirmed'};\n  if(!items.length && !complete)return {state:'loading'};\n  const key=mail=>Array.isArray(mail?._id)&&mail._id.length===2 && mail._id.every(v=>typeof v==='string' && v.length<200)?JSON.stringify(mail._id):null;\n  const sender=address=>typeof address==='string' && /^[^@<>\\s,;]+@(?:[a-z0-9-]+\\.)?note\\.(?:com|mu)$/i.test(address);\n  const date=mail=>new Date(mail.receivedDate).getTime();\n  const recent=mail=>Number.isFinite(date(mail)) && date(mail)>=arg.since && date(mail)<=Date.now();\n  const candidates=items.filter(mail=>key(mail) && recent(mail) && sender(mail.sender?.address) && /招待|invitation|invited/i.test(mail.subject||''));\n  if(step==='list')return {state:'ready',items:candidates.map(mail=>({key:key(mail),received:date(mail)})),\n    // mails in the current model are not ordered by receivedDate. Never declare\n    // the inbox exhausted merely because a grouped/unsorted old mail is present.\n    complete:complete || (legacy && items.length===raw.length && items.every((mail,i)=>Number.isFinite(date(mail)) && (!i || date(items[i-1])>=date(mail))) && items.some(mail=>date(mail)<arg.since))};\n  if(step==='more') {\n    if(typeof list.loadMore!=='function')return {state:'page'};\n    const before=items.map(mail=>key(mail)).join('|');\n    await list.loadMore();\n    let state=read(list,'state');\n    if(typeof state==='function')state=state.call(list);\n    const direct=read(list,'mails');\n    const next=Array.isArray(direct)?direct:Array.isArray(state?.items)?state.items:read(list,'items');\n    const finished=typeof list.isLoadedCompletely==='function'?list.isLoadedCompletely()===true:\n      typeof list.isEmptyAndDone==='function'?list.isEmptyAndDone()===true:false;\n    if(finished)return {state:'loaded'};\n    return Array.isArray(next) && next.map(mailValue).filter(Boolean).map(mail=>key(mail)).join('|')!==before?{state:'loaded'}:{state:'unchanged'};\n  }\n  if(step==='open') {\n    const mail=unique(candidates.filter(mail=>key(mail)===arg.key));\n    if(!mail)return {state:'changed'};\n    await model.onSingleSelection(mail);return {state:'opened'};\n  }\n  if(step!=='read')return {state:'page'};\n  const view=model.getConversationViewModel()?.primaryViewModel?.();\n  if(!view || key(view.mail)!==arg.key || !recent(view.mail) || typeof view.getMailBody!=='function' ||\n    typeof view.getSanitizedMailBody!=='function' || typeof view.mustRenderFailureBanner!=='function' ||\n    typeof view.isWarningDismissed!=='function' || typeof view.didErrorsOccur!=='function')return {state:'loading'};\n  if(!view.mailDetails || !view.getSanitizedMailBody())return {state:'loading'};\n  // None == 0 in FailureBannerType. With loaded mailDetails and no dismissed\n  // warning, this requires Tuta's positive authenticated-sender result.\n  if(view.isWarningDismissed()!==false || view.mustRenderFailureBanner()!==0 || view.didErrorsOccur()!==false)return {state:'untrusted'};\n  const from=view.getSender?.()?.address,displayed=view.getDisplayedSender?.()?.address;\n  if(!sender(from) || typeof displayed!=='string' || from.toLowerCase()!==displayed.toLowerCase())return {state:'untrusted'};\n  const recipients=[...(view.getToRecipients?.()||[]),...(view.getCcRecipients?.()||[]),...(view.getBccRecipients?.()||[])];\n  if(!recipients.some(r=>typeof r.address==='string' && r.address.toLowerCase()===arg.email))return {state:'recipient'};\n  const fragment=view.getSanitizedMailBody(),body=fragment.textContent||'',text=(view.getSubject?.()||'')+'\\n'+body;\n  if(text.length>60000 || !/共同運営/.test(body) || !/招待/.test(body))return {state:'irrelevant'};\n  const links=[...fragment.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'))\n    .concat(Array.from(text.matchAll(/https:\\/\\/note\\.com\\/[^\\s<>\"']+/g),m=>m[0]))\n    .filter(raw=>{try{const u=new URL(raw);return u.origin==='https://note.com'&&!u.username&&!u.password && raw.length<=6000;}catch{return false;}});\n  return {state:'mail',key:arg.key,received:date(view.mail),text,links:[...new Set(links)].slice(0,24),authenticated:true};\n}",
   "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  let canonical;\n  try{canonical=new URL(document.querySelector('link[rel=\"canonical\"]')?.href);}catch{return {state:'loading'};}\n  if(canonical.origin!==location.origin || canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  if(step==='ready')return {state:'ready'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').replace(/\\s+/g,' ').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const all=(root,selector)=>[...root.querySelectorAll(selector)].filter(visible);\n  const controls=root=>all(root,'button,[role=\"button\"]');\n  const unique=items=>[...new Set(items)];\n  // Count and action are distinct controls; never toggle the article heart to open readers.\n  const excluded='[data-testid=\"note-body\"],.note-common-styles,nav,aside,[data-testid=\"note-card\"],.m-noteSmall';\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-comment,.o-commentList__item,.m-commentList__item,.o-comment__item,[class*=\"CommentItem_\"],[class*=\"CommentItem__\"],[class*=\"commentItem_\"],[class*=\"commentList__item\"]';\n  const roots=all(document,rowSelector).filter(e=>!e.closest(excluded)).filter((r,i,rs)=>!rs.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const authorNodes=all(root,'[data-testid=\"comment-author\"] a[href],a[data-testid=\"comment-author\"],.m-comment__author a[href],.o-comment__author a[href],[class*=\"comment\" i][class*=\"author\" i] a[href],[class*=\"comment\" i][class*=\"userName\" i] a[href]');\n    const bodies=all(root,'[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,.o-comment__body,.o-comment__text,.m-commentList__body,.m-commentList__text,.o-commentList__body,.o-commentList__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]').filter(local);\n    const names=unique((authorNodes.length?authorNodes:all(root,'a[href]').filter(a=>!bodies.some(b=>b.contains(a)))).filter(local).map(owner).filter(Boolean));\n    const texts=unique(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean));\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text))),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?(?:\\s*[\\d,]+)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed'),n=label(button);\n      // Contradictory accessibility state cannot authorize a write.\n      if(pressed==='true' && /スキ(?:する|をする|をつける)/.test(n) || pressed==='false' && /取り消す|取消す|解除|済み/.test(n))liked=null;\n      else if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  const clean=r=>r.map(({button,...row})=>row);\n  const dialogs=unique(all(document,'[role=\"dialog\"],dialog[open],[aria-modal=\"true\"],.m-modal,.o-modal,[class*=\"Modal__content\"],[class*=\"modal__content\"]'));\n  const likerTitle=/^(?:この記事に)?スキ(?:(?:を)?した(?:人|ユーザー|クリエイター)(?:の一覧)?|の一覧|一覧)(?:\\s*[（(]?\\s*[\\d,]+\\s*(?:人|件)?\\s*[）)]?)?$/;\n  const modals=dialogs.filter(d=>{\n    const headings=all(d,'h1,h2,h3,[role=\"heading\"]');\n    return likerTitle.test(label(d)) || headings.some(h=>likerTitle.test(label(h))) ||\n      likerTitle.test((d.innerText||'').split('\\n').map(s=>s.trim()).find(Boolean)||'');\n  }).filter((r,i,rs)=>!rs.some(other=>other!==r && r.contains(other)));\n  const modal=modals.length===1?modals[0]:null;\n  const commentLists=all(document,'[data-testid=\"comment-list\"],.o-commentList,.m-commentList,[class*=\"CommentList_\"],[class*=\"commentList_\"]').filter(e=>!e.closest(excluded));\n  const commentBusy=commentLists.some(e=>e.getAttribute('aria-busy')==='true'||all(e,'[role=\"progressbar\"],[aria-busy=\"true\"]').length>0);\n  const emptyComments=!roots.length&&!commentBusy&&commentLists.some(e=>(e.innerText||'').split('\\n').some(line=>/^(?:まだ)?コメント(?:は|が)?(?:ありません[。！!]?|0件)$/.test(line.trim())));\n  if(step==='comments')return {state:commentBusy?'loading':'ready',rows:clean(rows),empty:emptyComments,roots:roots.length,lists:commentLists.length};\n  if(step==='closeComments'){\n    const comments=dialogs.filter(d=>all(d,'h1,h2,h3,[role=\"heading\"]').some(h=>/^コメント(?:\\s*[（(]?\\d+[）)]?)?$/.test(label(h))));\n    if(!comments.length)return {state:'ready'};\n    const leaves=comments.filter(d=>!comments.some(x=>x!==d&&d.contains(x)));\n    if(leaves.length!==1)return {state:'ambiguous'};\n    const close=controls(leaves[0]).filter(b=>/^(?:閉じる|とじる|close)$/i.test(label(b))&&!b.closest(rowSelector));\n    if(close.length!==1||close[0].disabled)return {state:'missing'};\n    close[0].click();return {state:'closed'};\n  }\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible || r.liked!==false || !r.button || r.button.disabled || r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(roots.length||emptyComments)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示|をすべて見る)?|コメント\\s*[（(]?\\d+\\s*(?:件)?[）)]?|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector) && !b.closest(excluded));\n    if(!options.length)return {state:'missing'};\n    if(new Set(options.map(label)).size!==1)return {state:'ambiguous'};\n    if(options[0].disabled || options[0].getAttribute('aria-disabled')==='true')return {state:'loading'};\n    options[0].scrollIntoView?.({block:'center'});options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    if(modal)return {state:'ready'};\n    const explicit=controls(document).filter(b=>/^(?:この記事に)?スキ(?:を)?した(?:人|ユーザー|クリエイター)(?:の一覧)?(?:を見る|を表示)?(?:\\s*\\d+人)?$|^スキ(?:の一覧|一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector) && !b.closest(excluded));\n    const countSelector='.o-noteLike__count,.m-noteLike__count,[class*=\"likeCount\"],[class*=\"LikeCount\"],[class*=\"like__count\"],[class*=\"like__number\"],[class*=\"like-count\"],[class*=\"like_count\"]';\n    const numeric=all(document,countSelector).flatMap(e=>{\n      if(e.closest(rowSelector)||e.closest(excluded)||!/^\\d[\\d,]*$/.test(label(e)))return [];\n      // A count may be a span inside a native button. Never click a count\n      // contained in the heart toggle, even when the count itself looks right.\n      const b=e.closest('button,[role=\"button\"]')||e;\n      if(b.getAttribute('aria-pressed')!==null||/スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)/.test(label(b)))return [];\n      if(!/^\\d[\\d,]*$/.test(label(b))&&!/一覧|スキ(?:を)?した/.test(label(b)))return [];\n      return [b];\n    });\n    const options=unique(explicit.length?explicit:numeric);\n    // Responsive copies have the same count; select one only if all counts agree.\n    if(!options.length || !explicit.length && new Set(options.map(label)).size!==1)return {state:'missing'};\n    if(explicit.length>1 && new Set(explicit.map(label)).size!==1)return {state:'ambiguous'};\n    const button=options[0];if(button.disabled || button.getAttribute('aria-disabled')==='true')return {state:'loading'};\n    button.scrollIntoView?.({block:'center'});button.click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const busy=modal && (modal.getAttribute('aria-busy')==='true' || all(modal,'[role=\"progressbar\"],[aria-busy=\"true\"]').length>0 || /読み込み中|ロード中/.test(modal.innerText));\n    const likers=modal&&!busy?unique(all(modal,'a[href]').map(owner).filter(Boolean)):[];\n    // Merely opening a shell dialog does not establish an empty response.\n    const empty=modal&&!busy&&/スキ(?:を)?した(?:人|ユーザー|クリエイター)(?:は|が)?(?:いません|ありません)|まだスキがありません|ゲストユーザー/.test(modal.innerText);\n    const sampleComplete=!!modal&&!busy&&!/ゲスト|もっと見る|さらに表示|次のページ/.test(modal.innerText)&&\n      Number.isSafeInteger(arg.expectedLikes)&&arg.expectedLikes>=0&&arg.expectedLikes<=200&&likers.length===arg.expectedLikes&&(likers.length>0||!!empty);\n    return {state:busy?'loading':'ready',owners:unique([...rows.map(r=>r.owner),...likers]).filter(v=>v!==arg.owner).slice(0,20),likeOwners:likers.filter(v=>v!==arg.owner).slice(0,20),likesRead:!!modal&&!busy&&(likers.length>0||!!empty),comments:rows.length,likers:likers.length,modal:!!modal,busy:!!busy,sampleOwners:likers.slice(0,200),sampleComplete};\n  }\n  return {state:'missing'};\n}",
   "observationScreen1698": "function observationScreen1698(job) {\n  const unknown=reason=>({state:'unknown',reason});\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]') && getComputedStyle(e).visibility!=='hidden';\n  const text=e=>(e?.textContent||'').replace(/\\s+/g,' ').trim();\n  const absolute=raw=>{try{const u=new URL(raw,location.href);return u.origin==='https://note.com' && !u.username && !u.password?u:null;}catch{return null;}};\n  const rawCanonical=document.querySelector('link[rel=\"canonical\"]')?.getAttribute('href');\n  const canonical=rawCanonical?absolute(rawCanonical):null;\n  if(location.origin!=='https://note.com' || document.readyState!=='complete' || !canonical ||\n     canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return unknown('page');\n  const bodySelector='[contenteditable],.note-common-styles__textnote-body,.o-noteContentText,[data-testid=\"note-body\"],[class*=\"noteBody\"],[class*=\"NoteBody\"],blockquote';\n  const h1=[...document.querySelectorAll('h1')].filter(visible);\n  if(h1.length!==1)return unknown('heading');\n  if(job.kind==='keyword') {\n    let path;try{path=decodeURIComponent(location.pathname).replace(/\\/$/,'');}catch{return unknown('page');}\n    const mode=new URL(location.href).searchParams.get('mode');\n    if(path!=='/tag/'+job.subject || text(h1[0])!==job.subject ||\n       (job.mode==='new'?mode!=='new':mode!==null))return unknown('page');\n    const mains=[...document.querySelectorAll('main,[role=\"main\"]')].filter(visible);\n    const root=mains.length===1?mains[0]:null;\n    if(!root)return unknown('list');\n    const tabs=[...root.querySelectorAll('a[href],[role=\"tab\"]')].filter(e=>visible(e)&&['人気','新着'].includes(text(e)));\n    const selected=tabs.filter(e=>e.getAttribute('aria-selected')==='true' || ['page','true'].includes(e.getAttribute('aria-current')) || e.classList.contains('is-active'));\n    if(selected.length!==1 || text(selected[0])!==(job.mode==='new'?'新着':'人気'))return unknown('sort');\n    const cardSelector='article,[data-testid=\"note-card\"],.m-note,.m-largeNoteWrapper,[class*=\"noteCard\"],[class*=\"NoteCard\"]';\n    const cards=[...root.querySelectorAll(cardSelector)].filter(e=>visible(e)&&!e.closest('aside,nav,footer,[class*=\"recommend\" i],[data-testid*=\"recommend\"],'+bodySelector));\n    const leaves=cards.filter(e=>!cards.some(other=>other!==e && e.contains(other)));\n    if(!leaves.length)return unknown('list');\n    const entries=[],seen=new Set();let incomplete=false;\n    for(const card of leaves.slice(0,50)) {\n      const headings=[...card.querySelectorAll('h2,h3,h4')].filter(visible);\n      if(headings.length!==1 || !text(headings[0])){incomplete=true;continue;}\n      const urls=[...new Set([...card.querySelectorAll('a[href],[data-href]')].concat(card.matches('a[href],[data-href]')?[card]:[])\n        .filter(visible).map(e=>absolute(e.getAttribute('href')||e.getAttribute('data-href')))\n        .filter(u=>u && /^\\/[\\w-]{1,80}\\/n\\/n[a-z0-9]{1,64}\\/?$/.test(u.pathname)).map(u=>u.origin+u.pathname.replace(/\\/$/,'')))];\n      if(urls.length!==1){incomplete=true;continue;}\n      if(seen.has(urls[0]))continue;\n      seen.add(urls[0]);entries.push({url:urls[0],title:text(headings[0]).slice(0,300)});\n    }\n    // A missing/unrecognized card is not proof that 520 is absent from this page.\n    if(!entries.length)return unknown('cards');\n    return {state:'observed',complete:!incomplete,entries,scope:'initial_cards'};\n  }\n  if(job.kind!=='footer' || location.pathname.replace(/\\/$/,'')!=='/43__/n/'+job.subject || text(h1[0])==='521')return unknown('page');\n  const groups=[...document.querySelectorAll('[aria-label*=\"パンくず\"],[aria-label*=\"breadcrumb\" i],[class*=\"breadcrumb\" i]')]\n    .filter(e=>visible(e) && !e.closest(bodySelector));\n  const paths=[];\n  for(const group of groups) {\n    if(group.getBoundingClientRect().top<h1[0].getBoundingClientRect().bottom)continue;\n    const links=[...group.querySelectorAll('a[href]')].filter(visible);\n    const list=links.map(a=>({u:absolute(a.getAttribute('href')),label:text(a)}));\n    if(!list.some(x=>x.u?.pathname==='/' && ['トップ','ホーム'].includes(x.label)))continue;\n    const topics=list.filter(x=>x.u && /^\\/topic\\/[a-z0-9_/-]+\\/?$/.test(x.u.pathname) && x.label && x.label.length<=100)\n      .map(x=>({label:x.label,url:x.u.origin+x.u.pathname}));\n    if(topics.length && topics.length<=8)paths.push(topics);\n  }\n  const unique=[...new Map(paths.map(p=>[JSON.stringify(p),p])).values()];\n  return unique.length===1?{state:'observed',title:text(h1[0]).slice(0,300),topics:unique[0]}:unknown('breadcrumb');\n}"
@@ -9902,7 +10094,7 @@ async function acquireBackground16931(env,urgent=false){
 }
 function patrolCoordinator16931(storage){
   let ready=false;
-  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
+  const rows=(q,...a)=>objectRows(storage,q,...a);
   const init=()=>{
     if(ready)return;
     storage.transactionSync(()=>{
@@ -10260,6 +10452,7 @@ function reachRecord16933(v){
 // Management security is isolated from the patrol object and its alarms/history.
 // One private instance of the existing class; no binding or migration is added.
 const ADMIN_GUARD16934 = 'note-helper-admin-guard-16934';
+const readyAdminStores=new WeakSet();
 class AdminInputError16934 extends Input520 {
   constructor(message,status=400){super(message);this.status=status;}
 }
@@ -10314,6 +10507,11 @@ async function adminKeyDenied16934(request,env,provided,reject,bearer=false){
     const stub=env.SCHEDULER.get(env.SCHEDULER.idFromName(ADMIN_GUARD16934));
     const response=await stub.fetch(new Request('https://scheduler.internal/security/admin-key',{
       method:'POST',body:JSON.stringify({client,valid})}));
+    if(response.status===503 && response.headers.get('X-Note-Helper-Limit')==='do-daily-reads'){
+      const paused=reject('Durable Objects の日次読み取り枠の更新待ちです。',503);
+      paused.headers.set('Retry-After',response.headers.get('Retry-After')||'60');
+      return paused;
+    }
     if(!response.ok)throw Error('guard unavailable');
     const verdict=await response.json();
     if(verdict?.allowed===true&&valid)return null;
@@ -10328,9 +10526,12 @@ async function adminKeyDenied16934(request,env,provided,reject,bearer=false){
 }
 function adminGuardDecision16934(storage,input,now=Date.now()){
   if(!input||typeof input.valid!=='boolean'||!/^([a-f0-9]{64})$/.test(input.client||''))throw Error('guard input');
-  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
-  rows('CREATE TABLE IF NOT EXISTS admin_guard16934(client TEXT PRIMARY KEY,failures INTEGER NOT NULL,first_at INTEGER NOT NULL,blocked_until INTEGER NOT NULL,expires INTEGER NOT NULL)');
-  rows('CREATE INDEX IF NOT EXISTS admin_guard_expiry16934 ON admin_guard16934(expires)');
+  const rows=(q,...a)=>objectRows(storage,q,...a);
+  if(!readyAdminStores.has(storage)){
+    rows('CREATE TABLE IF NOT EXISTS admin_guard16934(client TEXT PRIMARY KEY,failures INTEGER NOT NULL,first_at INTEGER NOT NULL,blocked_until INTEGER NOT NULL,expires INTEGER NOT NULL)');
+    rows('CREATE INDEX IF NOT EXISTS admin_guard_expiry16934 ON admin_guard16934(expires)');
+    readyAdminStores.add(storage);
+  }
   return storage.transactionSync(()=>{
     rows('DELETE FROM admin_guard16934 WHERE client IN (SELECT client FROM admin_guard16934 WHERE expires<=? ORDER BY expires LIMIT 64)',now);
     const row=rows('SELECT * FROM admin_guard16934 WHERE client=?',input.client)[0];
