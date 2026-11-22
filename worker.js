@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.30';
+const VERSION = 'v16.9.31';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -18,7 +18,7 @@ function retryDelay16929(value, now=Date.now(), secondsOnly=false) {
   return Number.isSafeInteger(until)&&until>now&&Number.isFinite(new Date(until).getTime())?until-now:0;
 }
 function scoped(original, slot) {
-  return {...original, SLOT:slot, NOTE_SESSION:slot === '2' ? original.NOTE_SESSION_2 : original.NOTE_SESSION,
+  return {...original, [PATROL_LOCAL16931]:original[PATROL_LOCAL16931], SLOT:slot, NOTE_SESSION:slot === '2' ? original.NOTE_SESSION_2 : original.NOTE_SESSION,
     DB:slot === '1' ? original.DB : {
       prepare:q => original.DB.prepare(q.replace(/\b(nh_control|nh_seen|nh_health)\b/g, '$1_2')),
       batch:items => original.DB.batch(items)
@@ -42,7 +42,7 @@ function page(message = '管理用の鍵を入力してください。', slot = 
 <p>同じ読者が別の自作にもスキした記録を巡回先の比較に使います。対応した企画は条件を確認して自動応募し、公開結果まで確認します。詳細は「520の作品管理・記録」で確認できます。</p>
 <p>公開作品の内容が近い別作者の作品を最大10本比較し、3作品以上に共通して反応した読者と、継続して他者の作品を紹介する作者を優先します。材料が足りない間は従来の巡回を続けます。比較状況は「520の作品管理・記録」に表示します。</p>
 <p>通常は各アカウント4分以上の間隔で最大1件。2垢がONの間は処理開始も約2分以上ずらします。間隔は下の設定で変更できます。実行が遅れる場合があります。</p>
-<p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
+<p>送信前の一時的な読み取りエラーは、次の通常間隔で自動再試行します。送信前と確認できた内部エラーは、繰り返す場合だけ最大30分まで間隔を延ばします。スキの送信・結果確認のエラー、認証・回数制限などでは原則2時間待機します。noteが指定した待機時間を守ります。</p>
 <p>質問箱の文芸に関する回答へのスキと、520の0円メンバーシップ参加も自動で探索します。通常会費0円と、新しくフォローしないことを確認できた場合だけ参加します。結果は状態確認に表示します。</p>
 <pre>${esc(message)}</pre>
 <form method="post" action="/control">
@@ -230,7 +230,8 @@ async function exportData(env) {
     sql(env,'SELECT slot,day,COUNT(*) AS confirmed FROM nh_v13_success WHERE day>=? GROUP BY day,slot ORDER BY day,slot',since)
   ]);
   const accounts = [first,second].map((r,i)=>({slot:SLOTS[i],...r.results[0]}));
-  return new Response(JSON.stringify({version:VERSION,exported_at:new Date().toISOString(),settings,accounts,tag_stats:stats.results,metrics:metrics.results,daily:daily.results},null,2),{
+  const patrol=await readPatrol16931(env);
+  return new Response(JSON.stringify({version:VERSION,exported_at:new Date().toISOString(),settings,accounts,tag_stats:stats.results,metrics:metrics.results,daily:daily.results,patrol},null,2),{
     headers:{'Content-Type':'application/json; charset=utf-8','Content-Disposition':'attachment; filename="note-helper-settings-stats.json"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}
   });
 }
@@ -467,18 +468,26 @@ function likeState16928(note){
     throw new Trouble('記事の公開状態・スキ状態を確認できません','response');
   return note.is_liked;
 }
-async function acquire(env, automatic) {
+async function acquire(env, automatic, background = false) {
   const now = Date.now(), token = crypto.randomUUID();
   const result = await sql(env,
     'UPDATE nh_control SET token=?, lease=?' + (automatic ? ', checked=?, next_at=?' : '') +
     ' WHERE id=1 AND lease<=?' + (automatic ? ' AND enabled=1 AND next_at<=?' : '') +
+    (background ? " AND (enabled=0 OR (next_at>? AND inflight=''))" : '') +
     ' AND NOT EXISTS (SELECT 1 FROM nh_v13_connection WHERE slot=? AND hold_until>?)',
-    token, now + LEASE, ...(automatic ? [now,now + 2*HOUR] : []), now, ...(automatic ? [now] : []), env.SLOT, now
+    token, now + LEASE, ...(automatic ? [now,now + 2*HOUR] : []), now, ...(automatic ? [now] : []), ...(background ? [now+30000] : []), env.SLOT, now
   ).run();
   return result.meta.changes ? token : null;
 }
 async function release(env, token) {
-  await sql(env, "UPDATE nh_control SET token='', lease=0 WHERE id=1 AND token=?", token).run();
+  const wake=env[PATROL_RELEASE16931];
+  const linked=wake?.token===token;
+  const result=await sql(env, "UPDATE nh_control SET token='', lease=0 WHERE id=1 AND token=?"+(linked?' RETURNING enabled,next_at':''), token).run();
+  if(linked){
+    delete env[PATROL_RELEASE16931];
+    const state=result.results?.[0];
+    if(result.meta.changes && state?.enabled)await wake.coordinator.wake(state.next_at);
+  }
 }
 async function connection(original, slot, candidate = null) {
   let env = scoped(original, slot);
@@ -912,7 +921,10 @@ async function run(original,slot) {
   const baseEnv = scoped(original,slot);
   const token = await acquire(baseEnv,true);
   if (!token) return false;
+  const started=Date.now(), recorder=original[PATROL_LOCAL16931];
   const trace = {calls:0}, counts = {runs:1};
+  let patrol={slot,started,finished:0,delay_ms:Math.max(0,started-(Number(original.PATROL_EXPECTED16931)||started)),duration_ms:0,outcome:'running',stage:'開始',kind:'',code:0,next_at:0,wait_saved:false};
+  const receipt=recorder?.begin(patrol);
   let env = {...baseEnv,TRACE:trace}, stage = 'ログイン確認', activeTag = null, settings;
   let checkingSend = false;
   const bump = (reason,n=1) => { counts[reason]=(counts[reason]||0)+n; };
@@ -920,12 +932,14 @@ async function run(original,slot) {
   const finish = async (message,success=false) => {
     await auxiliaryWrites16917(env,'metrics',()=>learningPersist16913(env));
     if(trace.auxFault)message+='／追加機能だけ保留（AUX17/'+trace.auxFault.component+'/'+trace.auxFault.reason+'）';
+    const nextAt=Date.now()+(settings?.interval_seconds*1000 || INTERVAL);
     await env.DB.batch([
       ...metrics(),
       ...statItems(env,activeTag,success ? 'sent' : 'skips'),
-      sql(env,'UPDATE nh_control SET message=?,next_at=? WHERE id=1 AND token=?',message,Date.now()+(settings?.interval_seconds*1000 || INTERVAL),token),
+      sql(env,'UPDATE nh_control SET message=?,next_at=? WHERE id=1 AND token=?',message,nextAt,token),
       sql(env,"UPDATE nh_health SET errors=CASE WHEN ? THEN 0 ELSE errors END,kind='',rate_fail=CASE WHEN ? THEN 0 ELSE rate_fail END,success_at=CASE WHEN ? THEN ? ELSE success_at END WHERE id=1",+success,+success,+success,Date.now())
     ]);
+    patrol={...patrol,outcome:success?'success':'skipped',next_at:nextAt,wait_saved:true};
   };
   try {
     const snapshot=await runSnapshot16913(env);
@@ -1079,12 +1093,20 @@ async function run(original,slot) {
     // 送信前のGET失敗は次の通常枠に回す。予約済みの送信や本人確認の拒否は従来の待機に従う。
     const retryRead = !checkingSend && error instanceof Trouble &&
       (error.kind==='network' || (error.kind==='response' && [0,404,408,410].includes(error.code)));
+    let retryInternal=false;
+    if(!checkingSend && !(error instanceof Trouble)){
+      try {const safe=await auxSafety16917(env,token);retryInternal=safe.live&&!safe.pending;}
+      catch(checkError){if(readLimit(checkError))throw checkError;}
+    }
     const kind = retryRead ? 'read' : (error instanceof Trouble ? error.kind : 'storage');
     const h=await sql(env,'SELECT * FROM nh_health WHERE id=1').first();
     const errors=Number(h.errors)+1, rates=Number(h.rate_fail)+(kind==='rate'?1:0);
     const serverWait=error instanceof Trouble?error.retry:0;
-    const wait=Math.max(retryRead ? (settings?.interval_seconds*1000 || INTERVAL) : 2*HOUR,serverWait);
-    const message=(retryRead ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error)+
+    const interval=settings?.interval_seconds*1000 || INTERVAL;
+    const retryWait=retryInternal?Math.max(interval,Math.min(30*60000,interval*2**Math.min(3,Math.max(0,errors-1)))):retryRead?interval:2*HOUR;
+    const wait=Math.max(retryWait,serverWait);
+    patrol={...patrol,outcome:'error',kind:retryInternal?'internal_read':kind,code:Number(error instanceof Trouble?error.code:0)||0,next_at:Date.now()+wait,wait_saved:false};
+    const message=(retryRead || retryInternal ? '今回の巡回を見送りました。次回に自動再試行：' : '自動再確認待ち：')+stage+'／'+failure(error)+
       (!(error instanceof Trouble)?'（RUN17/'+auxReason16917(error)+'）':'');
     bump('errors');
     await env.DB.batch([
@@ -1093,13 +1115,19 @@ async function run(original,slot) {
       sql(env,'UPDATE nh_control SET next_at=?,message=? WHERE id=1 AND token=?',Date.now()+wait,message,token),
       sql(env,'UPDATE nh_v13_connection SET hold_until=MAX(hold_until,?) WHERE slot=?',Date.now()+serverWait,slot)
     ]);
+    patrol.wait_saved=true;
     if (['auth','config'].includes(kind)) await queueAlert(env,kind,message);
     return true;
-  } finally { await release(env,token); }
+  } finally {
+    try {await release(env,token);}
+    finally {recorder?.finish(receipt,{...patrol,finished:Date.now(),duration_ms:Math.max(0,Date.now()-started),stage,outcome:patrol.outcome==='running'?'interrupted':patrol.outcome});}
+  }
 }
 async function dashboard(original, settings, prefix = '') {
   const blocks = [];
   const schedule = await schedulerState(original);
+  const patrol=await readPatrol16931(original);
+  if(patrol.available)blocks.push(patrolDisplay16931(patrol));
   const summary = await original.DB.batch([
     sql(original,"SELECT (chat_id<>'') AS paired,message,last_sent FROM nh_v14_telegram WHERE id=1"),
     sql(original,'SELECT tag,SUM(checks) AS checks,SUM(sent) AS sent,SUM(skips) AS skips,SUM(errors) AS errors FROM nh_v14_stats WHERE day>=? GROUP BY tag ORDER BY checks DESC',day(6)),
@@ -1238,11 +1266,13 @@ export class NoteScheduler {
   constructor(ctx, env) {
     this.ctx=ctx;this.busy=false;
     const browser=coordinatedBrowser16916(env.BROWSER,ctx.storage,()=>!!this.desk?.ready&&this.desk.publicationPriority16916(Date.now()));
-    this.env=new Proxy(env,{get:(target,key,receiver)=>key==='BROWSER'?browser:Reflect.get(target,key,receiver)});
+    const patrol=patrolCoordinator16931(ctx.storage);
+    this.env=new Proxy(env,{get:(target,key,receiver)=>key==='BROWSER'?browser:key===PATROL_LOCAL16931?patrol:Reflect.get(target,key,receiver)});
   }
   async fetch(request) {
     if (request) {
       const path = new URL(typeof request === 'string' ? request : request.url).pathname;
+      if(path==='/patrol/status')return Response.json(this.env[PATROL_LOCAL16931].read());
       if (path === '/desk/tick' || path === '/desk/admin' || path === '/desk/invitation') {
         this.desk ||= new Desk520(this.ctx.storage,this.env);
         if (path === '/desk/admin') return this.desk.admin(request,this.ctx);
@@ -1288,7 +1318,7 @@ export class NoteScheduler {
       const due = schedule.active.find(s=>s.eligible<=Date.now());
       if (due) {
         await sql(this.env,'UPDATE nh_v15_runtime SET last_slot=?,last_at=? WHERE id=1',due.slot,Date.now()).run();
-        try { await run({...this.env,NETWORK16922:this.desk?.ready?this.desk.networkBridge16922():null,MEMBER_GATE16910:()=>{
+        try { await run({...this.env,[PATROL_LOCAL16931]:this.env[PATROL_LOCAL16931],PATROL_EXPECTED16931:due.next_at>0?Math.max(due.next_at,due.hold_until,schedule.gate):Date.now(),NETWORK16922:this.desk?.ready?this.desk.networkBridge16922():null,MEMBER_GATE16910:()=>{
           this.desk ||= new Desk520(this.ctx.storage,this.env);this.desk.init();
           return !!this.desk.one('SELECT 1 FROM desk_cfg c JOIN desk_delivery d ON d.id=c.id WHERE c.id=1 AND c.enabled=1 AND d.enabled=1 AND c.blocked<=?',Date.now());
         }},due.slot); }
@@ -3268,7 +3298,7 @@ class Desk520 {
       const a=await this.deliveryAccount();
       if(!a || a.until>Date.now() || this.publicationPriority16916(Date.now()))return;
       slot=a.slot;base=scoped(this.env,slot);
-      lease=await acquire(base,false);if(!lease)return;
+      lease=await acquireBackground16931(base);if(!lease)return;
       const env=await loadCookie(base,a.id);
       if(await account(env)!==a.id)return;
       for(const p of pending){
@@ -3301,7 +3331,7 @@ class Desk520 {
     this.rows('UPDATE desk_draft_directory SET due=? WHERE id=1',now+4*M520);
     const a=await this.deliveryAccount().catch(()=>null);
     if(!a || a.until>now)return;
-    const base=scoped(this.env,a.slot),lease=await acquire(base,false);
+    const base=scoped(this.env,a.slot),lease=await acquireBackground16931(base);
     if(!lease)return;
     try {
     const env=await loadCookie(base,a.id);
@@ -3396,7 +3426,7 @@ class Desk520 {
           message='現在の募集条件で作品の掲載可否を確認待ち';return;
         }
       }
-      lease=await acquire(env,false);
+      lease=await acquireBackground16931(env,job.kind==='publish');
       if(!lease){message='別の処理が終了するのを待機中';retry=job.kind==='publish'?M520:5*M520;return;}
       const credential=await loadCookie(env,account.id);
       const cookie=cleanCookie(credential.NOTE_SESSION);
@@ -3530,7 +3560,7 @@ class Desk520 {
       if (!account) {message='520の接続を確認待ち';due=now+2*HOUR;return;}
       if (account.until>now) {message='520の処理・待機の終了後に再確認';due=account.until+M520;return;}
       env=scoped(this.env,account.slot);
-      token=await acquire(env,false);
+      token=await acquireBackground16931(env);
       if (!token) {message='520の使用中・次回再確認';due=now+4*M520;return;}
       const cookie=cleanCookie((await loadCookie(env,account.id)).NOTE_SESSION);
       this.rows('UPDATE desk_reactions SET used=CASE WHEN utc_day=? THEN used+1 ELSE 1 END,utc_day=? WHERE id=1',day,day);
@@ -3595,7 +3625,7 @@ class Desk520 {
       const slot=match[0], gate=slots[SLOTS.indexOf(slot)].results[0];
       const after=Math.max(gate.lease,gate.hold_until,gate.kind?gate.next_at:0);
       if(after>now){message='登録済みアカウントの処理・待機の終了後に確認';due=after+1000;return;}
-      recommendEnv=scoped(this.env,slot);recommendLease=await acquire(recommendEnv,false);
+      recommendEnv=scoped(this.env,slot);recommendLease=await acquireBackground16931(recommendEnv);
       if(!recommendLease){message='520の処理終了を確認待ち';due=now+4*M520;return;}
       const credential=await loadCookie(recommendEnv,id);
       const cookie=cleanCookie(credential.NOTE_SESSION);
@@ -5047,7 +5077,7 @@ Object.assign(Desk520.prototype,{
       const accountInfo=await this.deliveryAccount();
       if(!accountInfo || accountInfo.until>Date.now()){reason='account_wait';message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.until+M520):now+2*HOUR;return;}
       if(row.account && row.account!==accountInfo.id){message='登録時の520本人と一致せず・操作を保留';return;}
-      env=scoped(this.env,accountInfo.slot);lease=await acquire(env,false);
+      env=scoped(this.env,accountInfo.slot);lease=await acquireBackground16931(env);
       if(!lease){message='520の処理終了を確認待ち';due=now+4*M520;return;}
       const credential=await loadCookie(env,accountInfo.id);
       let link=null;
@@ -5606,7 +5636,7 @@ Object.assign(Desk520.prototype,{
       if(typeof this.env.BROWSER?.acquire!=='function'){message='ブラウザー接続後に人気記事の表示を確認';return;}
       const a=await this.deliveryAccount();
       if(!a || a.until>Date.now()){message='520の接続・前の処理が終了するのを待機中';due=a?Math.max(now+30*M520,a.until+M520):due;return;}
-      env=scoped(this.env,a.slot);lease=await acquire(env,false);
+      env=scoped(this.env,a.slot);lease=await acquireBackground16931(env);
       if(!lease){due=now+30*M520;return;}
       const cookie=cleanCookie((await loadCookie(env,a.id)).NOTE_SESSION);
       const result=await browserPopular520(this.env.BROWSER,a.id,cookie,!state.attempt||state.attempt<=now-D520,async(saveOnly=false)=>{
@@ -7330,7 +7360,7 @@ Object.assign(Desk520.prototype,{
       if(typeof this.env.BROWSER?.acquire!=='function'){message='BROWSER設定の確認待ち';return;}
       const identity=await this.deliveryAccount();
       if(!identity || identity.until>now){message='520本人の接続・処理・待機の終了後に取得';this.rows('UPDATE desk_traffic16913 SET due=? WHERE id=1',Math.max(now+4*M520,identity?.until||now+2*HOUR));return;}
-      env=scoped(this.env,identity.slot);token=await acquire(env,false);
+      env=scoped(this.env,identity.slot);token=await acquireBackground16931(env);
       if(!token){message='520の処理終了後に取得';this.rows('UPDATE desk_traffic16913 SET due=? WHERE id=1',now+4*M520);return;}
       const credential=await loadCookie(env,identity.id);
       let failure=null;
@@ -9017,7 +9047,7 @@ Object.assign(Desk520.prototype,{
     if(browserWait16916(binding,'normal')){message('既存のブラウザー処理の終了を待機中');return;}
     let lease,env=scoped(this.env,account.slot);
     try{
-      lease=await acquire(env,false);if(!lease)return;
+      lease=await acquireBackground16931(env);if(!lease)return;
       const credentials=await loadCookie(env,account.id),cookie=cleanCookie(credentials.NOTE_SESSION);
       const mayAct=async()=>{
         const live=await sql(env,'SELECT c.account,c.token,c.lease,c.next_at,c.enabled,c.inflight,h.kind,n.hold_until,d.pending comment_pending,o.pending outreach_pending FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? LEFT JOIN nh_v1697_discovery d ON d.slot=n.slot LEFT JOIN nh_v16910_state o ON o.slot=n.slot WHERE c.id=1',account.slot).first();
@@ -9572,3 +9602,88 @@ const BROWSER_SOURCES520 = Object.freeze({
   "readerScreen1697": "async function readerScreen1697(step,arg) {\n  if(location.origin!=='https://note.com' || location.pathname.replace(/\\/$/,'')!=='/'+arg.owner+'/n/'+arg.key)return {state:'page'};\n  let canonical;\n  try{canonical=new URL(document.querySelector('link[rel=\"canonical\"]')?.href);}catch{return {state:'loading'};}\n  if(canonical.origin!==location.origin || canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return {state:'page'};\n  if(step==='ready')return {state:'ready'};\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]');\n  const label=e=>(e.getAttribute('aria-label')||e.getAttribute('title')||e.innerText||'').replace(/\\s+/g,' ').trim();\n  const owner=a=>{try{const u=new URL(a.href);return u.origin===location.origin && /^\\/([\\w-]{1,80})\\/?$/.exec(u.pathname)?.[1]||'';}catch{return '';}};\n  const all=(root,selector)=>[...root.querySelectorAll(selector)].filter(visible);\n  const controls=root=>all(root,'button,[role=\"button\"]');\n  const unique=items=>[...new Set(items)];\n  // Count and action are distinct controls; never toggle the article heart to open readers.\n  const excluded='[data-testid=\"note-body\"],.note-common-styles,nav,aside,[data-testid=\"note-card\"],.m-noteSmall';\n  const rowSelector='[data-comment-id],[data-testid=\"comment-item\"],.m-comment,.o-comment,.o-commentList__item,.m-commentList__item,.o-comment__item,[class*=\"CommentItem_\"],[class*=\"CommentItem__\"],[class*=\"commentItem_\"],[class*=\"commentList__item\"]';\n  const roots=all(document,rowSelector).filter(e=>!e.closest(excluded)).filter((r,i,rs)=>!rs.some(other=>other!==r && r.contains(other) && other.innerText===r.innerText));\n  const rows=[];\n  for(const root of roots.slice(0,24)){\n    const local=e=>e.closest(rowSelector)===root;\n    const authorNodes=all(root,'[data-testid=\"comment-author\"] a[href],a[data-testid=\"comment-author\"],.m-comment__author a[href],.o-comment__author a[href],[class*=\"comment\" i][class*=\"author\" i] a[href],[class*=\"comment\" i][class*=\"userName\" i] a[href]');\n    const bodies=all(root,'[data-testid=\"comment-body\"],[data-testid=\"comment-text\"],.m-comment__body,.m-comment__text,.o-comment__body,.o-comment__text,.m-commentList__body,.m-commentList__text,.o-commentList__body,.o-commentList__text,[class*=\"commentBody\"],[class*=\"CommentBody\"],[class*=\"commentText\"],[class*=\"CommentText\"]').filter(local);\n    const names=unique((authorNodes.length?authorNodes:all(root,'a[href]').filter(a=>!bodies.some(b=>b.contains(a)))).filter(local).map(owner).filter(Boolean));\n    const texts=unique(bodies.map(e=>(e.innerText||'').trim()).filter(Boolean));\n    if(names.length!==1 || texts.length!==1 || texts[0].length>2000)continue;\n    const text=texts[0],name=names[0];\n    const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(name+'\\n'+text))),b=>b.toString(16).padStart(2,'0')).join('');\n    const likes=controls(root).filter(b=>local(b) && /^(?:コメントに)?スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)?(?:\\s*[\\d,]+)?$/.test(label(b)));\n    const button=likes.length===1?likes[0]:null;\n    let liked=null;\n    if(button){\n      const pressed=button.getAttribute('aria-pressed'),n=label(button);\n      // Contradictory accessibility state cannot authorize a write.\n      if(pressed==='true' && /スキ(?:する|をする|をつける)/.test(n) || pressed==='false' && /取り消す|取消す|解除|済み/.test(n))liked=null;\n      else if(pressed==='true'||/取り消す|取消す|解除|済み/.test(n))liked=true;\n      else if(pressed==='false'||/スキ(?:する|をする|をつける)/.test(n))liked=false;\n    }\n    const eligible=text.length>=20 && /読|文章|描写|物語|主人公|登場人物|余韻|ラスト|結末|表現/.test(text) &&\n      !/https?:|www\\.|フォロ[ーバ]|スキ返|相互|参加希望|招待|勧誘|死ね|殺す/.test(text);\n    rows.push({owner:name,hash,liked,eligible,button});\n  }\n  const clean=r=>r.map(({button,...row})=>row);\n  const dialogs=unique(all(document,'[role=\"dialog\"],dialog[open],[aria-modal=\"true\"],.m-modal,.o-modal,[class*=\"Modal__content\"],[class*=\"modal__content\"]'));\n  const likerTitle=/^(?:この記事に)?スキ(?:(?:を)?した(?:人|ユーザー|クリエイター)(?:の一覧)?|の一覧|一覧)(?:\\s*[（(]?\\s*[\\d,]+\\s*(?:人|件)?\\s*[）)]?)?$/;\n  const modals=dialogs.filter(d=>{\n    const headings=all(d,'h1,h2,h3,[role=\"heading\"]');\n    return likerTitle.test(label(d)) || headings.some(h=>likerTitle.test(label(h))) ||\n      likerTitle.test((d.innerText||'').split('\\n').map(s=>s.trim()).find(Boolean)||'');\n  }).filter((r,i,rs)=>!rs.some(other=>other!==r && r.contains(other)));\n  const modal=modals.length===1?modals[0]:null;\n  const commentLists=all(document,'[data-testid=\"comment-list\"],.o-commentList,.m-commentList,[class*=\"CommentList_\"],[class*=\"commentList_\"]').filter(e=>!e.closest(excluded));\n  const commentBusy=commentLists.some(e=>e.getAttribute('aria-busy')==='true'||all(e,'[role=\"progressbar\"],[aria-busy=\"true\"]').length>0);\n  const emptyComments=!roots.length&&!commentBusy&&commentLists.some(e=>(e.innerText||'').split('\\n').some(line=>/^(?:まだ)?コメント(?:は|が)?(?:ありません[。！!]?|0件)$/.test(line.trim())));\n  if(step==='comments')return {state:commentBusy?'loading':'ready',rows:clean(rows),empty:emptyComments,roots:roots.length,lists:commentLists.length};\n  if(step==='closeComments'){\n    const comments=dialogs.filter(d=>all(d,'h1,h2,h3,[role=\"heading\"]').some(h=>/^コメント(?:\\s*[（(]?\\d+[）)]?)?$/.test(label(h))));\n    if(!comments.length)return {state:'ready'};\n    const leaves=comments.filter(d=>!comments.some(x=>x!==d&&d.contains(x)));\n    if(leaves.length!==1)return {state:'ambiguous'};\n    const close=controls(leaves[0]).filter(b=>/^(?:閉じる|とじる|close)$/i.test(label(b))&&!b.closest(rowSelector));\n    if(close.length!==1||close[0].disabled)return {state:'missing'};\n    close[0].click();return {state:'closed'};\n  }\n  if(step==='verify'||step==='like'){\n    const found=rows.filter(r=>r.owner===arg.commentOwner && r.hash===arg.hash);\n    if(found.length!==1)return {state:'missing'};\n    const r=found[0];if(r.liked===true)return {state:'liked'};\n    if(step==='verify')return {state:r.liked===false?'off':'unknown'};\n    if(!r.eligible || r.liked!==false || !r.button || r.button.disabled || r.button.getAttribute('aria-disabled')==='true')return {state:'unknown'};\n    r.button.click();return {state:'clicked'};\n  }\n  if(step==='openComments'){\n    if(roots.length||emptyComments)return {state:'ready'};\n    const options=controls(document).filter(b=>/^(?:コメント(?:欄)?(?:を見る|を表示|をすべて見る)?|コメント\\s*[（(]?\\d+\\s*(?:件)?[）)]?|\\d+\\s*コメント)$/.test(label(b)) && !b.closest(rowSelector) && !b.closest(excluded));\n    if(!options.length)return {state:'missing'};\n    if(new Set(options.map(label)).size!==1)return {state:'ambiguous'};\n    if(options[0].disabled || options[0].getAttribute('aria-disabled')==='true')return {state:'loading'};\n    options[0].scrollIntoView?.({block:'center'});options[0].click();return {state:'opened'};\n  }\n  if(step==='openLikers'){\n    if(modal)return {state:'ready'};\n    const explicit=controls(document).filter(b=>/^(?:この記事に)?スキ(?:を)?した(?:人|ユーザー|クリエイター)(?:の一覧)?(?:を見る|を表示)?(?:\\s*\\d+人)?$|^スキ(?:の一覧|一覧)(?:を見る|を表示)?$/.test(label(b)) && !b.closest(rowSelector) && !b.closest(excluded));\n    const countSelector='.o-noteLike__count,.m-noteLike__count,[class*=\"likeCount\"],[class*=\"LikeCount\"],[class*=\"like__count\"],[class*=\"like__number\"],[class*=\"like-count\"],[class*=\"like_count\"]';\n    const numeric=all(document,countSelector).flatMap(e=>{\n      if(e.closest(rowSelector)||e.closest(excluded)||!/^\\d[\\d,]*$/.test(label(e)))return [];\n      // A count may be a span inside a native button. Never click a count\n      // contained in the heart toggle, even when the count itself looks right.\n      const b=e.closest('button,[role=\"button\"]')||e;\n      if(b.getAttribute('aria-pressed')!==null||/スキ(?:する|をする|をつける|を取り消す|を取消す|を解除|済み)/.test(label(b)))return [];\n      if(!/^\\d[\\d,]*$/.test(label(b))&&!/一覧|スキ(?:を)?した/.test(label(b)))return [];\n      return [b];\n    });\n    const options=unique(explicit.length?explicit:numeric);\n    // Responsive copies have the same count; select one only if all counts agree.\n    if(!options.length || !explicit.length && new Set(options.map(label)).size!==1)return {state:'missing'};\n    if(explicit.length>1 && new Set(explicit.map(label)).size!==1)return {state:'ambiguous'};\n    const button=options[0];if(button.disabled || button.getAttribute('aria-disabled')==='true')return {state:'loading'};\n    button.scrollIntoView?.({block:'center'});button.click();return {state:'opened'};\n  }\n  if(step==='readers'){\n    const busy=modal && (modal.getAttribute('aria-busy')==='true' || all(modal,'[role=\"progressbar\"],[aria-busy=\"true\"]').length>0 || /読み込み中|ロード中/.test(modal.innerText));\n    const likers=modal&&!busy?unique(all(modal,'a[href]').map(owner).filter(Boolean)):[];\n    // Merely opening a shell dialog does not establish an empty response.\n    const empty=modal&&!busy&&/スキ(?:を)?した(?:人|ユーザー|クリエイター)(?:は|が)?(?:いません|ありません)|まだスキがありません|ゲストユーザー/.test(modal.innerText);\n    return {state:busy?'loading':'ready',owners:unique([...rows.map(r=>r.owner),...likers]).filter(v=>v!==arg.owner).slice(0,20),likeOwners:likers.filter(v=>v!==arg.owner).slice(0,20),likesRead:!!modal&&!busy&&(likers.length>0||!!empty),comments:rows.length,likers:likers.length,modal:!!modal,busy:!!busy};\n  }\n  return {state:'missing'};\n}",
   "observationScreen1698": "function observationScreen1698(job) {\n  const unknown=reason=>({state:'unknown',reason});\n  const visible=e=>!!e?.getClientRects().length && !e.closest('[hidden],[aria-hidden=\"true\"]') && getComputedStyle(e).visibility!=='hidden';\n  const text=e=>(e?.textContent||'').replace(/\\s+/g,' ').trim();\n  const absolute=raw=>{try{const u=new URL(raw,location.href);return u.origin==='https://note.com' && !u.username && !u.password?u:null;}catch{return null;}};\n  const rawCanonical=document.querySelector('link[rel=\"canonical\"]')?.getAttribute('href');\n  const canonical=rawCanonical?absolute(rawCanonical):null;\n  if(location.origin!=='https://note.com' || document.readyState!=='complete' || !canonical ||\n     canonical.pathname.replace(/\\/$/,'')!==location.pathname.replace(/\\/$/,''))return unknown('page');\n  const bodySelector='[contenteditable],.note-common-styles__textnote-body,.o-noteContentText,[data-testid=\"note-body\"],[class*=\"noteBody\"],[class*=\"NoteBody\"],blockquote';\n  const h1=[...document.querySelectorAll('h1')].filter(visible);\n  if(h1.length!==1)return unknown('heading');\n  if(job.kind==='keyword') {\n    let path;try{path=decodeURIComponent(location.pathname).replace(/\\/$/,'');}catch{return unknown('page');}\n    const mode=new URL(location.href).searchParams.get('mode');\n    if(path!=='/tag/'+job.subject || text(h1[0])!==job.subject ||\n       (job.mode==='new'?mode!=='new':mode!==null))return unknown('page');\n    const mains=[...document.querySelectorAll('main,[role=\"main\"]')].filter(visible);\n    const root=mains.length===1?mains[0]:null;\n    if(!root)return unknown('list');\n    const tabs=[...root.querySelectorAll('a[href],[role=\"tab\"]')].filter(e=>visible(e)&&['人気','新着'].includes(text(e)));\n    const selected=tabs.filter(e=>e.getAttribute('aria-selected')==='true' || ['page','true'].includes(e.getAttribute('aria-current')) || e.classList.contains('is-active'));\n    if(selected.length!==1 || text(selected[0])!==(job.mode==='new'?'新着':'人気'))return unknown('sort');\n    const cardSelector='article,[data-testid=\"note-card\"],.m-note,.m-largeNoteWrapper,[class*=\"noteCard\"],[class*=\"NoteCard\"]';\n    const cards=[...root.querySelectorAll(cardSelector)].filter(e=>visible(e)&&!e.closest('aside,nav,footer,[class*=\"recommend\" i],[data-testid*=\"recommend\"],'+bodySelector));\n    const leaves=cards.filter(e=>!cards.some(other=>other!==e && e.contains(other)));\n    if(!leaves.length)return unknown('list');\n    const entries=[],seen=new Set();let incomplete=false;\n    for(const card of leaves.slice(0,50)) {\n      const headings=[...card.querySelectorAll('h2,h3,h4')].filter(visible);\n      if(headings.length!==1 || !text(headings[0])){incomplete=true;continue;}\n      const urls=[...new Set([...card.querySelectorAll('a[href],[data-href]')].concat(card.matches('a[href],[data-href]')?[card]:[])\n        .filter(visible).map(e=>absolute(e.getAttribute('href')||e.getAttribute('data-href')))\n        .filter(u=>u && /^\\/[\\w-]{1,80}\\/n\\/n[a-z0-9]{1,64}\\/?$/.test(u.pathname)).map(u=>u.origin+u.pathname.replace(/\\/$/,'')))];\n      if(urls.length!==1){incomplete=true;continue;}\n      if(seen.has(urls[0]))continue;\n      seen.add(urls[0]);entries.push({url:urls[0],title:text(headings[0]).slice(0,300)});\n    }\n    // A missing/unrecognized card is not proof that 520 is absent from this page.\n    if(!entries.length)return unknown('cards');\n    return {state:'observed',complete:!incomplete,entries,scope:'initial_cards'};\n  }\n  if(job.kind!=='footer' || location.pathname.replace(/\\/$/,'')!=='/43__/n/'+job.subject || text(h1[0])==='521')return unknown('page');\n  const groups=[...document.querySelectorAll('[aria-label*=\"パンくず\"],[aria-label*=\"breadcrumb\" i],[class*=\"breadcrumb\" i]')]\n    .filter(e=>visible(e) && !e.closest(bodySelector));\n  const paths=[];\n  for(const group of groups) {\n    if(group.getBoundingClientRect().top<h1[0].getBoundingClientRect().bottom)continue;\n    const links=[...group.querySelectorAll('a[href]')].filter(visible);\n    const list=links.map(a=>({u:absolute(a.getAttribute('href')),label:text(a)}));\n    if(!list.some(x=>x.u?.pathname==='/' && ['トップ','ホーム'].includes(x.label)))continue;\n    const topics=list.filter(x=>x.u && /^\\/topic\\/[a-z0-9_/-]+\\/?$/.test(x.u.pathname) && x.label && x.label.length<=100)\n      .map(x=>({label:x.label,url:x.u.origin+x.u.pathname}));\n    if(topics.length && topics.length<=8)paths.push(topics);\n  }\n  const unique=[...new Map(paths.map(p=>[JSON.stringify(p),p])).values()];\n  return unique.length===1?{state:'observed',title:text(h1[0]).slice(0,300),topics:unique[0]}:unknown('breadcrumb');\n}"
 });
+
+// Ordinary patrol has first claim on an account when its timer is due.
+// Symbols contain only local scheduler state, never a remote RPC binding.
+const PATROL_LOCAL16931=Symbol('patrol-coordinator-16931');
+const PATROL_RELEASE16931=Symbol('patrol-release-16931');
+async function acquireBackground16931(env,urgent=false){
+  const coordinator=env[PATROL_LOCAL16931];
+  const token=await acquire(env,false,!!coordinator&&!urgent);
+  if(token&&coordinator)env[PATROL_RELEASE16931]={token,coordinator};
+  return token;
+}
+function patrolCoordinator16931(storage){
+  let ready=false;
+  const rows=(q,...a)=>storage.sql.exec(q,...a).toArray();
+  const init=()=>{
+    if(ready)return;
+    storage.transactionSync(()=>{
+      rows("CREATE TABLE IF NOT EXISTS desk_patrol16931(slot TEXT PRIMARY KEY,seq INTEGER NOT NULL DEFAULT 0,last_run TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '')");
+      rows("CREATE TABLE IF NOT EXISTS desk_patrol_log16931(slot TEXT NOT NULL,pos INTEGER NOT NULL,seq INTEGER NOT NULL,started INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(slot,pos))");
+      rows('CREATE INDEX IF NOT EXISTS desk_patrol_log_time16931 ON desk_patrol_log16931(started DESC)');
+    });
+    ready=true;
+  };
+  const write=(receipt,value)=>{
+    const payload=JSON.stringify(value);
+    rows('UPDATE desk_patrol_log16931 SET payload=? WHERE slot=? AND pos=? AND seq=?',payload,receipt.slot,receipt.seq%256,receipt.seq);
+    rows('UPDATE desk_patrol16931 SET last_run=? WHERE slot=? AND seq=?',payload,receipt.slot,receipt.seq);
+    if(['error','interrupted'].includes(value.outcome))rows('UPDATE desk_patrol16931 SET last_error=? WHERE slot=? AND seq=?',payload,receipt.slot,receipt.seq);
+  };
+  return {
+    begin(value){
+      try{
+        init();let receipt;
+        storage.transactionSync(()=>{
+          const row=rows('SELECT seq FROM desk_patrol16931 WHERE slot=?',value.slot)[0];
+          receipt={slot:value.slot,seq:(row?.seq||0)+1};
+          const payload=JSON.stringify(value);
+          rows('INSERT INTO desk_patrol16931(slot,seq,last_run) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET seq=excluded.seq,last_run=excluded.last_run',receipt.slot,receipt.seq,payload);
+          rows('INSERT INTO desk_patrol_log16931(slot,pos,seq,started,payload) VALUES(?,?,?,?,?) ON CONFLICT(slot,pos) DO UPDATE SET seq=excluded.seq,started=excluded.started,payload=excluded.payload',receipt.slot,receipt.seq%256,receipt.seq,value.started,payload);
+        });
+        return receipt;
+      }catch{console.warn('note-helper: patrol start record unavailable');return null;}
+    },
+    finish(receipt,value){
+      if(!receipt)return;
+      try{init();storage.transactionSync(()=>write(receipt,value));}
+      catch{console.warn('note-helper: patrol finish record unavailable');}
+    },
+    read(){
+      try{
+        init();
+        const accounts=rows('SELECT slot,last_run,last_error FROM desk_patrol16931 ORDER BY slot').map(r=>({slot:r.slot,last_run:r.last_run?JSON.parse(r.last_run):null,last_error:r.last_error?JSON.parse(r.last_error):null}));
+        const runs=rows('SELECT payload FROM desk_patrol_log16931 ORDER BY started DESC LIMIT 512').map(r=>JSON.parse(r.payload));
+        return {available:true,version:31,accounts,runs};
+      }catch{return {available:false,version:31,accounts:[],runs:[]};}
+    },
+    async wake(nextAt){
+      try{
+        const next=Math.max(Date.now()+1000,Number(nextAt)||0),at=await storage.getAlarm();
+        if(at===null||at>next)await storage.setAlarm(next);
+      }catch{console.warn('note-helper: patrol wake deferred to existing alarm');}
+    }
+  };
+}
+async function readPatrol16931(env){
+  const local=env[PATROL_LOCAL16931];
+  if(local)return local.read();
+  if(!env.SCHEDULER)return {available:false,version:31,accounts:[],runs:[]};
+  try{
+    const response=await env.SCHEDULER.get(env.SCHEDULER.idFromName('note-helper-210-seconds')).fetch('https://scheduler.internal/patrol/status');
+    if(response.ok){const result=await response.json();if(result.version===31&&Array.isArray(result.accounts)&&Array.isArray(result.runs))return result;}
+  }catch{}
+  return {available:false,version:31,accounts:[],runs:[]};
+}
+function patrolDisplay16931(data){
+  const states={running:'開始後の完了記録なし',success:'操作の成功を確認',skipped:'送信せず巡回を完了',error:'エラー後の再確認待ち',interrupted:'途中で中断・完了を確認できず'};
+  const kinds={internal_read:'送信前の内部エラー',read:'送信前の読み取り',network:'通信・操作結果の確認',storage:'読み書き・内部処理',auth:'ログイン・アクセス拒否',rate:'回数制限',config:'設定の確認',response:'応答形式の確認'};
+  return '【通常巡回の実行記録】\n'+(data.accounts.length?data.accounts.map(a=>{
+    const r=a.last_run,e=a.last_error;
+    return 'アカウント '+a.slot+'：'+(states[r?.outcome]||'まだ記録なし')+
+      (r?'\n開始 '+time(r.started)+'／完了 '+time(r.finished)+'\n予約時刻からの遅れ '+Math.ceil(r.delay_ms/1000)+'秒／処理時間 '+Math.ceil(r.duration_ms/1000)+'秒':'')+
+      (e?'\n最後のエラー '+time(e.finished||e.started)+'／'+e.stage+'／'+(kinds[e.kind]||'内部処理')+(e.code?'（HTTP '+e.code+'）':'')+'\nその時点の再確認予定 '+time(e.next_at)+(e.wait_saved?'':'（保存は未確認）'):'\nこの版で完了時に記録できたエラーはありません');
+  }).join('\n\n'):'この版での実行記録はまだありません。')+
+    '\n成功後も最後のエラー記録を残します。記録は各アカウント直近256回。「設定と実績を保存」にも含まれます。受け取ったスキの数ではありません。';
+}
