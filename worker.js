@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.40';
+const VERSION = 'v16.9.41';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -898,6 +898,14 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   const claim=await claimDiscovery16919(env,s,Date.now(),!pending);
   if(!claim)return null;
   bump('reader_checks');
+  // Own-work audience measurements and pending reactions need the person's
+  // actual list or action state even when the article reports a zero count.
+  if(!pending && !returning && reachCount16933(source,'comment')===0 &&
+     (mode==='comments' || reachCount16933(source)===0)){
+    await record(mode==='comments'?'元記事のコメント0件・感想コメントの候補なし':'元記事のスキ・コメントともに0件・読者候補なし');
+    await diagnostic16915(env,component,'wait','source');
+    return null;
+  }
   let reserved='',failure=null;
   const guard=async fn=>{try{return await fn();}catch(e){failure=e;throw e;}};
   const result=await inNoteBrowser(env.BROWSER,cleanCookie(env.NOTE_SESSION),false,async io=>{
@@ -1630,6 +1638,21 @@ async function read520body(res, limit) {
 function deskJson(data,status=200) {
   return Response.json(data,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
 }
+async function readBrowserCapacity(binding) {
+  try {
+    const limits=await binding.limits();
+    const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
+    const seconds=limits.usedBrowserTimeSeconds;
+    const capacity={
+      activeSessions:Array.isArray(limits.activeSessions)?limits.activeSessions.length:null,
+      maxConcurrentSessions:count(limits.maxConcurrentSessions),
+      allowedBrowserAcquisitions:count(limits.allowedBrowserAcquisitions),
+      usedBrowserTimeSeconds:Number.isFinite(seconds)&&seconds>=0?seconds:null
+    };
+    if(Object.values(capacity).some(value=>value!==null))return deskJson({version:VERSION,capacity});
+  }catch{ /* Provider details can include session IDs. Return only approved counts. */ }
+  return deskJson({error:'Cloudflareのブラウザー使用量を読み取れませんでした。'},503);
+}
 async function deskRoute(request,env) {
   if (request.method==='GET') return deskPage();
   if (request.method!=='POST') return deskJson({error:'操作方法を確認してください。'},405);
@@ -1681,6 +1704,7 @@ async function deskRoute(request,env) {
       const denied=await adminKeyDenied16934(request,env,bearer??directKey,failure,bearer!==null);
       if(denied)return denied;
       input=JSON.parse(await readAdminBody16934(request,2000000));
+      if(input?.action==='browser_capacity')return readBrowserCapacity(env.BROWSER);
     }
     if(!env.SCHEDULER)return failure('作品管理の保存先 SCHEDULER が設定されていません。',503);
     const res=await stub520(env).fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:JSON.stringify(input)}));
@@ -4461,7 +4485,8 @@ function deskRecordText(s) {
   if(s.runtime){
     const r=s.runtime.tick,b=s.runtime.browser;
     lines.push('【自動処理の確認】',r.message,'最終開始 '+tm(r.started)+' ／ 最終巡回完了 '+tm(r.finished)+(r.fallback?' ／ 補助起動による確認':''));
-    if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
+    if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':b.background_retry_at>Date.now()?'予約公開の共通待機終了':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
+    if(b?.background_retry_at>Date.now() && b.background_retry_at>b.hold_until)lines.push('ブラウザーの通常処理：回数制限が続いたため '+tm(b.background_retry_at)+' 以降に再試行');
   }
   if(s.audience)lines.push(networkRecord16922(s.audience));
   if(s.repeat)lines.push(repeatRecord16923(s.repeat));
@@ -6271,7 +6296,10 @@ async function readTuta520(binding,credential,callbacks) {
   const inspected=new Set();
   // Diagnostics contain only fixed stage/state identifiers, never page text,
   // URLs, exceptions, account addresses, mail contents or credentials.
-  const report=result=>({...result,stage,screen:lastScreen.reason||lastScreen.state,http:blocked,
+  // Only the authenticated Tuta controller can identify a different mailbox.
+  // A controller still loading its identity must retain its normal wait.
+  const wrongMailbox=()=>lastScreen.state==='identity' && lastScreen.reason==='account_mismatch';
+  const report=result=>({...result,...(wrongMailbox()?{kind:'screen'}:{}),stage,screen:lastScreen.reason||lastScreen.state,http:blocked,
     ...(blocked||retry>0?{kind:blocked===401?'auth':'hold',hold:Math.max(retry,blocked===429?2*HOUR:0)}:{})});
   try {
     session=await binding.acquire({keepAlive:15000,recording:false,guardrails:{allowedDomains:['app.tuta.com','*.tuta.com','*.tutanota.com']}});
@@ -6290,7 +6318,7 @@ async function readTuta520(binding,credential,callbacks) {
       const raw=Object.entries(r.headers||{}).find(([k])=>k.toLowerCase()==='retry-after')?.[1];
       if(raw!==undefined)retry=Math.max(retry,retryDelay16929(raw));
     });
-    const halt=()=>blocked||retry>0||Date.now()>=until||!callbacks.active();
+    const halt=()=>blocked||retry>0||wrongMailbox()||Date.now()>=until||!callbacks.active();
     const frame=async(step,arg={})=>{
       if(halt())return {state:'stopped'};
       let r;
@@ -6312,7 +6340,7 @@ async function readTuta520(binding,credential,callbacks) {
       let state={state:'page'};
       for(let n=0;n<tries&&!halt();n++) {
         try{state=await frame(step,arg);}catch(error){lastScreen=state={state:tutaErrorState520(error)};}
-        if(!['page','loading','identity','script_error','script_reference','script_type','script_syntax','script_eval','command_error'].includes(state?.state))return state;
+        if(wrongMailbox()||!['page','loading','identity','script_error','script_reference','script_type','script_syntax','script_eval','command_error'].includes(state?.state))return state;
         await pause520(500);
       }
       return state;
@@ -8019,47 +8047,101 @@ function boundedClose16916(work) {
   let timer;
   return Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('close timeout')),5000);})]).finally(()=>clearTimeout(timer));
 }
+function browserDailyTimeLimit(detail){
+  let messages=[detail];
+  if(detail.trimStart().startsWith('{')){
+    try{
+      const body=JSON.parse(detail);
+      messages=[body.message,typeof body.error==='string'?body.error:body.error?.message];
+      if(Array.isArray(body.errors))messages.push(...body.errors.map(e=>e?.message));
+    }catch{return false;}
+  }
+  return messages.some(s=>typeof s==='string' && (
+    /\bbrowser (?:rendering |run )?time limit (?:has been |was |is )?(?:exceeded|reached|exhausted) for (?:today|the day)\b/i.test(s) ||
+    /\bdaily browser (?:rendering |run )?(?:time |usage )?(?:limit|quota) (?:has been |was |is )?(?:exceeded|reached|exhausted)\b/i.test(s)
+  ));
+}
+// Use the same binding acquisition request as @cloudflare/puppeteer, retaining
+// the provider's HTTP status and Retry-After before a typed RPC error loses them.
+async function acquireBrowserWithRetryInfo(raw,options){
+  const supported=options && Object.keys(options).every(k=>['keepAlive','recording','guardrails'].includes(k)) &&
+    Number.isSafeInteger(options.keepAlive) && options.keepAlive>0 && typeof options.recording==='boolean' &&
+    options.guardrails && Object.keys(options.guardrails).length===1 && Object.hasOwn(options.guardrails,'allowedDomains') &&
+    Array.isArray(options.guardrails.allowedDomains) && options.guardrails.allowedDomains.every(d=>typeof d==='string');
+  if(!supported || typeof raw.fetch!=='function')return raw.acquire(options);
+  const url=new URL('https://fake.host/v1/devtools/browser');
+  url.searchParams.set('keep_alive',String(options.keepAlive));
+  url.searchParams.set('recording',String(options.recording));
+  const response=await raw.fetch(url.href,{method:'POST',redirect:'manual',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({guardrails:options.guardrails})});
+  if(response.status!==200){
+    const detail=response.status===429?await read520body(response,8192).catch(()=>''):'';
+    if(response.status!==429)await response.body?.cancel().catch(()=>{});
+    const daily=browserDailyTimeLimit(detail);
+    const error=new Error(daily?'Browser time limit exceeded for today':'Browser acquisition failed');
+    error.status=response.status;
+    error.retryAfter=response.headers.get('Retry-After');
+    throw error;
+  }
+  try{return JSON.parse(await read520body(response,8192));}
+  catch{throw Error('Invalid browser acquisition response');}
+}
 function coordinatedBrowser16916(raw,storage,priority=()=>false) {
   if(LOCAL_BROWSERS16921.has(raw)||typeof raw?.acquire!=='function')return raw;
   let ready=false;
   const sessions=new Map();
   const rows=(q,...a)=>objectRows(storage,q,...a);
   const one=(q,...a)=>rows(q,...a)[0];
-  const init=()=>{
-    if(ready)return;
-    storage.transactionSync(()=>{
-      rows("CREATE TABLE IF NOT EXISTS desk_browser16916(id INTEGER PRIMARY KEY,next_at INTEGER NOT NULL DEFAULT 0,hold_until INTEGER NOT NULL DEFAULT 0,lease INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',started INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,sessions INTEGER NOT NULL DEFAULT 0)");
+  const state=()=>{
+    if(ready)return one('SELECT * FROM desk_browser16916 WHERE id=1');
+    const first=storage.transactionSync(()=>{
+      rows("CREATE TABLE IF NOT EXISTS desk_browser16916(id INTEGER PRIMARY KEY,next_at INTEGER NOT NULL DEFAULT 0,hold_until INTEGER NOT NULL DEFAULT 0,lease INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',started INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,sessions INTEGER NOT NULL DEFAULT 0,rate_backoff_ms INTEGER NOT NULL DEFAULT 0)");
       rows('INSERT OR IGNORE INTO desk_browser16916(id) VALUES(1)');
-    });ready=true;
+      const s=one('SELECT * FROM desk_browser16916 WHERE id=1');
+      if(!Object.hasOwn(s,'rate_backoff_ms')){
+        rows('ALTER TABLE desk_browser16916 ADD COLUMN rate_backoff_ms INTEGER NOT NULL DEFAULT 0');
+        s.rate_backoff_ms=0;
+      }
+      return s;
+    });
+    ready=true;return first;
   };
-  const available=purpose=>{
-    init();const now=Date.now(),s=one('SELECT * FROM desk_browser16916 WHERE id=1');
+  const available=(purpose,s=state())=>{
+    const now=Date.now();
     let reason='',at=0;
-    if(s.hold_until>now){reason=Object.hasOwn(BROWSER_WAIT16916,s.reason)?s.reason:'startup';at=s.hold_until;}
+    if(s.hold_until>now){
+      reason=Object.hasOwn(BROWSER_WAIT16916,s.reason)?s.reason:'startup';
+      at=purpose!=='publish' && reason==='rate'?Math.max(s.hold_until,s.started+s.rate_backoff_ms):s.hold_until;
+    }
     else if(s.lease>now){reason='busy';at=s.lease;}
     else if(s.next_at>now){reason='spacing';at=s.next_at;}
+    else if(purpose!=='publish' && s.reason==='rate' && s.started+s.rate_backoff_ms>now){reason='rate';at=s.started+s.rate_backoff_ms;}
     else if(purpose!=='publish'&&priority()){reason='publication';at=now+60000;}
     return reason?browserDeferred16916(new BrowserWait16916(reason,at)):null;
   };
   const binding=purpose=>{const wrapped={
     available16916:(kind=purpose)=>available(kind),purpose16916:binding,
-    state16916:()=>{init();return one('SELECT next_at,hold_until,lease,started,closed,reason,attempts,sessions FROM desk_browser16916 WHERE id=1');},
+    state16916:()=>{
+      const {next_at,hold_until,lease,started,closed,reason,attempts,sessions,rate_backoff_ms}=state();
+      return {next_at,hold_until,lease,started,closed,reason,attempts,sessions,background_retry_at:rate_backoff_ms?started+rate_backoff_ms:0};
+    },
     devtools:raw.devtools,
     connectSession:(...args)=>raw.connectSession(...args),
     async acquire(options){
-      const wait=available(purpose);if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
+      const s=state();
+      const wait=available(purpose,s);if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
       const at=Date.now(),token=crypto.randomUUID();
       // Reserve synchronously before yielding. An interrupted isolate leaves a
       // finite lease, while the provider's 15-second keepAlive closes its session.
       rows("UPDATE desk_browser16916 SET next_at=?,lease=?,token=?,started=?,attempts=attempts+1 WHERE id=1",at+21000,at+4*60000,token,at);
       let session;
       try {
-        session=await raw.acquire(options);
+        session=await acquireBrowserWithRetryInfo(raw,options);
         if(typeof session?.sessionId!=='string'||!session.sessionId)throw Error('missing browser session');
         const held=one('SELECT token,lease FROM desk_browser16916 WHERE id=1');
         if(held?.token!==token||held.lease<=Date.now())
           throw new BrowserWait16916('busy',Math.max(Date.now()+21000,held?.lease||0));
-        rows("UPDATE desk_browser16916 SET sessions=sessions+1,reason='' WHERE id=1 AND token=?",token);
+        rows("UPDATE desk_browser16916 SET sessions=sessions+1,reason='',rate_backoff_ms=0 WHERE id=1 AND token=?",token);
         sessions.set(session.sessionId,token);
         return session;
       }catch(error){
@@ -8068,13 +8150,21 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
         const created=typeof session?.sessionId==='string'&&!!session.sessionId;
         if(created)await boundedClose16916(()=>raw.closeSession(session.sessionId)).catch(()=>{});
         const text=errorText(error);
-        const daily=/browser.*time.*limit.*(?:today|day)|daily.*browser.*limit/i.test(text);
+        const daily=browserDailyTimeLimit(text);
         const rate=Number(error?.status??error?.statusCode??error?.code)===429||/\b429\b|too many|rate.?limit|concurrent.*limit/i.test(text);
         let reason=error instanceof BrowserWait16916?error.reason:created?'storage':daily?'daily':rate?'rate':'startup';
         const rawRetry=error?.retryAfter??error?.retry_after??error?.headers?.get?.('Retry-After');
-        let until=Math.max(Date.now()+60000,daily?(Math.floor(Date.now()/86400000)+1)*86400000+5000:0,
-          Date.now()+retryDelay16929(rawRetry),error instanceof BrowserWait16916?error.at:0);
-        try{rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=? WHERE id=1 AND token=?",until,reason,token);}
+        const failed=Date.now(),providerDelay=retryDelay16929(rawRetry,failed);
+        const backoff=reason==='rate' && !providerDelay?Math.min(32*M520,Math.max(M520,s.rate_backoff_ms*2)):0;
+        // Only an actual due publication gets an early attempt after the shared
+        // deadline. If rejected again, the same five-minute slot cannot probe twice.
+        const earlyPublish=purpose==='publish' && at<s.started+s.rate_backoff_ms;
+        let until=Math.max(failed+M520,failed+providerDelay,daily?(Math.floor(failed/D520)+1)*D520+5000:0,
+          error instanceof BrowserWait16916?error.at:0,backoff && earlyPublish?failed+5*M520+1:0);
+        try{
+          rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=?,rate_backoff_ms=? WHERE id=1 AND token=?",until,reason,backoff,token);
+          if(purpose!=='publish')until=Math.max(until,at+backoff);
+        }
         catch{reason='storage';until=Math.max(until,at+4*60000);}
         throw new BrowserWait16916(reason,until);
       }
@@ -10308,8 +10398,8 @@ function circulationRecord16932(v){
 const REACH16933=Object.freeze({launch:48*HOUR,window:14*D520,retention:28*D520,works:256,contacts:8192,sample:200});
 // Match the existing D1 cohort exactly: today and the previous 27 JST days.
 const reachCohort16933=now=>Date.parse(jstDay(now-27*D520)+'T00:00:00+09:00');
-function reachCount16933(n){
-  const values=[n?.likeCount,n?.like_count].filter(v=>v!==undefined);
+function reachCount16933(n,kind='like'){
+  const values=[n?.[kind+'Count'],n?.[kind+'_count']].filter(v=>v!==undefined);
   return values.length&&values.every(v=>Number.isSafeInteger(v)&&v>=0&&v===values[0])?values[0]:null;
 }
 function reachOwn16933(identity,n,now){

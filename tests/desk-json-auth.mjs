@@ -6,11 +6,12 @@ const origin = 'https://fixture.invalid';
 const key = 'fixture-only';
 const direct = 'X-Note-Helper-Admin-Key';
 
-function fixture(locked = false) {
+function fixture(locked = false, browser) {
   const guarded = [];
   let reads = 0;
   const env = {
     ADMIN_KEY: key,
+    BROWSER: browser,
     SCHEDULER: {
       idFromName: name => name,
       get: () => ({
@@ -32,10 +33,10 @@ function fixture(locked = false) {
       })
     }
   };
-  const request = (headers, site = origin) => worker.fetch(new Request(site + '/520', {
+  const request = (headers, site = origin, action = 'plans') => worker.fetch(new Request(site + '/520', {
     method: 'POST',
     headers: {Origin: site, 'Content-Type': 'application/json', ...headers},
-    body: JSON.stringify({action: 'plans'})
+    body: JSON.stringify({action})
   }), env);
   return {request, guarded, reads: () => reads};
 }
@@ -49,6 +50,32 @@ test('both desk JSON credentials authenticate before accessing the saved plans',
   }
   assert.deepEqual(guarded, [true, true]);
   assert.equal(reads(), 2);
+});
+
+test('capacity reads only aggregate limits with admin credentials and never opens a browser', async () => {
+  let calls = 0;
+  const browser = {
+    limits() {
+      calls++;
+      return {activeSessions:[{id:'private-session'}], maxConcurrentSessions:3,
+        allowedBrowserAcquisitions:0, usedBrowserTimeSeconds:600.5, extra:'private'};
+    },
+    acquire() { assert.fail('unexpected acquisition'); }
+  };
+  const {request, reads} = fixture(false,browser);
+  assert.equal((await request({},origin,'browser_capacity')).status,403);
+  assert.equal(calls,0);
+  const result = await request({[direct]:key},origin,'browser_capacity');
+  assert.equal(result.status,200);
+  assert.deepEqual((await result.json()).capacity,{
+    activeSessions:1, maxConcurrentSessions:3, allowedBrowserAcquisitions:0, usedBrowserTimeSeconds:600.5
+  });
+  assert.equal(calls,1);
+  const partial = fixture(false,{limits:() => ({allowedBrowserAcquisitions:1})});
+  assert.equal((await (await partial.request({[direct]:key},origin,'browser_capacity')).json()).capacity.usedBrowserTimeSeconds,null);
+  const missing = fixture();
+  assert.equal((await missing.request({[direct]:key},origin,'browser_capacity')).status,503);
+  assert.equal(reads(),0);
 });
 
 test('an invalid, ambiguous or insecure direct key cannot authorize a desk read', async () => {
