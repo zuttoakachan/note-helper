@@ -8190,10 +8190,11 @@ Object.assign(Desk520.prototype,{
     const history=[];
     if(tables.has('desk_join') && tables.has('desk_join_check16930'))history.push(...this.rows(
       `SELECT '共同誌参加' AS feature,j.id AS subject,MAX(j.at,COALESCE(c.checked,0)) AS at,
-        j.phase AS state,j.message,c.reason FROM desk_join j LEFT JOIN desk_join_check16930 c ON c.id=j.id
-        WHERE j.at>0 OR c.checked>0 ORDER BY MAX(j.at,COALESCE(c.checked,0)) DESC,j.id LIMIT 40`));
+        j.phase AS state,j.message,c.reason,j.due AS nextAt FROM desk_join j LEFT JOIN desk_join_check16930 c ON c.id=j.id
+        WHERE j.at>0 OR c.checked>0 OR j.due>0 OR j.message<>'募集方法を確認待ち'
+        ORDER BY MAX(j.at,COALESCE(c.checked,0)) DESC,j.due DESC,j.id LIMIT 40`));
     else if(tables.has('desk_join'))history.push(...this.rows(
-      "SELECT '共同誌参加' AS feature,id AS subject,at,phase AS state,message FROM desk_join WHERE at>0 ORDER BY at DESC LIMIT 40"));
+      "SELECT '共同誌参加' AS feature,id AS subject,at,phase AS state,message,due AS nextAt FROM desk_join WHERE at>0 OR due>0 OR message<>'募集方法を確認待ち' ORDER BY at DESC,due DESC,id LIMIT 40"));
     if(tables.has('desk_job'))history.push(...this.rows(
       "SELECT kind AS feature,at,phase AS state,message FROM desk_job WHERE at>0 ORDER BY at DESC LIMIT 24"));
     if(tables.has('desk_task_health'))history.push(...this.rows(
