@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.43';
+const VERSION = 'v16.9.44';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1024,6 +1024,32 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
   return null;
 }
 
+const PATROL_TAG_HISTORY = 8;
+function leastUsedPatrolTag(note,listing,counts) {
+  let best=null;
+  for(const tag of contestTags16923(note)||[]){
+    if(tag!==listing && counts.has(tag) && (best===null || counts.get(tag)<counts.get(best)))best=tag;
+  }
+  return best;
+}
+function alternatePatrolCard(keys,notes,listing,counts,ownIds,recent,cutoff) {
+  let lowest=null,alternate=null;
+  for(const key of keys){
+    const card=notes.get(key),author=String(card.user?.id??card.user_id??'');
+    if(ownIds.has(author) || (recent.get(author)||0)>cutoff)continue;
+    const likeFlags=[card.is_liked,card.isLiked].filter(flag=>flag!==undefined);
+    const unliked=likeFlags.length>0 && likeFlags.every(flag=>flag===false);
+    const tag=card.status==='published' && unliked && /^[1-9]\d*$/.test(author)?leastUsedPatrolTag(card,listing,counts):null;
+    // Keep the original first detail lookup if its category or eligibility is unknown.
+    if(!tag){if(lowest===null)return null;continue;}
+    const score=counts.get(tag);
+    if(lowest===null)lowest=score;
+    else if(score<lowest){lowest=score;alternate={key,tag,author};}
+    if(lowest===0)break;
+  }
+  return alternate;
+}
+
 async function run(original,slot) {
   const baseEnv = scoped(original,slot);
   const token = await acquire(baseEnv,true);
@@ -1094,6 +1120,8 @@ async function run(original,slot) {
     const readerNotes=['tag','explore_tag'].includes(choice.mode)&&!choice.afterReaders?null:await auxiliary16917(env,token,'queue',()=>checkingSend,()=>queuedReader1699(env,state,settings,token,ownIds,bump,choice.origin||null));
     const started=Date.now();
     const waits=new Map(waitRows.results.map(row=>[row.tag,row.until_at]));
+    const tagCounts=new Map(tags.map(tag=>[tag,0]));
+    for(const tag of receipt?.recentTags||[])if(tagCounts.has(tag))tagCounts.set(tag,tagCounts.get(tag)+1);
     let cursor=state.cursor, savedCursor=cursor, lists=0, details=0, limited=false;
     for (let visited=0; visited<tags.length+(readerNotes?1:0) && (visited===0 && readerNotes || lists<settings.scan_tags); visited++) {
       if (details>=settings.scan_notes || Date.now()-started>=90000) { limited=true; break; }
@@ -1124,7 +1152,10 @@ async function run(original,slot) {
           for (const row of rows.results) recent.set(row.author,row.last_at);
         }
       }
-      for (const key of candidates) {
+      const alternate=!fromReader && receipt?.recentTags?.length && !receipt.preferOriginalOrder && candidates.length>1
+        ? alternatePatrolCard(candidates,notes,tag,tagCounts,ownIds,recent,Date.now()-settings.author_hours*HOUR):null;
+      if(alternate)receipt.preferOriginalOrder=true;
+      for (const key of alternate?[alternate.key]:candidates) {
         const listedAuthor=authorOf(notes.get(key));
         if (listedAuthor && ownIds.has(listedAuthor)) { bump('own_or_liked'); continue; }
         if (listedAuthor && (recent.get(listedAuthor)||0)>Date.now()-settings.author_hours*HOUR) { bump('author_recent'); continue; }
@@ -1133,6 +1164,7 @@ async function run(original,slot) {
         const note=await article(env,key);
         const author=authorOf(note);
         if(note&&(note.status!=='published'||typeof note.is_liked!=='boolean')){bump('no_candidates');continue;}
+        if(alternate && note && (author!==alternate.author || !contestTags16923(note)?.includes(alternate.tag))){bump('no_candidates');continue;}
         if(fromReader && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
         if (!note || note.is_liked===true || ownIds.has(author)) {
           await sql(env,"INSERT OR IGNORE INTO nh_seen VALUES (?,'skip',?)",key,Date.now()).run();
@@ -1181,10 +1213,19 @@ async function run(original,slot) {
           sql(env,'INSERT OR IGNORE INTO nh_v13_success VALUES (?,?,?,?)',slot,key,day(),Date.now()),
           ...(fromReader?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
         ]);
+        if(receipt && !fromReader){
+          const confirmedTag=alternate?.tag || leastUsedPatrolTag(note,tag,tagCounts) || tag;
+          receipt.recentTags=[...(receipt.recentTags||[]),confirmedTag].slice(-PATROL_TAG_HISTORY);
+          receipt.preferOriginalOrder=false;
+        }
         await auxiliaryWrites16917(env,'confirmed',()=>learningConfirmed16913(env,key,true));
         bump('sent');if(fromReader)bump('reader_sent');
         await finish('スキ確認済み：'+key+(fromReader?'（文芸・自分の作品の読者経由）':'（#'+tag+'）')+'／詳細確認 '+details+'記事',true);
         return true;
+      }
+      if(alternate){
+        // This card replaced one existing lookup. Do not spend another if its detail or reservation changed.
+        await finish('送信見送り：候補1件を照合しました。次の通常巡回で続けます。');return true;
       }
       if (limited) break;
       bump('no_candidates');
@@ -10465,6 +10506,9 @@ async function acquireBackground16931(env,urgent=false){
 function patrolCoordinator16931(storage){
   let ready=false;
   const rows=(q,...a)=>objectRows(storage,q,...a);
+  // Keep the selection hints on the slot's existing latest record only.
+  const latestPatrol=(receipt,value)=>JSON.stringify({...value,recentTags:receipt.recentTags,
+    preferOriginalOrder:receipt.preferOriginalOrder || (value.outcome==='running' && receipt.recentTags.length>0)});
   const init=()=>{
     if(ready)return;
     storage.transactionSync(()=>{
@@ -10477,7 +10521,7 @@ function patrolCoordinator16931(storage){
   const write=(receipt,value)=>{
     const payload=JSON.stringify(value);
     rows('UPDATE desk_patrol_log16931 SET payload=? WHERE slot=? AND pos=? AND seq=?',payload,receipt.slot,receipt.seq%256,receipt.seq);
-    rows('UPDATE desk_patrol16931 SET last_run=? WHERE slot=? AND seq=?',payload,receipt.slot,receipt.seq);
+    rows('UPDATE desk_patrol16931 SET last_run=? WHERE slot=? AND seq=?',latestPatrol(receipt,value),receipt.slot,receipt.seq);
     if(['error','interrupted'].includes(value.outcome))rows('UPDATE desk_patrol16931 SET last_error=? WHERE slot=? AND seq=?',payload,receipt.slot,receipt.seq);
   };
   return {
@@ -10485,10 +10529,12 @@ function patrolCoordinator16931(storage){
       try{
         init();let receipt;
         storage.transactionSync(()=>{
-          const row=rows('SELECT seq FROM desk_patrol16931 WHERE slot=?',value.slot)[0];
-          receipt={slot:value.slot,seq:(row?.seq||0)+1};
+          const row=rows('SELECT seq,last_run FROM desk_patrol16931 WHERE slot=?',value.slot)[0];
+          const previous=savedJson16936(row?.last_run,null,r=>Array.isArray(r?.recentTags) &&
+            r.recentTags.length<=PATROL_TAG_HISTORY && r.recentTags.every(t=>typeof t==='string' && t.length<=100));
+          receipt={slot:value.slot,seq:(row?.seq||0)+1,recentTags:previous?.recentTags||[],preferOriginalOrder:previous?.preferOriginalOrder===true};
           const payload=JSON.stringify(value);
-          rows('INSERT INTO desk_patrol16931(slot,seq,last_run) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET seq=excluded.seq,last_run=excluded.last_run',receipt.slot,receipt.seq,payload);
+          rows('INSERT INTO desk_patrol16931(slot,seq,last_run) VALUES(?,?,?) ON CONFLICT(slot) DO UPDATE SET seq=excluded.seq,last_run=excluded.last_run',receipt.slot,receipt.seq,latestPatrol(receipt,value));
           rows('INSERT INTO desk_patrol_log16931(slot,pos,seq,started,payload) VALUES(?,?,?,?,?) ON CONFLICT(slot,pos) DO UPDATE SET seq=excluded.seq,started=excluded.started,payload=excluded.payload',receipt.slot,receipt.seq%256,receipt.seq,value.started,payload);
         });
         return receipt;
@@ -10502,7 +10548,11 @@ function patrolCoordinator16931(storage){
     read(){
       try{
         init();
-        const accounts=rows('SELECT slot,last_run,last_error FROM desk_patrol16931 ORDER BY slot').map(r=>({slot:r.slot,last_run:r.last_run?JSON.parse(r.last_run):null,last_error:r.last_error?JSON.parse(r.last_error):null}));
+        const accounts=rows('SELECT slot,last_run,last_error FROM desk_patrol16931 ORDER BY slot').map(r=>{
+          const last=r.last_run?JSON.parse(r.last_run):null;
+          if(last){delete last.recentTags;delete last.preferOriginalOrder;}
+          return {slot:r.slot,last_run:last,last_error:r.last_error?JSON.parse(r.last_error):null};
+        });
         const runs=rows('SELECT payload FROM desk_patrol_log16931 ORDER BY started DESC LIMIT 512').map(r=>JSON.parse(r.payload));
         return {available:true,version:31,accounts,runs};
       }catch{return {available:false,version:31,accounts:[],runs:[]};}
