@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.41';
+const VERSION = 'v16.9.42';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1360,7 +1360,7 @@ export default {
     let gate=cronReadGates.get(original.DB);
     if(!gate){gate=new ObjectReadGate(original.DB);cronReadGates.set(original.DB,gate);}
     await gate.restore();
-    if(gate.until>Date.now())return;
+    if(gate.until>Date.now() && !await gate.recover(original,false))return;
     for(const run of [wakeScheduler,deskTick])ctx.waitUntil(run(original).catch(error=>{
       if(!dailyObjectReadsExceeded(error))throw error;
       gate.record(error,ctx);
@@ -1391,39 +1391,103 @@ function dailyObjectReadsExceeded(error){
     /rows? (?:read|reads)|read rows?|row[- ]reads?/i.test(text) &&
     /limit|quota|exceed/i.test(text) && /daily|per day|today|midnight|free (?:tier|plan)/i.test(text);
 }
+// Keep legacy two-column D1 storage readable during rollout. A released marker
+// remains in the new singleton so that an older, delayed rejection cannot rearm it.
+const readGateSchema=`CREATE TABLE IF NOT EXISTS nh_do_read_state(
+  id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,seen INTEGER NOT NULL,
+  probe_at INTEGER NOT NULL,claimed INTEGER NOT NULL,released INTEGER NOT NULL)`;
 class ObjectReadGate {
   constructor(db,ctx=null){
-    this.ctx=ctx;this.db=db;this.until=0;
+    this.ctx=ctx;this.db=db;this.until=0;this.seen=0;this.probeAt=0;this.releasedDeadline=0;
     if(ctx)objectReadGates.set(ctx.storage,this);
   }
-  async restore(){
+  async restore(force=false){
+    const now=Date.now();
+    if(this.loaded && (force || (this.until>now && now>=this.refreshAt))){
+      await this.loaded;this.loaded=null;
+    }
     this.loaded ||= (async()=>{
+      this.refreshAt=now+60000;
       try{
-        const row=await this.db.prepare('SELECT resume_at FROM nh_do_read_limit WHERE id=1').first();
-        if(Number.isSafeInteger(row?.resume_at))this.until=Math.max(this.until,row.resume_at);
-      }catch{
-        // An untouched database has no marker table. If D1 is unavailable as
-        // well, the first actual DO quota rejection still closes the local gate.
-      }
+        let row;
+        try{row=await this.db.prepare('SELECT * FROM nh_do_read_state WHERE id=1').first();}
+        catch(error){if(!/no such table/i.test(errorText(error)))throw error;}
+        if(row){
+          if(row.seen>=this.seen || (!row.released && row.probe_at<0 && row.deadline>this.until)){
+            this.until=row.released?0:row.deadline;
+            this.seen=row.seen;this.probeAt=row.claimed?0:Math.max(0,row.probe_at);
+            this.releasedDeadline=row.released?row.deadline:0;
+          }
+        }else if(!this.seen){
+          const legacy=await this.db.prepare('SELECT resume_at FROM nh_do_read_limit WHERE id=1').first();
+          if(Number.isSafeInteger(legacy?.resume_at))this.until=Math.max(this.until,legacy.resume_at);
+        }
+      }catch{ /* Never lift a known hold on a missing or unavailable D1 response. */ }
     })();
     await this.loaded;
   }
   record(error,ctx=this.ctx){
-    if(this.until>Date.now() || !dailyObjectReadsExceeded(error))return;
     const now=Date.now();
-    const reset=(Math.floor(now/86400000)+1)*86400000+5000;
-    // A response crossing midnight still carries the original reset deadline.
-    const until=Number.isSafeInteger(error?.resumeAt) && error.resumeAt>0?Math.min(error.resumeAt,reset):reset;
-    if(until<=now)return;
-    this.until=until;
+    if(this.until>now || !dailyObjectReadsExceeded(error))return;
+    // A forwarded application response already has an originating gate. Do
+    // not write an older notification back as a fresh platform rejection.
+    if(Number.isSafeInteger(error?.resumeAt) && error.resumeAt>0){
+      if(error.resumeAt>now){this.until=error.resumeAt;this.refreshAt=0;}
+      return;
+    }
+    const midnight=Math.floor(now/86400000)*86400000;
+    const providerWait=retryDelay16929(error?.retryAfter??error?.headers?.get?.('Retry-After'));
+    const until=providerWait?now+providerWait:midnight+86400000+5000;
+    // A single refusal just after yesterday's inferred reset can be rollover
+    // lag. Schedule one shared storage check, without probing ordinary holds.
+    const rollover=this.until===midnight+5000 && now<midnight+5*60000;
+    // A negative D1 probe_at denotes a provider-directed hard deadline.
+    const probe=providerWait?-1:rollover?midnight+10*60000:0;
+    this.until=until;this.seen=now;this.probeAt=Math.max(probe,0);this.releasedDeadline=0;
     ctx.waitUntil((async()=>{
       try{
         await this.db.batch([
-          this.db.prepare('CREATE TABLE IF NOT EXISTS nh_do_read_limit(id INTEGER PRIMARY KEY,resume_at INTEGER NOT NULL)'),
-          this.db.prepare('INSERT INTO nh_do_read_limit VALUES(1,?) ON CONFLICT(id) DO UPDATE SET resume_at=MAX(resume_at,excluded.resume_at)').bind(until)
+          this.db.prepare(readGateSchema),
+          this.db.prepare(`INSERT INTO nh_do_read_state VALUES(1,?,?,?,0,0)
+            ON CONFLICT(id) DO UPDATE SET deadline=excluded.deadline,seen=excluded.seen,
+            probe_at=CASE
+              WHEN nh_do_read_state.released=1 OR nh_do_read_state.deadline<>excluded.deadline THEN excluded.probe_at
+              WHEN MIN(nh_do_read_state.probe_at,excluded.probe_at)<0 THEN -1
+              ELSE MAX(nh_do_read_state.probe_at,excluded.probe_at) END,
+            claimed=CASE WHEN nh_do_read_state.deadline=excluded.deadline THEN nh_do_read_state.claimed ELSE 0 END,released=0
+            WHERE (excluded.seen>nh_do_read_state.seen OR (excluded.seen=nh_do_read_state.seen
+                AND nh_do_read_state.released=0 AND nh_do_read_state.claimed=0 AND nh_do_read_state.probe_at=0 AND excluded.probe_at<>0)) AND
+              (nh_do_read_state.released=1 OR nh_do_read_state.probe_at>=0 OR nh_do_read_state.deadline<=excluded.deadline)`).bind(until,now,probe)
         ]);
+        await this.restore(true);
       }catch{console.warn('note-helper: DO daily read limit recorded in memory only');}
     })());
+  }
+  async recover(env,manual){
+    const now=Date.now(),deadline=this.until;
+    if(deadline<=now || (manual?this.seen!==0:!this.probeAt || this.probeAt>now))return false;
+    try{
+      if(manual)await this.db.batch([
+        this.db.prepare(readGateSchema),
+        this.db.prepare(`INSERT OR IGNORE INTO nh_do_read_state
+          SELECT 1,resume_at,0,0,0,0 FROM nh_do_read_limit WHERE id=1 AND resume_at=?`).bind(deadline)
+      ]);
+      // Conditional D1 update serializes the one real SQLite read across all
+      // instances, including the case where the provider rejects the fetch.
+      const claim=await this.db.prepare(`UPDATE nh_do_read_state SET claimed=1 WHERE id=1 AND deadline=?
+        AND released=0 AND claimed=0 AND ((seen=0 AND ?=1) OR (probe_at>0 AND probe_at<=? AND ?=0)) RETURNING seen`)
+        .bind(deadline,+manual,now,+manual).first();
+      this.probeAt=0;
+      if(!claim)return false;
+      const result=await stub520(env).fetch(new Request('https://scheduler.internal/quota/read-probe',{method:'POST'}));
+      if(!result.ok)return false;
+      const cleared=await this.db.prepare(`UPDATE nh_do_read_state SET released=1,seen=MAX(seen+1,?),probe_at=0
+        WHERE id=1 AND deadline=? AND seen=? AND claimed=1 AND released=0 RETURNING seen`)
+        .bind(Date.now(),deadline,claim.seen).first();
+      if(!cleared)return false;
+      this.until=0;this.seen=cleared.seen;this.releasedDeadline=deadline;
+      return true;
+    }catch{return false;}
   }
   response(){
     return Response.json({error:'Durable Objects の日次読み取り枠の更新待ちです。'},{
@@ -1445,7 +1509,17 @@ export class NoteScheduler {
     this.env=new Proxy(env,{get:(target,key,receiver)=>key==='BROWSER'?browser:key===PATROL_LOCAL16931?patrol:Reflect.get(target,key,receiver)});
   }
   async fetch(request) {
-    await this.readGate.restore();
+    if(request?.url==='https://scheduler.internal/quota/read-probe' && request.method==='POST'){
+      // Only the internal Worker calls this after claiming the shared D1 row.
+      // The provider must actually serve SQLite metadata to release the hold.
+      try{
+        const [table]=this.ctx.storage.sql.exec("SELECT name FROM sqlite_schema WHERE type='table' LIMIT 1").toArray();
+        if(!table?.name)return new Response(null,{status:503});
+      }catch{return new Response(null,{status:503});}
+      this.readGate.refreshAt=0;
+      return new Response(null,{status:204});
+    }
+    await this.readGate.restore(request?.headers?.get('X-Note-Helper-Refresh-Gate')==='1' && this.readGate.until>Date.now());
     if(this.readGate.until>Date.now())return this.readGate.response();
     try{
       const result=await this.handleRequest(request);
@@ -1489,7 +1563,7 @@ export class NoteScheduler {
     }
     if (!this.busy) {
       const at = await this.ctx.storage.getAlarm();
-      if (at === null || at < Date.now() - 300000) {
+      if (at === null || at < Date.now() - 300000 || (at===this.readGate.releasedDeadline && at>Date.now())) {
         await this.ctx.storage.setAlarm(Date.now() + 1000);
       }
     }
@@ -8779,7 +8853,8 @@ async function productionTestRoute16920(request,env){
   if(!env.ADMIN_KEY || !env.SCHEDULER)return fail('ADMIN_KEY・SCHEDULERの設定を確認してください。',503);
   try{
     const f=new URLSearchParams(await readAdminBody16934(request,20000));
-    const denied=await adminKeyDenied16934(request,env,f.get('key'),fail);
+    const retryStorage=f.get('action')==='records' && request.headers.get('X-Note-Helper-Retry-Storage')==='once';
+    const denied=await adminKeyDenied16934(request,env,f.get('key'),fail,false,retryStorage);
     if(denied)return denied;
     const operation={run:'production_test_start',status:'production_test_status',records:'production_test_records'};
     const action=f.get('action');
@@ -10607,7 +10682,7 @@ async function adminSameKey16934(provided,expected){
   const key=await crypto.subtle.importKey('raw',b,{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
   return crypto.subtle.verify('HMAC',key,await crypto.subtle.sign('HMAC',key,a),b);
 }
-async function adminKeyDenied16934(request,env,provided,reject,bearer=false){
+async function adminKeyDenied16934(request,env,provided,reject,bearer=false,retryStorage=false){
   try{
     if(!env.SCHEDULER || typeof env.ADMIN_KEY!=='string' || !env.ADMIN_KEY)
       return reject('管理画面の認証を確認できません。SCHEDULER・ADMIN_KEYの設定を確認してください。',503);
@@ -10622,8 +10697,14 @@ async function adminKeyDenied16934(request,env,provided,reject,bearer=false){
     const digest=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode('note-helper:admin-ip:v1\0'+ip));
     const client=Array.from(new Uint8Array(digest),x=>x.toString(16).padStart(2,'0')).join('');
     const stub=env.SCHEDULER.get(env.SCHEDULER.idFromName(ADMIN_GUARD16934));
-    const response=await stub.fetch(new Request('https://scheduler.internal/security/admin-key',{
-      method:'POST',body:JSON.stringify({client,valid})}));
+    const check=(refresh=false)=>stub.fetch(new Request('https://scheduler.internal/security/admin-key',{
+      method:'POST',headers:refresh?{'X-Note-Helper-Refresh-Gate':'1'}:{},body:JSON.stringify({client,valid})}));
+    let response=await check();
+    if(valid && retryStorage && response.headers.get('X-Note-Helper-Limit')==='do-daily-reads'){
+      const gate=new ObjectReadGate(env.DB);
+      await gate.restore();
+      if(await gate.recover(env,true) || !gate.until)response=await check(true);
+    }
     if(response.status===503 && response.headers.get('X-Note-Helper-Limit')==='do-daily-reads'){
       const paused=reject('Durable Objects の日次読み取り枠の更新待ちです。',503);
       paused.headers.set('Retry-After',response.headers.get('Retry-After')||'60');
