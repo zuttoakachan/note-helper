@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.46';
+const VERSION = 'v16.9.47';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -3123,7 +3123,7 @@ class Desk520 {
         const hold=now+(delay||HOUR);
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',hold);
       }
-      await res.body?.cancel(); throw new PublicReadError('note応答 HTTP '+res.status);
+      await res.body?.cancel(); throw Object.assign(new PublicReadError('note応答 HTTP '+res.status),{status:res.status});
     }
     let body;
     try {body=await read520body(res,3000000);}
@@ -6137,10 +6137,10 @@ Object.assign(Desk520.prototype,{
     if(c.due>now || !this.joinActive520(''))return;
     const day=jstDay(now),used=c.day===day?c.used:0;
     if(used>=48)return;
-    const choices=this.rows(`SELECT i.* FROM desk_join_discovery q JOIN desk_import i ON i.id=q.id
+    const choices=this.rows(`SELECT i.*,q.due AS discovery_due FROM desk_join_discovery q JOIN desk_import i ON i.id=q.id
       WHERE q.due<=? AND NOT EXISTS(SELECT 1 FROM desk_join_target t WHERE t.id=q.id)
       AND NOT EXISTS(SELECT 1 FROM desk_member m WHERE m.id=q.id AND m.mode='excluded') ORDER BY q.due,q.id LIMIT 16`,now);
-    const row=this.networkTry16922(()=>this.networkRecruitment16922(choices,now,used),choices[0]);
+    const row=this.networkTry16922(()=>this.expansionRecruitment16947(choices,now,used),choices[0]);
     if(!row)return;
     this.rows('UPDATE desk_expansion SET day=?,used=?,due=? WHERE id=1',day,used+1,now+15*M520);
     this.rows("UPDATE desk_join_discovery SET due=?,checked=?,message='募集方法の読み取り中' WHERE id=?",now+D520,now,row.id);
@@ -6170,7 +6170,10 @@ Object.assign(Desk520.prototype,{
         this.rows('UPDATE desk_join_cfg SET due=MIN(due,?) WHERE id=1',now);
       });
       message='フォロー不要・無料の参加申請先に追加。掲載条件は別に確認します';
-    }finally{this.rows('UPDATE desk_join_discovery SET message=?,due=? WHERE id=?',message,now+7*D520,row.id);}
+    }finally{
+      if(row.matchedRecruitmentBodies)message+='（自作と題材の近い作品を別々の作者2人以上で確認し、募集調査を優先）';
+      this.rows('UPDATE desk_join_discovery SET message=?,due=? WHERE id=?',message,now+7*D520,row.id);
+    }
     return true; // Completed this pass; an early return above is only a wait/skip.
   },
   async scoutLiterary(now){
@@ -9306,7 +9309,12 @@ const NETWORK_THEMES16922=[
 function networkJSON16922(s,fallback=[]){try{const x=JSON.parse(s);return Array.isArray(x)?x:fallback;}catch{return fallback;}}
 function networkOwner16922(s){return typeof s==='string'&&/^[\w-]{1,80}$/.test(s)&&!['api','settings','search','hashtag','tag','info'].includes(s);}
 function networkNote16922(n){return n?.status==='published'&&/^n[a-z0-9]{1,64}$/.test(n.key||'')&&networkOwner16922(n.user?.urlname)&&typeof n.name==='string'&&n.name.trim()&&n.name.trim()!=='521';}
-function networkFeature16922(n,detail=false){
+function recruitmentRestricted16947(n){
+  return n.is_limited===true||n.isLimited===true||n.is_paid===true||n.isPaid===true||Number(n.price)>0||
+    n.isPreview===true||n.is_preview===true||n.hasPaywall===true||n.has_paywall===true||
+    n.hasAvailableCirclePlans===true||n.has_available_circle_plans===true;
+}
+function networkFeature16922(n,detail=false,recruitment=false){
   const full=detail&&typeof n.body==='string'&&n.body.length<=250000&&n.is_limited!==true&&n.isLimited!==true&&n.is_paid!==true&&n.isPaid!==true&&!(Number(n.price)>0);
   const text=words161((n.name||'')+'\n'+(full?n.body:'')).normalize('NFKC').slice(0,24000);
   const counts=new Map(),stop=new Set(['自分','本当','今日','時間','言葉','文章','小説','記事','作品','投稿','読者','紹介','気持','全部','最後','最初','人間']);
@@ -9314,8 +9322,26 @@ function networkFeature16922(n,detail=false){
     const parts=/^[一-龯々]+$/.test(word)?Array.from({length:word.length-1},(_,i)=>word.slice(i,i+2)):[word];
     for(const token of parts)if(!stop.has(token))counts.set(token,(counts.get(token)||0)+1);
   }
-  return {full:!!full&&text.length>=80,themes:NETWORK_THEMES16922.filter(([,p])=>new RegExp(p).test(text)).map(([k])=>k),
+  const feature={full:!!full&&text.length>=80,themes:NETWORK_THEMES16922.filter(([,p])=>new RegExp(p).test(text)).map(([k])=>k),
     tokens:[...counts].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0])).slice(0,96).map(([k])=>k)};
+  if(recruitment&&feature.full&&n.price===0&&!recruitmentRestricted16947(n)&&n.status==='published'&&
+     (typeof n.user?.id==='string'||Number.isSafeInteger(n.user?.id))&&
+     /^[1-9]\d{0,19}$/.test(String(n.user?.id))&&(!n.type||n.type==='TextNote'||n.type==='text')){
+    const title=words161(n.name).normalize('NFKC'),plain=text.startsWith(title+'\n')?text.slice(title.length+1).trim():'';
+    const tagged=plain.includes('#'),body=tagged?plain.replace(/#[\p{L}\p{N}\p{M}_]+/gu,' '):plain;
+    if(body.replace(/\s/g,'').length>=80){
+      // The existing fingerprint includes the title. Store two bitsets pointing
+      // to terms actually present in the body; never duplicate text or tokens.
+      let themes=0,tokens=0;
+      feature.themes.forEach((theme,i)=>{
+        const p=NETWORK_THEMES16922.find(([label])=>label===theme)[1],re=new RegExp(p);
+        if((!tagged&&!re.test(title))||re.test(body))themes|=1<<i;
+      });
+      feature.tokens.slice(0,24).forEach((token,i)=>{if((!tagged&&!title.includes(token))||body.includes(token))tokens|=1<<i;});
+      feature.recruitment16947={authorId:String(n.user.id),themes,tokens};
+    }
+  }
+  return feature;
 }
 function networkSimilarity16922(a,b){
   if(!a?.full||!b?.full)return 0;
@@ -9327,6 +9353,42 @@ function networkSimilarity16922(a,b){
     0.45*tokens.length/Math.max(8,Math.min(a.tokens.length,b.tokens.length)));
 }
 function networkParseFeature16922(text){try{const f=JSON.parse(text);return f&&typeof f.full==='boolean'&&Array.isArray(f.themes)&&Array.isArray(f.tokens)?f:null;}catch{return null;}}
+function recruitmentBody16947(work){
+  const f=networkParseFeature16922(work.feature),proof=f?.recruitment16947;
+  if(!f?.full||!proof||typeof proof.authorId!=='string'||!/^[1-9]\d{0,19}$/.test(proof.authorId)||
+     f.themes.length>NETWORK_THEMES16922.length||f.tokens.length>96||
+     ![...f.themes,...f.tokens].every(s=>typeof s==='string'&&s.length>0&&s.length<=80)||
+     !Number.isSafeInteger(proof.themes)||proof.themes<0||proof.themes>=2**f.themes.length||
+     !Number.isSafeInteger(proof.tokens)||proof.tokens<0||proof.tokens>=2**Math.min(24,f.tokens.length))return null;
+  return {full:true,authorId:proof.authorId,themes:f.themes.filter((_,i)=>proof.themes&(1<<i)),
+    tokens:f.tokens.slice(0,24).filter((_,i)=>proof.tokens&(1<<i))};
+}
+function recruitmentIssue16947(feed,mag,now,ownNames){
+  if(!rssUrl16926(feed.url)||!Number.isSafeInteger(feed.full_at)||!Number.isSafeInteger(feed.checked)||
+     feed.full_at<now-28*D520||feed.full_at>feed.checked||feed.checked>now)return [];
+  const source=noteLink161(feed.url.replace(/\/rss$/,'')),issue=savedJson16936(feed.payload,null,p=>Array.isArray(p?.entries));
+  let channelUrl=issue?.header?.link,entries=issue?.entries;
+  if(!entries){
+    const saved=networkJSON16922(feed.norm),head=saved[0]?.recruitment16947;
+    if(!Number.isInteger(head?.links)||head.links<=0||head.links>=2**20)return [];
+    channelUrl=head.channel;
+    entries=saved.slice(0,20).flatMap((i,k)=>head.links&(1<<k)?[{link:'https://note.com/'+i.owner+'/n/'+i.key,pubdate:i.pub,title:i.title}]:[]);
+  }
+  if(!/^https:\/\/note\.com\//.test(channelUrl||''))return [];
+  const channel=noteLink161(channelUrl);
+  if(source?.id!==mag.id||channel?.id!==mag.id||channel.owner!==mag.owner||(source.owner&&source.owner!==mag.owner))return [];
+  const authors=new Set(),items=[];
+  for(const entry of entries.slice(0,20)){
+    if(!/^https:\/\/note\.com\//.test(entry?.link||''))continue;
+    const link=noteLink161(entry.link,undefined,'article'),pub=typeof entry.pubdate==='number'?entry.pubdate:Date.parse(entry.pubdate);
+    if(!link||!networkOwner16922(link.owner)||link.owner===mag.owner||ownNames.has(link.owner)||authors.has(link.owner)||
+       typeof entry.title!=='string'||!entry.title.trim()||entry.title.length>160||
+       !Number.isFinite(pub)||pub<now-60*D520||pub>now)continue;
+    authors.add(link.owner);items.push({article:link.id,owner:link.owner,pub,title:entry.title});
+    if(items.length===4)break;
+  }
+  return items;
+}
 function networkCall16922(env,method,...args){
   const bridge=env.NETWORK16922;
   if(!bridge||!LOCAL_NETWORK16922.has(bridge))return null;
@@ -9377,14 +9439,29 @@ Object.assign(Desk520.prototype,{
     return row;
   },
   networkWork16922(n,detail=false){
-    if(!networkNote16922(n))return null;
-    const now=Date.now(),f=networkFeature16922(n,detail),pub=Date.parse(n.publishAt||n.publish_at||n.publishedAt)||0;
-    if(pub>now)return null;
+    const now=Date.now(),pub=Date.parse(n?.publishAt||n?.publish_at||n?.publishedAt)||0;
+    if(!networkNote16922(n)||pub>now){
+      if(/^n[a-z0-9]{1,64}$/.test(n?.key||'')&&(pub>now||(typeof n.name==='string'&&n.name.trim()==='521')||(detail&&n.status&&n.status!=='published')))
+        this.clearRecruitmentBody16947(n.key);
+      return null;
+    }
+    const f=networkFeature16922(n,detail,detail);
     const own=this.rows('SELECT owner FROM desk_audience16922').some(r=>r.owner===n.user.urlname)||n.user.urlname==='43__';
     const old=this.one('SELECT * FROM desk_network_work16922 WHERE article=?',n.key);
     if(old&&old.owner!==n.user.urlname){this.rows('DELETE FROM desk_network_sample16922 WHERE article=?',n.key);}
     // A summary never overwrites a verified full-text fingerprint.
-    if(!detail&&old?.full&&old.owner===n.user.urlname)return old;
+    if(!detail&&old?.full&&old.owner===n.user.urlname){
+      const changed=n.name.slice(0,160)!==old.title||(pub>0&&Math.floor(pub/1000)!==Math.floor(old.pub/1000))||recruitmentRestricted16947(n);
+      if(changed||n.user.id!=null){
+        const prior=networkParseFeature16922(old.feature);
+        if(prior?.recruitment16947&&(changed||String(n.user.id)!==prior.recruitment16947.authorId)){
+          delete prior.recruitment16947;
+          old.feature=JSON.stringify(prior);
+          this.rows('UPDATE desk_network_work16922 SET feature=? WHERE article=?',old.feature,n.key);
+        }
+      }
+      return old;
+    }
     this.rows(`INSERT INTO desk_network_work16922(article,owner,title,pub,feature,full,fiction,likes,seen,due) VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(article) DO UPDATE SET owner=excluded.owner,title=excluded.title,pub=excluded.pub,feature=excluded.feature,full=excluded.full,fiction=excluded.fiction,likes=excluded.likes,seen=excluded.seen,
       due=CASE WHEN ? THEN excluded.due ELSE desk_network_work16922.due END`,n.key,n.user.urlname,n.name.slice(0,160),pub,JSON.stringify(f),+f.full,+(own||publicFiction1697(n)),Math.max(0,Number(n.likeCount??n.like_count)||0),now,detail?now+7*D520:0,+detail);
@@ -9406,6 +9483,10 @@ Object.assign(Desk520.prototype,{
     if(detail)for(const row of this.rows('SELECT slot,account,owner FROM desk_audience16922 WHERE owner=?',n.user.urlname))
       this.reachTry16933(()=>this.reachStoreOwn16933(row.slot,{id:row.account,owner:row.owner},n));
     return this.one('SELECT * FROM desk_network_work16922 WHERE article=?',n.key);
+  },
+  clearRecruitmentBody16947(article){
+    this.rows(`UPDATE desk_network_work16922 SET feature=json_remove(feature,'$.recruitment16947')
+      WHERE article=? AND CASE WHEN json_valid(feature) THEN json_type(feature,'$.recruitment16947') END IS NOT NULL`,article);
   },
   networkTrim16922(table,key,column,limit){
     // All callers are fixed internal constants. At most cap+batch rows exist.
@@ -9663,6 +9744,76 @@ Object.assign(Desk520.prototype,{
     };
     return rows.map((r,i)=>({r,i,s:score(r.id)})).sort((a,b)=>b.s-a.s||a.i-b.i)[0].r;
   },
+  expansionRecruitment16947(rows,now,turn){
+    if(rows.length<2||turn%4===0)return rows[0];
+    const accounts=this.rows("SELECT * FROM desk_audience16922 WHERE slot IN ('1','2') ORDER BY rowid");
+    const own=accounts.find(a=>a.owner==='43__');if(!own)return rows[0];
+    const ids=rows.map(r=>r.id),magazines=new Map(this.rows(`SELECT m.id,m.owner,c.seen FROM desk_network_mag16922 m
+      LEFT JOIN desk_network_curator16922 c ON c.owner=m.owner AND c.seen>=? WHERE m.id IN (`+ids.map(()=>'?').join(',')+')',
+      now-28*D520,...ids).map(m=>[m.id,m]));
+    const owners=new Set(rows.map(r=>magazines.get(r.id)?.owner));
+    const curators=owners.size>1&&[...magazines.values()].some(m=>m.seen!=null)?
+      new Map(this.networkCurators16922(own).map(c=>[c.owner,c.score])):new Map();
+    const ranked=rows.map(row=>({row,score:curators.get(magazines.get(row.id)?.owner)||0})).sort((a,b)=>b.score-a.score);
+    const baseline=ranked[0],due=baseline.row.discovery_due;
+    if(!Number.isSafeInteger(due)||accounts.filter(a=>a.owner===own.owner||a.account===own.account).length!==1)return baseline.row;
+    const peers=ranked.filter(p=>p.score===baseline.score&&p.row.discovery_due===due).slice(0,4).map(p=>p.row);
+    if(peers.length<2)return baseline.row;
+    // The optional cache must not trip the shared network feature's fault gate.
+    try{return this.expansionTheme16947(peers,magazines,own,accounts,now)||baseline.row;}
+    catch(error){if(dailyObjectReadsExceeded(error))throw error;return baseline.row;}
+  },
+  expansionTheme16947(peers,magazines,own,accounts,now){
+    const ownKeys=networkJSON16922(own.corpus).filter(k=>typeof k==='string'&&/^n[a-z0-9]{1,64}$/.test(k)).slice(0,4);
+    if(!ownKeys.length||!/^[1-9]\d{0,19}$/.test(own.account))return null;
+    const names=new Set(accounts.map(a=>a.owner)),accountIds=new Set(accounts.map(a=>a.account));
+    const ids=[];
+    for(const peer of peers){
+      const mag=magazines.get(peer.id),link=noteLink161(peer.url);
+      if(!mag||!networkOwner16922(mag.owner)||names.has(mag.owner)||link?.id!==mag.id||(link.owner&&link.owner!==mag.owner))continue;
+      ids.push(mag.id);
+    }
+    if(!ids.includes(peers[0].id)||ids.length<2)return null;
+    // Two indexed observations per ID establish the newest URL and detect a
+    // simultaneous alias. Large legacy feeds wait for an ordinary refresh.
+    const feeds=this.rows(`WITH wanted(id) AS (VALUES `+ids.map(()=>'(?)').join(',')+`)
+      SELECT f.url,f.id,f.checked,f.full_at,
+        CASE WHEN octet_length(f.payload)<=16384 THEN f.payload END AS payload,
+        CASE WHEN octet_length(f.payload)>16384 AND octet_length(f.items)<=16384 THEN f.items END AS norm
+      FROM wanted w JOIN desk_rss_feed16926 f ON f.url=(SELECT u.url FROM desk_rss_feed16926 u
+        WHERE u.id=w.id ORDER BY u.checked DESC LIMIT 1)
+      WHERE f.checked IS NOT (SELECT s.checked FROM desk_rss_feed16926 s WHERE s.id=w.id ORDER BY s.checked DESC LIMIT 1 OFFSET 1)
+        AND CASE WHEN octet_length(f.items)<=16384 AND json_valid(f.items) THEN
+          json_extract(f.items,'$[0].recruitmentInvalid16947') IS NULL END`,...ids);
+    const items=new Map();
+    for(const feed of feeds){
+      const issue=recruitmentIssue16947(feed,magazines.get(feed.id),now,names);
+      if(issue.length>=2)items.set(feed.id,issue);
+    }
+    if(!items.has(peers[0].id)||items.size<2)return null;
+    const keys=[...new Set([...ownKeys,...[...items.values()].flat().map(i=>i.article)])];
+    const works=new Map(this.rows('SELECT article,owner,title,pub,feature FROM desk_network_work16922 WHERE article IN ('+
+      keys.map(()=>'?').join(',')+') AND full=1 AND seen BETWEEN ? AND ? AND pub>0 AND pub<=?',...keys,now-28*D520,now,now)
+      .map(w=>[w.article,{...w,body:recruitmentBody16947(w)}]));
+    for(const key of ownKeys){
+      const work=works.get(key);if(work?.owner!==own.owner||work.body?.authorId!==own.account)continue;
+      const scores=peers.map(peer=>{
+        const authors=new Map();
+        for(const item of items.get(peer.id)||[]){
+          const w=works.get(item.article);
+          if(!w?.body||w.owner!==item.owner||w.title!==item.title||Math.floor(w.pub/1000)!==Math.floor(item.pub/1000)||accountIds.has(w.body.authorId))continue;
+          const s=networkSimilarity16922(work.body,w.body);
+          if(s>=0.22)authors.set(w.body.authorId,Math.max(authors.get(w.body.authorId)||0,s));
+        }
+        return authors.size>=2?[...authors.values()].reduce((sum,s)=>sum+s,0)/authors.size:null;
+      });
+      if(scores[0]===null||!scores.some((s,i)=>i>0&&s!==null))continue;
+      let best=0;
+      for(let i=1;i<scores.length;i++)if(scores[i]!==null&&scores[i]>scores[best])best=i;
+      return scores[best]>scores[0]+0.03?{...peers[best],matchedRecruitmentBodies:true}:peers[0];
+    }
+    return null;
+  },
   networkView16922(){return this.networkTry16922(()=>{
     const now=Date.now(),cfg=this.one('SELECT * FROM desk_network16922 WHERE id=1');
     return {message:cfg.message,checked:cfg.checked,used:cfg.day===jstDay(now)?cfg.used:0,
@@ -9681,6 +9832,12 @@ Desk520.prototype.publicRead=function(path,format){
         if(link&&requested?.id===link.id&&Array.isArray(result.entries))this.networkMagazine16922(link,result.header.title||link.id,result.entries,true);
       }
     });return result;
+  },error=>{
+    const article=format==='json'&&/^https:\/\/note\.com\/api\/v3\/notes\/(n[a-z0-9]{1,64})$/.exec(path)?.[1];
+    if(article&&error instanceof PublicReadError&&[404,410].includes(error.status)&&this.networkReady16922){
+      try{this.clearRecruitmentBody16947(article);}catch{} // Preserve the original public-read error.
+    }
+    throw error;
   });
 };
 const networkChooseBefore16922=Desk520.prototype.chooseMagazine520;
@@ -10236,12 +10393,15 @@ function rssIdentity16926(url,issue){
   if(mag)return channel?.id===mag.id?{id:mag.id,owner:channel.owner||mag.owner||'',url:base}:null;
   try{const a=new URL(base),b=new URL(issue.header.link);return a.origin===b.origin&&a.pathname.replace(/\/$/,'')===b.pathname.replace(/\/$/,'')?{id:'',owner:a.pathname.slice(1),url:base}:null;}catch{return null;}
 }
-function rssItems16926(issue,url){
+function rssItems16926(issue,url,recordHead=false){
   const seen=new Set(),items=[];
-  for(const e of issue.entries.slice(0,100)){
+  let links=0;
+  for(const [index,e] of issue.entries.slice(0,100).entries()){
     const a=noteLink161(e?.link||'',url,'article');if(!a||seen.has(a.id))continue;
+    if(recordHead&&index<20&&/^https:\/\/note\.com\//.test(e.link))links|=1<<items.length;
     seen.add(a.id);items.push({key:a.id,owner:a.owner,title:String(e.title||'').slice(0,180),pub:Date.parse(e.pubdate)||0});
   }
+  if(links)items[0].recruitment16947={channel:issue.header.link,links};
   return items;
 }
 // The normalized items cache skips broken items and duplicates. Only the first
@@ -10325,10 +10485,17 @@ Object.assign(Desk520.prototype,{
     if(prune)this.rows('UPDATE desk_rss16926 SET pruned=? WHERE id=1',now);
   },
   rssObserve16926(url,issue,old,headers={},unchanged=false){
-    const now=Date.now(),identity=rssIdentity16926(url,issue);if(!identity)return;
-    const items=rssItems16926(issue,url),before=networkJSON16922(old?.items||'[]'),known=new Set(before.map(i=>i.key));
-    const added=old?items.filter(i=>!known.has(i.key)):items;
+    const now=Date.now(),identity=rssIdentity16926(url,issue);
+    if(!identity){
+      const channel=noteLink161(issue?.header?.link);
+      if(old?.id&&channel&&channel.id!==old.id)this.clearRecruitmentIssue16947(old.id);
+      return;
+    }
     const payload=JSON.stringify(issue),cacheable=payload.length<=131072&&!/(?:no-store|private)/i.test(headers.cache||'');
+    const channel=identity.id&&cacheable&&payload.length>4096&&/^https:\/\/note\.com\//.test(issue.header.link)&&noteLink161(issue.header.link);
+    const items=rssItems16926(issue,url,channel?.id===identity.id&&networkOwner16922(channel?.owner)),before=networkJSON16922(old?.items||'[]'),known=new Set(before.map(i=>i.key));
+    if(unchanged&&before[0]?.recruitmentInvalid16947&&items.length)items[0].recruitmentInvalid16947=1;
+    const added=old?items.filter(i=>!known.has(i.key)):items;
     this.storage.transactionSync(()=>{
       const span=old?now-old.checked:0,hour=Math.floor((now+9*HOUR)/HOUR),priorHour=old?Math.floor((old.checked+9*HOUR)/HOUR):0;
       // A day-long gap cannot identify the hour when a magazine changed.
@@ -10353,6 +10520,13 @@ Object.assign(Desk520.prototype,{
         writers.add(n.owner);this.networkWork16922({key:n.key,status:'published',user:{urlname:n.owner},name:n.title,publishAt:new Date(n.pub).toISOString()},false);
       }
     });
+  },
+  clearRecruitmentIssue16947(id){
+    // An identified replacement invalidates the recruitment evidence across
+    // aliases, while leaving RSS validators, freshness and historical data intact.
+    this.rows(`UPDATE desk_rss_feed16926 SET items=json_set(items,'$[0].recruitmentInvalid16947',1)
+      WHERE id=? AND CASE WHEN json_valid(items) THEN json_type(items,'$[0]')='object'
+        AND json_type(items,'$[0].recruitmentInvalid16947') IS NULL END`,id);
   },
   rssAppear16926(identity,name,items,old,known,now){
     for(const n of items.filter(i=>i.owner==='43__').slice(0,20)){
