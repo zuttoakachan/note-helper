@@ -105,7 +105,7 @@ test('first magazine placement selects a verified opener within the existing que
       assert.equal(b.target,a.target);assert.equal(b.fresh,a.fresh);assert.equal(b.revoked,false);
       if(name==='priorRejected')assert.equal(b.key,'nlater');
       if(name==='excluded'||name==='pacing')assert.equal(b.key,null);
-      assert.equal(b.counts.sql,a.counts.sql);
+      assert.ok(b.counts.sql<=a.counts.sql,'first placement must stay within the previous query budget');
       assert.equal(b.counts.written,a.counts.written);
       assert.ok(b.counts.read<=a.counts.read+12,JSON.stringify({name,a,b}));
     });

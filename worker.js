@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.45';
+const VERSION = 'v16.9.46';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -2664,6 +2664,8 @@ class Desk520 {
     if(!this.one("SELECT name FROM sqlite_master WHERE type='index' AND name='desk_import_due'"))
       this.storage.transactionSync(()=>{for(const q of importSchema161)this.rows(q);});
     if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_growth'"))this.initGrowth(Date.now());
+    if(!this.rows('PRAGMA table_info(desk_archive)').some(column=>column.name==='seasonal_tags'))
+      this.rows('ALTER TABLE desk_archive ADD COLUMN seasonal_tags TEXT');
     if(!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='desk_recommend'")){
       this.storage.transactionSync(()=>{
         this.rows("CREATE TABLE desk_recommend(id INTEGER PRIMARY KEY, done INTEGER DEFAULT 0, attempted INTEGER DEFAULT 0, tries INTEGER DEFAULT 0, due INTEGER DEFAULT 0, checked INTEGER DEFAULT 0, message TEXT DEFAULT '初回確認待ち', utc_day INTEGER DEFAULT -1, used INTEGER DEFAULT 0, fallback_at INTEGER DEFAULT 0)");
@@ -3404,7 +3406,8 @@ class Desk520 {
   rememberPublic(key,title,pub) {
     if(!/^n[a-z0-9]{1,64}$/.test(key) || !text520(title,300) || title.trim()==='521' || !Number.isFinite(pub) || pub<=0 || pub>Date.now())return false;
     this.rows(`INSERT INTO desk_archive(article,title,pub) VALUES(?,?,?) ON CONFLICT(article) DO UPDATE SET
-      title=excluded.title,pick_due=CASE WHEN title<>excluded.title THEN 0 ELSE pick_due END`,key,title,pub);
+      title=excluded.title,pick_due=CASE WHEN title<>excluded.title THEN 0 ELSE pick_due END,
+      seasonal_tags=CASE WHEN title=excluded.title THEN seasonal_tags END`,key,title,pub);
     // Recently published at upgrade: capture a still-open target, never invent a prior count.
     const now=Date.now();
     if(pub+7*D520+WINDOW520>now && pub<this.one('SELECT started FROM desk_growth WHERE id=1').started){
@@ -3502,6 +3505,15 @@ class Desk520 {
       if(!isPublishedBy520(n) || n.user?.urlname!=='43__' || n.key!==a.article || !text520(n.name,300) || n.name.trim()==='521')throw Error('not verified');
       if(isPublishedBy520(n))this.recordReactionTitle(a.article,n.name,a.pub,now);
       const value=count520(n,['likeCount','like_count']);
+      // NULL keeps this priority off until a published detail confirms the current title.
+      const publishedDates=[n.publishAt,n.publish_at,n.publishedAt].filter(date=>date!=null);
+      const seasonEligible=a.pub>0 && a.pub<=now && publishedDates.every(date=>{
+        const time=typeof date==='string'?Date.parse(date):NaN;
+        // RSS can omit fractional seconds. A different release date may identify a republished work.
+        return time>0 && time<=now && Math.abs(time-a.pub)<1000;
+      });
+      const seasonalTags=seasonEligible?JSON.stringify((contestTags16923(n)||[])
+        .filter(tag=>SEASONAL_EVENTS16946.some(event=>event.names.includes(tag)))):null;
       const tags=Array.isArray(n.hashtags)?n.hashtags.map(t=>String(typeof t==='string'?t:t?.hashtag?.name??t?.name??'').replace(/^#/,'')):[];
       // Use explicit genre metadata if note publishes it; the title alone is ambiguous.
       if(typeof n.genre==='string')tags.push(n.genre);
@@ -3510,12 +3522,12 @@ class Desk520 {
       // Do not estimate restricted text or infer how a writer produced it.
       const chars=publishedChars162(n);
       this.magazineHints(n);
-      this.rows(`UPDATE desk_archive SET title=?,pick_due=0,due=?,verified=?,genre=?,chars=?,previous=CASE WHEN ? IS NOT NULL THEN likes ELSE previous END,
+      this.rows(`UPDATE desk_archive SET title=?,pick_due=0,due=?,verified=?,genre=?,chars=?,seasonal_tags=?,previous=CASE WHEN ? IS NOT NULL THEN likes ELSE previous END,
         prior_at=CASE WHEN ? IS NOT NULL THEN at ELSE prior_at END,likes=COALESCE(?,likes),at=CASE WHEN ? IS NULL THEN at ELSE ? END,state=? WHERE article=?`,
-        n.name,now+(value===null?D520:7*D520),now,genre,chars,value,value,value,value,now,value===null?'スキ数取得待ち':'取得済み',a.article);
+        n.name,now+(value===null?D520:7*D520),now,genre,chars,seasonalTags,value,value,value,value,now,value===null?'スキ数取得待ち':'取得済み',a.article);
     }catch(error){
       if(error instanceof PublicReadError && /HTTP (404|410)$/.test(error.message)) this.rows('DELETE FROM desk_reaction_work WHERE article=?',a.article);
-      this.rows("UPDATE desk_archive SET due=?,state='詳細取得待ち',verified=0 WHERE article=?",now+D520,a.article);
+      this.rows("UPDATE desk_archive SET due=?,state='詳細取得待ち',verified=0,seasonal_tags=NULL WHERE article=?",now+D520,a.article);
     }
     return true; // Completed this pass; an early return above is only a wait/skip.
   }
@@ -3757,7 +3769,8 @@ class Desk520 {
   canDeliver(job,now){
     const cfg=this.one('SELECT enabled,blocked FROM desk_cfg WHERE id=1');
     if(!cfg.enabled || cfg.blocked>now || !this.one('SELECT enabled FROM desk_delivery WHERE id=1').enabled)return false;
-    const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now,job.target):job.link?this.dueLink(now,job.key):this.dueManuscript(now,job.subject);
+    const fresh=job.kind==='mag'?this.eligiblePlacement(job.key,now,job.target,undefined,null,job.seasonal):
+      job.link?this.dueLink(now,job.key):this.dueManuscript(now,job.subject);
     return !!fresh && !fresh.conflict && fresh.subject===job.subject && fresh.target===job.target && fresh.title===job.title && (job.kind!=='publish' || job.scheduled===fresh.scheduled);
   }
   async deliveryAccount(){
@@ -6009,7 +6022,7 @@ Object.assign(Desk520.prototype,{
   }
 });
 Object.assign(Desk520.prototype,{
-  chooseMagazine520(choices,genre,now){
+  chooseMagazine520(choices,genre,now,work=null){
     if(!choices.length)return null;
     if(choices.length===1)return choices[0];
     const rows=choices.map(m=>{
@@ -6021,8 +6034,16 @@ Object.assign(Desk520.prototype,{
     });
     // Fill gaps in comparable observations first; never call a zero-sample magazine a winner.
     const explore=rows.filter(r=>r.observations<3).sort((a,b)=>a.attempts-b.attempts||a.observations-b.observations||a.last-b.last||a.mag.url.localeCompare(b.mag.url));
-    if(explore.length)return explore[0].mag;
-    return (genre && this.strongestMagazine(choices,genre)) || rows.sort((a,b)=>a.attempts-b.attempts||a.last-b.last||a.mag.url.localeCompare(b.mag.url))[0].mag;
+    if(!explore.length && genre){
+      const strongest=this.strongestMagazine(choices,genre);
+      if(strongest)return strongest;
+    }
+    const ranked=explore.length?explore:rows.sort((a,b)=>a.attempts-b.attempts||a.last-b.last||a.mag.url.localeCompare(b.mag.url));
+    const best=ranked[0],policy=best.mag.policy;
+    if(!work?.article || work.pendingMagazine16946 || !policy || !this.rssReady16926)return best.mag;
+    const tied=ranked.filter(r=>r.attempts===best.attempts && r.last===best.last &&
+      r.observations===best.observations && r.mag.policy===policy).slice(0,3);
+    return tied.length<2?best.mag:this.rssTry16926(()=>this.rssMagazineTie16946(tied,work.article,now),best.mag);
   }
 });
 
@@ -8585,6 +8606,40 @@ async function diagnosticRecord16915(env){
 const DISTRIBUTION16918=Object.freeze({applications:24,checks:96,placements:48,applicationGap:30*M520,placementGap:15*M520,workGap:2*HOUR});
 // Legacy placements stored short or owner-qualified note.com magazine URLs; an owner can itself be named "m".
 const legacyMagazineId16945="CASE WHEN instr(url,'/m/')>0 THEN replace(rtrim(substr(url,instr(url,'/m/')+3),'/'),'m/','') ELSE '' END";
+// Fixed calendar events only. Dates are inclusive in Japan.
+const SEASONAL_EVENTS16946=[
+  {from:'01-01',to:'01-01',names:['元日','元旦']},
+  {from:'03-01',to:'03-03',names:['ひな祭り','雛祭り']},
+  {from:'05-01',to:'05-05',names:['こどもの日','端午の節句']},
+  {from:'07-01',to:'07-07',names:['七夕']},
+  {from:'12-20',to:'12-25',names:['クリスマス']},
+  {from:'12-26',to:'12-31',names:['大晦日','大みそか']}
+];
+function seasonalTitle16946(title,name){
+  if(name==='元日')return /(?:^|[^\p{Script=Han}])元日(?!\p{Script=Han})/u.test(title);
+  if(name==='元旦')return /(?:^|[^\p{Script=Han}])元旦(?!\p{Script=Han})/u.test(title);
+  if(name==='こどもの日')return /こどもの日(?!\p{Script=Han})/u.test(title);
+  if(name==='クリスマス')return /クリスマス(?![\s・]*ローズ)/u.test(title);
+  return title.includes(name);
+}
+function seasonalEvent16946(now){
+  const day=jstDay(now).slice(5);
+  return SEASONAL_EVENTS16946.find(e=>e.from<=day && day<=e.to);
+}
+function seasonalMatch16946(row,event,now){
+  const series=/連載|シリーズ|前編|中編|後編|完結編|最終[話章回部]|第[0-9一二三四五六七八九十百千〇零]+[話章回部]/u;
+  if(!event || row.mag_at!==0 || row.pub>now-30*D520 || !row.verified || row.verified<now-8*D520 || row.verified>now ||
+    !row.title || row.title.trim()==='521' || series.test(row.title.normalize('NFKC')))return null;
+  // NULL means this title has not yet been confirmed by its own public detail response.
+  const tags=savedJson16936(row.seasonal_tags,null,Array.isArray);
+  if(!tags || !tags.every(tag=>typeof tag==='string'))return null;
+  return event.names.some(name=>tags.includes(name) || seasonalTitle16946(row.title,name));
+}
+function seasonalNeighbor16946(head,next,now,mag){
+  if(!next?.seasonalTurn || head.choice!==mag.url || next.choice!==mag.url || next.mag_due>now)return null;
+  const event=seasonalEvent16946(now);
+  return seasonalMatch16946(head,event,now)===false && seasonalMatch16946(next,event,now)===true?next:null;
+}
 // Treat explicit, separated title labels as evidence. An unlabelled work keeps its place.
 function magazineEntryRole(title){
   if(typeof title!=='string' || title.length>300)return '';
@@ -8633,40 +8688,69 @@ Object.assign(Desk520.prototype,{
     const fits=this.archiveFits(article,magazines,now);
     if(!fits.length)return [];
     const done=new Set(this.rows('SELECT id FROM desk_ref WHERE article=? UNION SELECT id FROM desk_mag_send WHERE article=?',article.article,article.article).map(r=>r.id));
-    const jobs=new Map(this.rows("SELECT subject,target,phase,next FROM desk_job WHERE kind='mag' AND article=?",article.article).map(j=>[j.target,j]));
+    const jobs=new Map();
+    article.pendingMagazine16946=false;
+    for(const j of this.rows("SELECT subject,target,phase,next FROM desk_job WHERE kind='mag' AND article=?",article.article)){
+      jobs.set(j.target,j);
+      if(j.phase!=='confirmed')article.pendingMagazine16946=true;
+    }
+    article.unplacedMagazine16946=done.size===0 && jobs.size===0;
     return fits.filter(m=>{
       const link=noteLink161(m.url),job=jobs.get(link?.id);
       return link && link.owner!=='43__' && !done.has(link.id) && (!activeTarget || link.id===activeTarget) &&
         (!job || job.phase==='wait' && (job.next<=now || activeTarget===link.id));
     });
   },
-  eligiblePlacement(key,now,activeTarget=null,magazines=this.batchMagazines(now),pool=null){
-    const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
+  eligiblePlacement(key,now,activeTarget=null,magazines=this.batchMagazines(now),pool=null,requireSeason=false){
+    const a=this.one('SELECT a.*,w.seq work_seq,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
     if(!a?.choice || a.title.trim()==='521' || !activeTarget && a.mag_due>now)return null;
+    if(requireSeason && (a.mag_due>now || seasonalMatch16946(a,seasonalEvent16946(now),now)!==true))return null;
     const pacing=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1');
     if(pacing.mag_next>now)return null;
-    const mag=this.chooseMagazine520(this.placementCandidates16918(a,magazines,now,activeTarget),a.work_genre||a.genre,now,a);
+    const choices=this.placementCandidates16918(a,magazines,now,activeTarget);
+    const mag=this.chooseMagazine520(choices,a.work_genre||a.genre,now,a);
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
     const opener=pool && a.choice===mag.url && magazineEntryRole(a.title)==='later' && pool.find(c=>
       c.choice===mag.url && c.mag_at===a.mag_at && c.verified>0 && c.verified>=now-8*D520 && c.verified<=now &&
       (a.pub>=now-3*D520)===(c.pub>=now-3*D520) && magazineEntryRole(c.title)==='opening');
+    const seasonal=!opener && a.unplacedMagazine16946 && this.rssReady16926 && !(this.rssFaultUntil16926>now) &&
+      seasonalNeighbor16946(a,pool?.[0],now,mag);
+    const alternate=opener||seasonal;
     const prior=opener?this.one(`SELECT
       (SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?) AS subject,
       NOT EXISTS(SELECT 1 FROM desk_ref WHERE id=?) AND NOT EXISTS(SELECT 1 FROM desk_mag_send WHERE id=?)
         AND NOT EXISTS(SELECT 1 FROM desk_placement WHERE ${legacyMagazineId16945} IN ('',?))
         AND NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND target=? AND phase IN ('sent','seen','confirmed'))
-        AND NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND article=? AND target=?) AS first_issue,
+        AND NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND article=? AND target=?) AS can_prefer,
       w.genre work_genre,w.chars work_chars,w.method FROM (SELECT 1) LEFT JOIN desk_work w ON w.article=?`,
-      key,link.id,link.id,link.id,link.id,link.id,opener.article,link.id,opener.article):
+      key,link.id,link.id,link.id,link.id,link.id,opener.article,link.id,opener.article):seasonal?this.one(`SELECT
+      NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND article=?1)
+        AND NOT EXISTS(SELECT 1 FROM desk_ref WHERE article=?1)
+        AND NOT EXISTS(SELECT 1 FROM desk_mag_send WHERE article=?1)
+        AND NOT EXISTS(SELECT 1 FROM desk_rss_match16926 WHERE article=?1 AND ready=1 AND at>=?3)
+        AND NOT EXISTS(SELECT 1 FROM desk_rss_match16926 WHERE article=?2 AND ready=1 AND at>=?3)
+        AND NOT EXISTS(SELECT 1 FROM desk_placement WHERE seq=w.seq)
+        AND NOT EXISTS(SELECT 1 FROM desk_placement WHERE seq=?4) AS can_prefer,
+      w.genre work_genre,w.chars work_chars,w.method FROM (SELECT 1) LEFT JOIN desk_work w ON w.article=?1`,
+      seasonal.article,key,now-2*D520,a.work_seq??null):
       this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
     const makeJob=(row,subject)=>({kind:'mag',key:row.article,subject:subject||row.article+'@'+link.id,target:link.id,url:link.url,title:row.title,name:mag.name,
       old:row.pub<=now-30*D520,previousMagAt:row.mag_at,previousMagDue:row.mag_due});
     const job=makeJob(a,prior?.subject);
     if(activeTarget)return job;
-    const first=opener && prior?.first_issue && !prior.subject && this.archiveFits({...opener,...prior},[mag],now).length
-      ? makeJob(opener,null):null;
-    return this.rssTiming16926(job,now,first);
+    let preferred=null;
+    if(alternate && prior?.can_prefer && !prior.subject){
+      const work={...alternate,...prior};
+      const fits=this.archiveFits(work,seasonal?magazines:[mag],now);
+      // With zero sends, collaborative rankings keep the genre's baseline. Both works must have the same
+      // eligible venues and no individual match, job or delay before sharing this already-computed choice.
+      const sameRanking=!seasonal || (work.work_genre||work.genre)===(a.work_genre||a.genre) &&
+        fits.length===choices.length && fits.every((m,i)=>m.url===choices[i].url);
+      if(sameRanking && fits.some(m=>m.url===mag.url))preferred=makeJob(alternate,null);
+    }
+    if(preferred && seasonal)preferred.seasonal=true;
+    return this.rssTiming16926(job,now,preferred);
   },
   nextPlacement(now,oldFirst){
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
@@ -8680,7 +8764,8 @@ Object.assign(Desk520.prototype,{
         const {article}=candidate;
         const job=this.eligiblePlacement(article,now,null,magazines,keys.slice(index+1));
         if(job){
-          const selected=job.key===article?candidate:{...keys.find(c=>c.article===job.key),reason:'この誌で最初の掲載候補・読み切りまたは冒頭の作品'};
+          const selected=job.key===article?candidate:{...keys.find(c=>c.article===job.key),reason:job.seasonal?
+            '同じ誌の未紹介旧作から、この時期の行事に合う作品を選択':'この誌で最初の掲載候補・読み切りまたは冒頭の作品'};
           this.circulationTry16932(()=>this.recordCirculation16932(job,selected,now));return job;
         }
         // A blocked publisher cannot monopolize the head of the queue.
@@ -9600,7 +9685,7 @@ Desk520.prototype.publicRead=function(path,format){
 };
 const networkChooseBefore16922=Desk520.prototype.chooseMagazine520;
 Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
-  const baseline=networkChooseBefore16922.call(this,valid,genre,now);
+  const baseline=networkChooseBefore16922.call(this,valid,genre,now,work);
   return this.networkTry16922(()=>this.networkChoose16922(valid,baseline,work,now),baseline);
 };
 function networkRecord16922(v){
@@ -10159,6 +10244,17 @@ function rssItems16926(issue,url){
   }
   return items;
 }
+// The normalized items cache skips broken items and duplicates. Only the first
+// two links in the original, identified magazine issue can establish a streak.
+function rssMagazineHead16946(feed){
+  if(!feed?.links || !rssUrl16926(feed.url))return null;
+  const [channel,first,second]=JSON.parse(feed.links);
+  if(![channel,first,second].every(s=>typeof s==='string' && /^https:\/\/note\.com\//.test(s)))return null;
+  if(noteLink161(channel)?.id!==feed.id || noteLink161(feed.url.replace(/\/rss$/,''))?.id!==feed.id)return null;
+  const a=noteLink161(first,undefined,'article'),b=noteLink161(second,undefined,'article');
+  if(!a || !b || a.id===b.id)return null;
+  return [a,b];
+}
 function rssHeader16926(value){return typeof value==='string'&&value.length<=512&&!/[\r\n\u0000]/.test(value)?value:'';}
 function rssPrevious16926(body){
   const text=words161(body).normalize('NFKC').replace(/\s+/g,'');
@@ -10249,6 +10345,7 @@ Object.assign(Desk520.prototype,{
       if(identity.id&&identity.owner!=='43__')this.rssAppear16926(identity,issue.header.title||identity.id,items,old,known,now);
       this.rssTrim16926(now);
     });
+    this.magazineHeads16946=null;
     // Old entries at the head of a feed cannot hide newly arrived works.
     this.networkTry16922(()=>{
       const writers=new Set();
@@ -10388,6 +10485,49 @@ Object.assign(Desk520.prototype,{
         AND t.first_seen=s.observed AND t.automatic=0
     )),0) later FROM desk_rss_appearance16926 a WHERE a.id=? AND a.first_seen>=? AND a.first_seen<=?`,now-RSS16926.age,now,id,now-RSS16926.age,now);
     return {...r,score:r.observations?r.later/r.observations:0};
+  },
+  rssMagazineTie16946(tied,article,now){
+    const ids=tied.map(r=>noteLink161(r.mag.url)?.id),base=tied[0].mag;
+    if(ids.some(id=>!id)||new Set(ids).size!==ids.length)return base;
+    // batchMagazines reuses these magazine objects within a synchronous plan.
+    // Read each issue at most once there, also remembering missing evidence.
+    const cache=this.magazineHeads16946??=new WeakMap();
+    const missing=tied.filter(r=>cache.get(r.mag)?.at!==now);
+    if(missing.length){
+      const sourceIds=missing.map(r=>noteLink161(r.mag.url).id);
+      const feeds=this.rows(`WITH candidates(id) AS (VALUES ${sourceIds.map(()=>'(?)').join(',')})
+        SELECT f.id,f.url,CASE WHEN json_valid(f.payload) THEN json_extract(f.payload,
+          '$.header.link','$.entries[0].link','$.entries[1].link') END links,
+          CASE WHEN json_valid(t.definition) THEN json_extract(t.definition,'$.perDay') END per_day
+        FROM candidates c JOIN desk_rss_feed16926 f ON f.rowid=(
+          SELECT rowid FROM desk_rss_feed16926 WHERE id=c.id ORDER BY checked DESC LIMIT 1)
+        LEFT JOIN desk_join_target t ON t.id=c.id
+        WHERE f.checked BETWEEN ? AND ? AND f.full_at BETWEEN ? AND f.checked
+        AND NOT EXISTS(SELECT 1 FROM desk_rss_feed16926 x WHERE x.id=f.id AND x.checked=f.checked AND x.url<>f.url)`,
+        ...sourceIds,now-D520,now,now-2*D520);
+      for(const [i,r] of missing.entries()){
+        const feed=feeds.find(f=>f.id===sourceIds[i]);
+        cache.set(r.mag,{at:now,head:rssMagazineHead16946(feed),perDay:feed?.per_day});
+      }
+    }
+    const original=cache.get(base),head=original.head;
+    if(!head || head.some(n=>n.owner!=='43__'))return base;
+    for(let i=1;i<ids.length;i++){
+      const other=cache.get(tied[i].mag);
+      if(!other.head || other.perDay!==original.perDay || other.head[0].owner==='43__')continue;
+      // Within this synchronous plan the archive ownership of the same feed
+      // items is stable. Saved waits and briefs must be checked for each work.
+      const proof=this.one(`SELECT COALESCE(?,(SELECT COUNT(*) FROM desk_archive
+          WHERE article IN (?,?) AND verified BETWEEN 1 AND ?)=2) AS bothVerified,
+        COALESCE(?,NOT EXISTS(SELECT 1 FROM desk_archive WHERE article=?)) AS outsideArchive,
+        NOT EXISTS(SELECT 1 FROM desk_rss_delay16926 WHERE article=?)
+          AND NOT EXISTS(SELECT 1 FROM desk_rss_match16926 WHERE article=? AND ready=1 AND at>=?) AS ready`,
+        original.bothVerified??null,head[0].id,head[1].id,now,other.outsideArchive??null,other.head[0].id,article,article,now-2*D520);
+      original.bothVerified=proof.bothVerified;
+      other.outsideArchive=proof.outsideArchive;
+      return proof.bothVerified && proof.outsideArchive && proof.ready?tied[i].mag:base;
+    }
+    return base;
   },
   rssChoose16926(valid,base,work,now){
     if(!base||!work?.article)return base;
@@ -10550,6 +10690,7 @@ Desk520.prototype.sourceForMagazine=async function(row){
 const rssChooseBefore16926=Desk520.prototype.chooseMagazine520;
 Desk520.prototype.chooseMagazine520=function(valid,genre,now,work=null){
   const eligible=valid.filter(m=>this.magazineRoom520(noteLink161(m.url)?.id,now));
+  if(eligible.length<2)return eligible[0]||null;
   const base=rssChooseBefore16926.call(this,eligible,genre,now,work);
   return this.rssChoose16926(eligible,base,work,now);
 };
@@ -10723,7 +10864,12 @@ Object.assign(Desk520.prototype,{
       !a.mag_at&&a.pub>=now-3*D520?'新作の初回紹介（公開72時間以内）':'公開30日未満の作品を順番に紹介',related:''});
     // Reuse the already-persisted alternating old-work turn. It advances only
     // in the existing magazine action reservation, never on a UI read or poll.
-    if(!old || !this.one('SELECT older FROM desk_scout_state WHERE id=1')?.older)return base.slice(0,8).map(ordinary);
+    if(!old)return base.slice(0,8).map(ordinary);
+    if(!this.one('SELECT older FROM desk_scout_state WHERE id=1')?.older){
+      const queue=base.slice(0,8).map(ordinary);
+      if(queue[1])queue[1].seasonalTurn=true;
+      return queue;
+    }
     const rising=this.rows(`SELECT * FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub<=?
       AND prior_at IS NOT NULL AND at BETWEEN ? AND ? AND likes>=previous+2
       ORDER BY at DESC,article LIMIT 24`,now,now-30*D520,now-7*D520,now);
