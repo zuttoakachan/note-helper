@@ -233,3 +233,83 @@ test('ordinary patrol diversifies equally eligible cards within the existing HTT
   t.diagnostic(JSON.stringify({before:{d1:old.diversity.d1,durable:old.diversity.durable,http:old.diversity.http,
     browsers:old.diversity.browsers,posts:old.diversity.posts},after:{d1,durable,http,browsers,posts}}));
 });
+
+test('literary patrol substitutes an explicit work for an announcement within the v44 cost',async t=>{
+  const v44=execFileSync('git',['show','15a8ed5:worker.js'],{cwd:root,encoding:'utf8',maxBuffer:4_000_000});
+  const announcement={...first,name:'【告知】春の朗読会'};
+  const story={...second,name:'【短編小説】灯台の窓'};
+  const pair={...base,history:null,cards:[announcement,story],budget:1};
+  const scenarios={
+    titled:pair,
+    contest:{...pair,cards:[{...announcement,name:'短編小説コンテスト募集要項'},{...story,name:'雨の駅で（掌編）'}]},
+    parenthesis:{...pair,cards:[announcement,{...story,name:'雨の駅で(掌編)'}]},
+    introduction:{...pair,cards:[{...announcement,name:'更新のお知らせ'},{...story,name:'夜の窓',description:'本作は読み切りの短編小説です。海辺の一夜。'}]},
+    poem:{...pair,cards:[{...announcement,name:'募集要項｜冬の公募'},{...story,name:'海辺【詩】'}]},
+    balanced:{...pair,history:['詩'],cards:[announcement,{...first,key:'nthird',name:'【詩】海辺'},story]},
+    alreadyWork:{...pair,cards:[{...announcement,name:'【短編小説】募集要項の夜'},story]},
+    ordinaryTitle:{...pair,cards:[{...announcement,name:'母の告知を聞いた朝'},story]},
+    ambiguous:{...pair,cards:[{...announcement,name:'【告知】【短編小説】夜の窓'},story]},
+    mixedWork:{...pair,cards:[announcement,{...story,name:'【短編小説】作品募集のお知らせ'}]},
+    mixedContest:{...pair,cards:[announcement,{...story,name:'【短編】冬コンテスト応募要項'}]},
+    unknown:{...pair,cards:[announcement,{...story,name:'詩人は眠る'}]},
+    nonLiterary:{...pair,tags:['イベント'],cards:[{...announcement,hashtags:['イベント']},{...story,hashtags:['イベント']}]},
+    metadata:{...pair,cards:[announcement,{...story,isLiked:true}]},
+    exclusion:{...pair,seen:['nseen'],recent:['14'],cards:[
+      announcement,{...story,user:{id:'42',urlname:'self'}},{...story,key:'nseen'}, {...story,key:'nrecent',user:{id:'14',urlname:'recent'}}
+    ]},
+    retitled:{...pair,overrides:{nsecond:{name:'【短編小説】別の題'}},checkRestart:true},
+    lostProof:{...pair,cards:[announcement,{...story,name:'夜の窓',description:'本作は短編小説です。'}],
+      overrides:{nsecond:{description:'内容はお問い合わせください。'}},checkRestart:true},
+    changedOwner:{...pair,overrides:{nsecond:{user:{...story.user,urlname:'changed'}}}},
+    lostListing:{...pair,overrides:{nsecond:{hashtags:['随筆']}}},
+    limited:{...pair,limited:'nsecond',checkRestart:true},
+    conflict:{...pair,conflict:'nsecond',checkRestart:true},
+    firstInterrupted:{...pair,unfinished:true,checkRestart:true},
+    stopped:{...pair,stopped:true},hold:{...pair,hold:true}
+  };
+  const old=await measure(v44,scenarios),current=await measure(after,scenarios);
+  for(const [name,input] of Object.entries(scenarios)){
+    await t.test(name,()=>{
+      const a=old[name],b=current[name];
+      if(input.unfinished){
+        assert.equal(b.unfinished,true);
+        assert.deepEqual(b.afterRestart.posts,['nfirst']);
+        assert.equal(b.afterRestart.http.details,1);
+        assert.equal(b.afterRestart.browsers,0);
+        assert.equal(b.afterRestart.preferOriginal,false);
+        return;
+      }
+      assert.equal(b.browsers,0);
+      if(input.stopped || input.hold){
+        assert.equal(b.ran,false);
+        assert.deepEqual(a.http,b.http);
+        assert.ok(Object.values(b.http).every(n=>n===0));
+        return;
+      }
+      assert.equal(b.http.lists,1);
+      assert.equal(b.http.details,1);
+      assert.deepEqual(a.posts,[name==='balanced'?'nsecond':'nfirst']);
+      if(input.overrides || input.limited || input.conflict){
+        assert.deepEqual(b.details,['nsecond']);
+        assert.deepEqual(b.posts,[]);
+        assert.equal(b.preferOriginal,true);
+        assert.equal(b.state.next_at,input.limited?Date.UTC(2026,10,23,6):Date.UTC(2026,10,23,3,4));
+        if(input.checkRestart){
+          assert.deepEqual(b.afterRestart.posts,['nfirst']);
+          assert.equal(b.afterRestart.preferOriginal,false);
+        }
+      }else{
+        const isWork=['titled','contest','parenthesis','introduction','poem','balanced'].includes(name);
+        assert.deepEqual(b.posts,[isWork?'nsecond':'nfirst']);
+        assert.deepEqual(a.http,b.http);
+        assert.deepEqual(a.d1,b.d1);
+        assert.deepEqual(a.durable,b.durable);
+      }
+      assert.equal(b.http.confirmation,b.posts.length);
+      assert.equal(b.state.inflight,'');
+      assert.equal(b.state.total,b.posts.length);
+    });
+  }
+  const stats=r=>({http:r.http,browser:r.browsers,d1:r.d1,durable:r.durable,selected:r.posts});
+  t.diagnostic(JSON.stringify({v44:stats(old.titled),current:stats(current.titled)}));
+});

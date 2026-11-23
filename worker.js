@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.44';
+const VERSION = 'v16.9.45';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -1025,21 +1025,64 @@ async function readerOpportunity1697(env,state,settings,token,ownIds,markSending
 }
 
 const PATROL_TAG_HISTORY = 8;
-function leastUsedPatrolTag(note,listing,counts) {
+const PATROL_WORK_LABEL='(?:読み切り(?:小説)?|短編(?:小説)?|掌編(?:小説)?|ショートショート|自由詩|散文詩|詩)';
+const PATROL_WORK_BADGE=new RegExp('(?:【'+PATROL_WORK_LABEL+'】|（'+PATROL_WORK_LABEL+'）|\\('+PATROL_WORK_LABEL+'\\))');
+const PATROL_WORK_TITLE=new RegExp('^(?:'+PATROL_WORK_BADGE.source+'\\s*\\S|'+PATROL_WORK_LABEL+'(?:[｜|：:]\\s*\\S|「.+」$|『.+』$))|\\S\\s*'+PATROL_WORK_BADGE.source+'$');
+function leastUsedPatrolTag(tags,listing,counts) {
   let best=null;
-  for(const tag of contestTags16923(note)||[]){
+  for(const tag of tags||[]){
     if(tag!==listing && counts.has(tag) && (best===null || counts.get(tag)<counts.get(best)))best=tag;
   }
   return best;
+}
+function patrolWorkKind(card) {
+  const name=card?.name;
+  if(typeof name!=='string' || name.length>200)return '';
+  const title=name.trim();
+  if(!title)return '';
+  const notice=/^(?:【(?:募集要項|応募要項|作品募集のお知らせ|告知|更新案内|更新のお知らせ|お知らせ)】|(?:募集要項|応募要項|作品募集のお知らせ|イベント告知|更新案内|更新のお知らせ)(?:$|[｜|：:]))/.test(title) ||
+    /^[\p{L}\p{N} 　]{0,50}コンテスト(?:の)?(?:募集|応募)要項$/u.test(title);
+  const work=PATROL_WORK_TITLE.test(title);
+  // Use only an explicit statement at the start of a short plain-text excerpt.
+  // A title with mixed editorial and literary labels is ambiguous.
+  const excerpt=typeof card.description==='string' && card.description.length<=320 ? card.description.trim() : '';
+  const workIntro=/^(?:本作|この作品)は(?:一話完結の|読み切りの)?(?:短編小説|掌編小説|ショートショート|自由詩|散文詩)です[。！]/.test(excerpt);
+  if(notice)return work || workIntro || PATROL_WORK_BADGE.test(title)?'':'notice';
+  if(/(?:募集|応募)要項|作品募集|原稿募集|お知らせ|告知|更新案内|書き方|書評|感想|作品紹介|作品解説/.test(title))return '';
+  return work || workIntro?'work':'';
+}
+function patrolCardAuthor(card) {
+  const author=String(card.user?.id??card.user_id??'');
+  const flags=[card.is_liked,card.isLiked].filter(flag=>flag!==undefined);
+  return card.status==='published' && /^[1-9]\d*$/.test(author) && flags.length && flags.every(flag=>flag===false)?author:'';
+}
+function workPatrolCard(keys,notes,listing,counts,ownIds,recent,cutoff) {
+  if(!FICTION1697.has(listing))return null;
+  let first=true,choice=null;
+  for(const key of keys){
+    const card=notes.get(key),id=String(card.user?.id??card.user_id??'');
+    if(ownIds.has(id) || (recent.get(id)||0)>cutoff)continue;
+    const author=patrolCardAuthor(card),owner=card.user?.urlname;
+    const tags=author && /^[\w-]{1,80}$/.test(owner||'')?contestTags16923(card):null;
+    if(first){
+      if(!tags?.includes(listing) || patrolWorkKind(card)!=='notice')return null;
+      first=false;
+    }else if(tags?.includes(listing) && patrolWorkKind(card)==='work'){
+      const tag=leastUsedPatrolTag(tags,listing,counts)||listing;
+      if(!choice || counts.get(tag)<counts.get(choice.tag)){
+        choice={key,author,owner,tag,workTitle:card.name};
+        if(counts.get(tag)===0)break;
+      }
+    }
+  }
+  return choice;
 }
 function alternatePatrolCard(keys,notes,listing,counts,ownIds,recent,cutoff) {
   let lowest=null,alternate=null;
   for(const key of keys){
     const card=notes.get(key),author=String(card.user?.id??card.user_id??'');
     if(ownIds.has(author) || (recent.get(author)||0)>cutoff)continue;
-    const likeFlags=[card.is_liked,card.isLiked].filter(flag=>flag!==undefined);
-    const unliked=likeFlags.length>0 && likeFlags.every(flag=>flag===false);
-    const tag=card.status==='published' && unliked && /^[1-9]\d*$/.test(author)?leastUsedPatrolTag(card,listing,counts):null;
+    const tag=patrolCardAuthor(card)?leastUsedPatrolTag(contestTags16923(card),listing,counts):null;
     // Keep the original first detail lookup if its category or eligibility is unknown.
     if(!tag){if(lowest===null)return null;continue;}
     const score=counts.get(tag);
@@ -1152,8 +1195,12 @@ async function run(original,slot) {
           for (const row of rows.results) recent.set(row.author,row.last_at);
         }
       }
-      const alternate=!fromReader && receipt?.recentTags?.length && !receipt.preferOriginalOrder && candidates.length>1
-        ? alternatePatrolCard(candidates,notes,tag,tagCounts,ownIds,recent,Date.now()-settings.author_hours*HOUR):null;
+      let alternate=null;
+      if(!fromReader && receipt && !receipt.preferOriginalOrder && candidates.length>1){
+        const cutoff=Date.now()-settings.author_hours*HOUR;
+        alternate=workPatrolCard(candidates,notes,tag,tagCounts,ownIds,recent,cutoff);
+        if(!alternate && receipt.recentTags?.length)alternate=alternatePatrolCard(candidates,notes,tag,tagCounts,ownIds,recent,cutoff);
+      }
       if(alternate)receipt.preferOriginalOrder=true;
       for (const key of alternate?[alternate.key]:candidates) {
         const listedAuthor=authorOf(notes.get(key));
@@ -1164,7 +1211,13 @@ async function run(original,slot) {
         const note=await article(env,key);
         const author=authorOf(note);
         if(note&&(note.status!=='published'||typeof note.is_liked!=='boolean')){bump('no_candidates');continue;}
-        if(alternate && note && (author!==alternate.author || !contestTags16923(note)?.includes(alternate.tag))){bump('no_candidates');continue;}
+        if(alternate && note){
+          const tags=contestTags16923(note);
+          if(author!==alternate.author || !tags?.includes(alternate.tag) || (alternate.workTitle &&
+            (note.name!==alternate.workTitle || note.user?.urlname!==alternate.owner || !tags.includes(tag) || patrolWorkKind(note)!=='work'))){
+            bump('no_candidates');continue;
+          }
+        }
         if(fromReader && note && (!publicFiction1697(note)||author!==listedAuthor||note.user?.urlname!==notes.get(key)?.user?.urlname)){bump('no_candidates');continue;}
         if (!note || note.is_liked===true || ownIds.has(author)) {
           await sql(env,"INSERT OR IGNORE INTO nh_seen VALUES (?,'skip',?)",key,Date.now()).run();
@@ -1214,7 +1267,7 @@ async function run(original,slot) {
           ...(fromReader?[sql(env,"UPDATE nh_v1697_discovery SET readers=readers+1,reader_pending='',message='読者経由の記事へのスキ確認済み' WHERE slot=?",slot)]:[])
         ]);
         if(receipt && !fromReader){
-          const confirmedTag=alternate?.tag || leastUsedPatrolTag(note,tag,tagCounts) || tag;
+          const confirmedTag=alternate?.tag || leastUsedPatrolTag(contestTags16923(note),tag,tagCounts) || tag;
           receipt.recentTags=[...(receipt.recentTags||[]),confirmedTag].slice(-PATROL_TAG_HISTORY);
           receipt.preferOriginalOrder=false;
         }
@@ -8530,6 +8583,21 @@ async function diagnosticRecord16915(env){
 
 // Magazine-only expansion. The ordinary like scheduler and its D1 tables are unchanged.
 const DISTRIBUTION16918=Object.freeze({applications:24,checks:96,placements:48,applicationGap:30*M520,placementGap:15*M520,workGap:2*HOUR});
+// Legacy placements stored short or owner-qualified note.com magazine URLs; an owner can itself be named "m".
+const legacyMagazineId16945="CASE WHEN instr(url,'/m/')>0 THEN replace(rtrim(substr(url,instr(url,'/m/')+3),'/'),'m/','') ELSE '' END";
+// Treat explicit, separated title labels as evidence. An unlabelled work keeps its place.
+function magazineEntryRole(title){
+  if(typeof title!=='string' || title.length>300)return '';
+  const plain=title.normalize('NFKC').replace(/「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"/gu,'□');
+  if(/[「」『』“”"]|目次|書き方|あらすじ|予告|告知|解説|募集要項/u.test(plain))return '';
+  const labels=plain.split(/[\s・|｜:：/／【】（）()［］\[\]〈〉《》〔〕―—]+/u).filter(Boolean);
+  const opening=/^(?:読み切り|読切|掌編(?:小説)?|一話完結|前編|第(?:0*1|一)[話章回部])$/;
+  const later=/^(?:後編|完結編|最終[話章回部]|第(?:0*[2-9]|0*[1-9]\d+|[二三四五六七八九十百千][一二三四五六七八九十百千]*)[話章回部])$/;
+  const edges=[labels[0],labels.at(-1)];
+  if(edges.some(t=>opening.test(t)) && !labels.some(t=>later.test(t)))return 'opening';
+  if(edges.some(t=>later.test(t)) && !labels.some(t=>opening.test(t)))return 'later';
+  return '';
+}
 Object.assign(Desk520.prototype,{
   initDistribution16918(){
     if(this.one("SELECT 1 FROM sqlite_master WHERE name='desk_distribution16918'"))return;
@@ -8572,7 +8640,7 @@ Object.assign(Desk520.prototype,{
         (!job || job.phase==='wait' && (job.next<=now || activeTarget===link.id));
     });
   },
-  eligiblePlacement(key,now,activeTarget=null,magazines=this.batchMagazines(now)){
+  eligiblePlacement(key,now,activeTarget=null,magazines=this.batchMagazines(now),pool=null){
     const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
     if(!a?.choice || a.title.trim()==='521' || !activeTarget && a.mag_due>now)return null;
     const pacing=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1');
@@ -8580,10 +8648,25 @@ Object.assign(Desk520.prototype,{
     const mag=this.chooseMagazine520(this.placementCandidates16918(a,magazines,now,activeTarget),a.work_genre||a.genre,now,a);
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
-    const prior=this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
-    const job={kind:'mag',key,subject:prior?.subject||key+'@'+link.id,target:link.id,url:link.url,title:a.title,name:mag.name,
-      old:a.pub<=now-30*D520,previousMagAt:a.mag_at,previousMagDue:a.mag_due};
-    return activeTarget?job:this.rssTiming16926(job,now);
+    const opener=pool && a.choice===mag.url && magazineEntryRole(a.title)==='later' && pool.find(c=>
+      c.choice===mag.url && c.mag_at===a.mag_at && c.verified>0 && c.verified>=now-8*D520 && c.verified<=now &&
+      (a.pub>=now-3*D520)===(c.pub>=now-3*D520) && magazineEntryRole(c.title)==='opening');
+    const prior=opener?this.one(`SELECT
+      (SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?) AS subject,
+      NOT EXISTS(SELECT 1 FROM desk_ref WHERE id=?) AND NOT EXISTS(SELECT 1 FROM desk_mag_send WHERE id=?)
+        AND NOT EXISTS(SELECT 1 FROM desk_placement WHERE ${legacyMagazineId16945} IN ('',?))
+        AND NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND target=? AND phase IN ('sent','seen','confirmed'))
+        AND NOT EXISTS(SELECT 1 FROM desk_job WHERE kind='mag' AND article=? AND target=?) AS first_issue,
+      w.genre work_genre,w.chars work_chars,w.method FROM (SELECT 1) LEFT JOIN desk_work w ON w.article=?`,
+      key,link.id,link.id,link.id,link.id,link.id,opener.article,link.id,opener.article):
+      this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
+    const makeJob=(row,subject)=>({kind:'mag',key:row.article,subject:subject||row.article+'@'+link.id,target:link.id,url:link.url,title:row.title,name:mag.name,
+      old:row.pub<=now-30*D520,previousMagAt:row.mag_at,previousMagDue:row.mag_due});
+    const job=makeJob(a,prior?.subject);
+    if(activeTarget)return job;
+    const first=opener && prior?.first_issue && !prior.subject && this.archiveFits({...opener,...prior},[mag],now).length
+      ? makeJob(opener,null):null;
+    return this.rssTiming16926(job,now,first);
   },
   nextPlacement(now,oldFirst){
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
@@ -8593,10 +8676,13 @@ Object.assign(Desk520.prototype,{
       const keys=this.circulationTry16932(()=>this.circulationCandidates16932(now,old))||
         this.rows('SELECT article FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub '+(old?'<=?':'>?')+
           ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT 8',now,now-30*D520);
-      for(const candidate of keys){
+      for(const [index,candidate] of keys.entries()){
         const {article}=candidate;
-        const job=this.eligiblePlacement(article,now,null,magazines);
-        if(job){this.circulationTry16932(()=>this.recordCirculation16932(job,candidate,now));return job;}
+        const job=this.eligiblePlacement(article,now,null,magazines,keys.slice(index+1));
+        if(job){
+          const selected=job.key===article?candidate:{...keys.find(c=>c.article===job.key),reason:'この誌で最初の掲載候補・読み切りまたは冒頭の作品'};
+          this.circulationTry16932(()=>this.recordCirculation16932(job,selected,now));return job;
+        }
         // A blocked publisher cannot monopolize the head of the queue.
         this.rows('UPDATE desk_archive SET mag_due=?,pick_due=MIN(pick_due,?) WHERE article=?',now+HOUR,now+HOUR,article);
       }
@@ -10267,19 +10353,25 @@ Object.assign(Desk520.prototype,{
     return this.rows('SELECT hour,COUNT(DISTINCT day) days,SUM(finish-start) duration,SUM(added) added FROM desk_rss_window16926 WHERE id=? AND finish>=? GROUP BY hour',id,now-21*D520)
       .filter(r=>r.days>=3&&r.duration>=HOUR).map(r=>({...r,rate:r.added*HOUR/r.duration}));
   },
-  rssTiming16926(job,now){
+  rssTiming16926(job,now,first=null){
     return this.rssTry16926(()=>{
       const old=this.one('SELECT * FROM desk_rss_delay16926 WHERE article=? AND id=?',job.key,job.target);
-      const started=Math.min(now,this.one('SELECT MIN(started) started FROM desk_rss_delay16926 WHERE article=?',job.key).started??now);
+      const history=first?this.one(`SELECT MIN(started) started,EXISTS(SELECT 1 FROM desk_rss_delay16926 WHERE article=?) opener_delay
+        FROM desk_rss_delay16926 WHERE article=?`,first.key,job.key):
+        this.one('SELECT MIN(started) started FROM desk_rss_delay16926 WHERE article=?',job.key);
+      const started=Math.min(now,history.started??now);
       if(now>=started+2*HOUR)return job;
       if(old){if(now>=old.until)return job;return null;}
+      // Without a saved delay for either work, the remaining timing rules depend only on their shared magazine.
+      // On a closed window, retain the ordinary work and its original retry record.
+      const ready=first && history.started==null && !history.opener_delay?first:job;
       const feed=this.one('SELECT checked FROM desk_rss_feed16926 WHERE id=? ORDER BY checked DESC LIMIT 1',job.target);
-      if(!feed||feed.checked<now-2*D520)return job;
+      if(!feed||feed.checked<now-2*D520)return ready;
       const rates=this.rssRates16926(job.target,now),hour=Math.floor((now+9*HOUR)/HOUR)%24,current=rates.find(r=>r.hour===hour);
-      if(!current||current.rate<3)return job;
+      if(!current||current.rate<3)return ready;
       const next=rates.filter(r=>{const gap=(r.hour-hour+24)%24;return gap>=1&&gap<=2&&r.rate*2+0.5<current.rate;})
         .sort((a,b)=>a.rate-b.rate||((a.hour-hour+24)%24)-((b.hour-hour+24)%24))[0];
-      if(!next)return job;
+      if(!next)return ready;
       const until=Math.min(started+2*HOUR,Math.floor(now/HOUR)*HOUR+((next.hour-hour+24)%24)*HOUR);
       this.rows('INSERT INTO desk_rss_delay16926 VALUES(?,?,?,?,?)',job.key,job.target,started,until,'観測上、更新の少ない時間帯まで共同誌への追加を待機');
       this.rssTrim16926(now);return null;
@@ -10426,6 +10518,7 @@ Desk520.prototype.init=function(){
   if(this.ready && this.networkReady16922 && this.repeatReady16923 && this.contestReady16923 && this.rssReady16926){
     this.storage.transactionSync(()=>{
       this.rows('CREATE INDEX IF NOT EXISTS desk_job_recent ON desk_job(at DESC)');
+      this.rows('CREATE INDEX IF NOT EXISTS desk_placement_mag16945 ON desk_placement('+legacyMagazineId16945+')');
       this.rows('INSERT INTO desk_schema_state(id,version) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version',VERSION);
     });
     this.schemaRecorded=true;
@@ -10508,7 +10601,7 @@ function patrolCoordinator16931(storage){
   const rows=(q,...a)=>objectRows(storage,q,...a);
   // Keep the selection hints on the slot's existing latest record only.
   const latestPatrol=(receipt,value)=>JSON.stringify({...value,recentTags:receipt.recentTags,
-    preferOriginalOrder:receipt.preferOriginalOrder || (value.outcome==='running' && receipt.recentTags.length>0)});
+    preferOriginalOrder:receipt.preferOriginalOrder || value.outcome==='running'});
   const init=()=>{
     if(ready)return;
     storage.transactionSync(()=>{
