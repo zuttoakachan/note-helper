@@ -7,7 +7,7 @@ const path = require('node:path');
 const {DatabaseSync} = require('node:sqlite');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'worker.js'), 'utf8');
-const exportsForTest = '\nexport {Desk520,nativeScreenJS,browserDelivery,inspectDraftDirectory,noteIdentityJS,text520,coverId,draftFailure16935};';
+const exportsForTest = '\nexport {Desk520,nativeScreenJS,draftParagraphTextJS,draftBodyHash,readDraftCover,BROWSER_SOURCES520,browserDelivery,inspectDraftDirectory,noteIdentityJS,text520,coverId,draftFailure16935};';
 const worker = import('data:text/javascript;base64,' + Buffer.from(source + exportsForTest).toString('base64'));
 
 test('draft directory and delivery preview handle canonical list URLs and accessible editor titles', async () => {
@@ -37,7 +37,7 @@ test('draft directory and delivery preview handle canonical list URLs and access
       }
       async function evaluate(expression) {
         if(expression === identity)return {id:'1', name:'43__'};
-        if(expression.includes('FIXTURE_METADATA'))return {name:title, cover:null, hash:'1'.repeat(64)};
+        if(expression.includes('FIXTURE_METADATA'))return {name:title, cover:null, hash:'1'.repeat(64),textHash:'2'.repeat(64)};
         return Function('location', 'document', 'return (' + expression + ')')(locationValue, document);
       }
       const frame = (step, arg) => evaluate('(' + screen + ')(' + JSON.stringify(step) + ',' + JSON.stringify(arg) + ')');
@@ -70,7 +70,7 @@ test('draft directory and delivery preview handle canonical list URLs and access
       }};
       const scope = {
         inNoteBrowser:async (_binding, _cookie, _editor, action) => action(io),
-        nativeScreenJS:screen, noteIdentityJS:identity, pause520:async () => {},
+        nativeScreenJS:screen, noteIdentityJS:identity, pause520:async () => {}, draftParagraphTextJS:'null', draftBodyHash:async () => '2'.repeat(64),
         BROWSER_SOURCES520:{readDraftCover:'FIXTURE_METADATA', draftBodyHash:'FIXTURE_HASH'}
       };
       for(const [name, src] of Object.entries(helpers))scope[name] = Function('return (' + src + ')')();
@@ -91,6 +91,135 @@ test('draft directory and delivery preview handle canonical list URLs and access
   } finally {
     await browser.close();
   }
+});
+
+test('a publication requires the registered text in both saved data and the editor', async t => {
+  const m = await worker;
+  assert.equal(m.BROWSER_SOURCES520.readDraftCover,String(m.readDraftCover));
+  assert.equal(m.BROWSER_SOURCES520.draftBodyHash,String(m.draftBodyHash));
+  assert.ok(m.nativeScreenJS.includes(m.draftParagraphTextJS));
+  const {chromium} = require('playwright');
+  const browser = await chromium.launch({executablePath:process.env.CHROMIUM_EXECUTABLE});
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  const title = '原稿';
+  const editorPage = '<textarea aria-label="記事タイトル">原稿</textarea><div class="ProseMirror" contenteditable="true"></div>' +
+    '<button>見出し画像を追加</button><button id="settings">公開設定</button><dialog><label><input type="radio" checked>無料</label>' +
+    '<fieldset><input placeholder="ハッシュタグ"></fieldset><button id="publish">投稿する</button></dialog>' +
+    '<script>window.clicks=0;settings.onclick=()=>document.querySelector("dialog").showModal();publish.onclick=()=>window.clicks++;</script>';
+  let saved, draftStatus, reads = 0;
+  const unexpected = [];
+  await page.route('**/*', route => {
+    const url = route.request().url();
+    const html = body => route.fulfill({contentType:'text/html; charset=utf-8',body});
+    if (url === 'https://note.com/notes') return html('<article><h2>原稿</h2><p>下書き</p><a href="https://editor.note.com/notes/nabc/edit">編集する</a></article>');
+    if (url === 'https://editor.note.com/notes/nabc/edit/') return html(editorPage);
+    if (url === 'https://note.com/api/v3/notes/nabc') {
+      reads++;
+      return route.fulfill({json:{data:{key:'nabc',name:title,user:{urlname:'43__',id:'1'},status:draftStatus,price:0,eyecatch:null,body:saved}}});
+    }
+    unexpected.push(url);
+    return route.abort();
+  });
+  async function run({body,editor=body,html,link=false,status='draft'}) {
+    saved=html;draftStatus=status;reads=0;
+    let marks=0;
+    const io={blocked:() => false,
+      evaluate:async code => code===m.noteIdentityJS?{name:'43__',id:'1'}:page.evaluate(code),
+      command:async (_method,{url}) => {
+        await page.goto(url);
+        if (!url.startsWith('https://editor.note.com/')) return;
+        await page.evaluate(text => {
+          const root=document.querySelector('.ProseMirror');
+          for (const line of text.replace(/\r\n?/g,'\n').split('\n')) {
+            const p=document.createElement('p');
+            if (line) p.append(line);
+            else p.append(document.createElement('br'));
+            root.append(p);
+          }
+        },editor);
+      }};
+    const scope={inNoteBrowser:async (_b,_c,_e,action) => action(io),pause520:async () => {}};
+    for(const key of ['BROWSER_SOURCES520','nativeScreenJS','draftParagraphTextJS','draftBodyHash','noteIdentityJS','coverId','text520','draftFailure16935'])
+      scope[key]=m[key];
+    const deliver=Function(...Object.keys(scope),'return ('+m.browserDelivery+')')(...Object.values(scope));
+    const result=await deliver({},'1','fixture',{kind:'publish',key:'nabc',title,body:link?undefined:body,link},async () => {marks++;return true;});
+    return {marks, clicks:await page.evaluate(() => window.clicks||0),reads,message:result.message};
+  }
+  const cases=[
+    ['formatted paragraphs and trailing blank lines','<p data-a="1"><strong>ここ&amp;そこ</strong><br>続き</p>\n<p></p><p>文末</p><p><br></p>','ここ&そこ\r\n続き\r\n\r\n文末\r\n',true],
+    ['plain saved text','そのままの文\r\n二行目','そのままの文\n二行目',true],
+    ['inline fragments and escaped characters','<a href="/abc">A &lt; B</a><br/>旅&#x1f60a;','A < B\n旅😊',true],
+    ['preserved space','<p>A&nbsp;B</p>','A\u00a0B',true],
+    ['different kind of space','<p>A&nbsp;B</p>','A B',false],
+    ['previously saved body','<p>古い文章</p>','新しい文章',false],
+    ['different blank lines','<p>前</p><p>後</p>','前\n\n後',false],
+    ['media and text cannot prove a plain manuscript','<p>本文</p><figure><img src="https://forbidden.invalid/image"></figure>','本文',false]
+  ];
+  for (const [label,html,body,matches] of cases) await t.test(label,async () => {
+    const result=await run({html,body});
+    assert.equal(result.reads,1);
+    assert.equal(result.marks,Number(matches),result.message);
+    assert.equal(result.clicks,Number(matches),result.message);
+  });
+  const staleEditor=await run({html:'<p>保存済み</p>',body:'保存済み',editor:'画面の別稿'});
+  assert.equal(staleEditor.marks,0);
+  const linkOnly=await run({link:true,html:'<p>保存済みのリンク稿</p>',body:'保存済みのリンク稿'});
+  assert.equal(linkOnly.marks,1,linkOnly.message);
+  assert.equal(linkOnly.clicks,1);
+  const scheduled=await run({link:true,status:'scheduled',html:'<p>note側で予約中</p>',body:'note側で予約中'});
+  assert.equal(scheduled.marks,0);
+  assert.deepEqual(unexpected,[]);
+});
+
+test('magazine delivery rechecks the visible add control after reserving a placement', async () => {
+  const m = await worker;
+  const {chromium} = require('playwright');
+  const browser = await chromium.launch({executablePath:process.env.CHROMIUM_EXECUTABLE});
+  try {
+    const page = await browser.newPage();
+    const html = '<link rel="canonical" href="https://note.com/43__/n/nwork"><h1>作品</h1>' +
+      '<button>マガジンに追加</button><div role="dialog"><div>' +
+      '<a href="https://note.com/writer/m/mfixture">文芸誌</a><button id="choice" role="checkbox">追加</button></div></div>';
+    await page.route('**/*', route => route.fulfill({contentType:'text/html; charset=utf-8', body:html}));
+    await page.goto('https://note.com/43__/n/nwork');
+    const run = (initial, final) => page.evaluate(async ({initial,final,screen,delivery}) => {
+      const choice = document.getElementById('choice');
+      let clicks = 0, marks = 0;
+      choice.onclick = () => {clicks++;};
+      const display = ({text,checked,pressed,aria}) => {
+        choice.textContent = text;
+        for (const [key,value] of Object.entries({'aria-checked':checked,'aria-pressed':pressed,'aria-label':aria})) {
+          if (value === undefined) choice.removeAttribute(key);
+          else choice.setAttribute(key,value);
+        }
+      };
+      display(initial);
+      const identity = 'fixture authenticated identity';
+      const io = {command:async () => {}, blocked:() => false,
+        evaluate:async code => code === identity ? {id:'1',name:'43__'} : Function('return '+code)()};
+      const send = Function('inNoteBrowser','nativeScreenJS','noteIdentityJS','pause520','return ('+delivery+')')(
+        async (_binding,_cookie,_editor,action) => action(io),screen,identity,async () => {});
+      const result = await send({},'1','fixture',{kind:'mag',title:'作品',key:'nwork',target:'mfixture'},async () => {
+        marks++;
+        if (final) display(final);
+        return true;
+      });
+      return {clicks,marks,seen:!!result.seen,notClicked:!!result.notClicked};
+    }, {initial,final,screen:m.nativeScreenJS,delivery:String(m.browserDelivery)});
+    const add = {text:'追加',checked:'false'};
+    const held = {clicks:0,marks:0,seen:false,notClicked:false};
+    assert.deepEqual(await run(add),{clicks:1,marks:1,seen:false,notClicked:false});
+    for (const control of [
+      {text:'削除',checked:'false'}, {text:'解除',checked:'false'}, {text:'追加済み',checked:'false'},
+      {text:'削除',aria:'追加'}, {text:'追加',checked:'false',pressed:'true'}, {text:'',checked:'mixed'}
+    ]) {
+      assert.deepEqual(await run(control),held,JSON.stringify(control));
+      assert.deepEqual(await run(add,control),{...held,marks:1,notClicked:true},JSON.stringify(control));
+    }
+    assert.deepEqual(await run({text:'削除',checked:'true'}),{...held,seen:true});
+    assert.deepEqual(await run(add,{text:'削除',checked:'true'}),{...held,marks:1,seen:true});
+  } finally { await browser.close(); }
 });
 
 async function deskFixture() {

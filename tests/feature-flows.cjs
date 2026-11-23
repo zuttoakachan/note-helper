@@ -107,6 +107,44 @@ test('offline Worker workflows', async t => {
     assert.deepEqual(await snapshot(),before);
   });
 
+  await t.test('native saved-results form preserves its origin and reads an unfinished test with or without JavaScript', async t => {
+    const {chromium} = require('playwright');
+    const browser = await chromium.launch({executablePath:process.env.CHROMIUM_EXECUTABLE});
+    t.after(() => browser.close());
+    await appObject.fetch('https://fixture.internal/pending');
+    const before = await snapshot();
+    for (const javaScriptEnabled of [true,false]) {
+      const context = await browser.newContext({javaScriptEnabled,serviceWorkers:'block'});
+      const submitted = [];
+      await context.route('**/*', async route => {
+        const req = route.request();
+        if (req.url() !== origin+'/test') return route.abort();
+        const headers = await req.allHeaders();
+        if (req.method() === 'POST') submitted.push([headers.origin,new URLSearchParams(req.postData()).get('action')]);
+        const res = await mf.dispatchFetch(req.url(), {method:req.method(),headers,body:req.postDataBuffer()??undefined});
+        await route.fulfill({status:res.status,headers:Object.fromEntries(res.headers),body:Buffer.from(await res.arrayBuffer())});
+      });
+      try {
+        const page = await context.newPage();
+        await page.goto(origin+'/test');
+        await page.locator('input[name="key"]').fill(admin);
+        const [response] = await Promise.all([
+          page.waitForResponse(r => r.request().method() === 'POST'),
+          page.getByRole('button',{name:'保存済みの結果・履歴を読む'}).click()
+        ]);
+        assert.deepEqual(submitted,[[origin,'records']]);
+        assert.equal(response.status(),200);
+        assert.match(await page.locator('#testresult').innerText(),/<saved>/);
+        assert.deepEqual(await snapshot(),before);
+      } finally { await context.close(); }
+    }
+    const denied = await mf.dispatchFetch(origin+'/test', {
+      method:'POST',headers:{Origin:'https://other.invalid'},body:new URLSearchParams({action:'records',key:admin})
+    });
+    assert.equal(denied.status,403);
+    assert.deepEqual(await snapshot(),before);
+  });
+
   await t.test('photo consent, metadata stripping, deduplication, download and share confirmation', async () => {
     // A gray one-pixel JPEG, with an additional JPEG comment inserted after SOI.
     const pixels = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAA//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AJ//Z','base64');
