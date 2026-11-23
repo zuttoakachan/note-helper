@@ -14,11 +14,13 @@ function markerDB(){
     writes:0,sqlite,
     prepare(query){
       return {query,args:[],bind(...args){this.args=args;return this;},
-        async first(){return sqlite.prepare(query).get(...this.args);}};
+        async first(){return sqlite.prepare(query).get(...this.args);},
+        async all(){return {results:sqlite.prepare(query).all(...this.args)};},
+        async run(){return this.all();}};
     },
     async batch(statements){
-      for(const {query,args} of statements)sqlite.prepare(query).run(...args);
       this.writes++;
+      return Promise.all(statements.map(statement=>statement.all()));
     }
   };
 }
@@ -28,14 +30,13 @@ function newContext(storage){
     while(pending.length)await Promise.all(pending.splice(0));
   }};
 }
-function makeScheduler(db,fault){
-  const sqlite=new DatabaseSync(':memory:');
-  sqlite.exec('CREATE TABLE fixture_source(id INTEGER PRIMARY KEY)');
+function makeScheduler(db,fault,sqlite=new DatabaseSync(':memory:')){
+  sqlite.exec('CREATE TABLE IF NOT EXISTS fixture_source(id INTEGER PRIMARY KEY)');
   const storage={attempts:0,rejections:0,alarms:[],
     sql:{exec(query,...args){
       storage.attempts++;
       if(fault.message && query.startsWith('SELECT')){
-        storage.rejections++;throw Error(fault.message);
+        storage.rejections++;throw Object.assign(Error(fault.message),{retryAfter:fault.retryAfter});
       }
       return {toArray:()=>sqlite.prepare(query).all(...args)};
     }},
@@ -47,7 +48,7 @@ function makeScheduler(db,fault){
   const guard=()=>scheduler.fetch(new Request('https://scheduler.internal/security/admin-key',{
     method:'POST',body:JSON.stringify({valid:true,client:'a'.repeat(64)})
   }));
-  return {ctx,scheduler,storage,guard};
+  return {ctx,scheduler,storage,guard,sqlite};
 }
 
 test('daily read rejection stops repeated SQL, survives cold start and expires at UTC reset',async t=>{
@@ -104,8 +105,8 @@ test('other storage failures leave the read gate open for recovery',async()=>{
 });
 
 const day=86400000,minute=60000;
-function liveFixture(db,fault={message:''}){
-  const guard=makeScheduler(db,{message:''}), app=makeScheduler(db,fault);
+function liveFixture(db,fault={message:''},realTick=false,previous){
+  const guard=makeScheduler(db,{message:''},previous?.guard.sqlite), app=makeScheduler(db,fault,previous?.app.sqlite);
   let probes=0;
   const env={DB:db,ADMIN_KEY:'test-key',SCHEDULER:{
     idFromName:name=>name,get:name=>({async fetch(request){
@@ -118,7 +119,7 @@ function liveFixture(db,fault={message:''}){
         if(app.scheduler.readGate.until>Date.now())return app.scheduler.readGate.response();
         return Response.json({active:false,results:['stored']});
       }
-      if(path==='/desk/tick')return new Response('OK');
+      if(path==='/desk/tick' && !realTick)return new Response('OK');
       const target=name==='note-helper-210-seconds'?app:guard;
       return target.scheduler.fetch(request);
     }})
@@ -208,4 +209,81 @@ test('a persisted provider-directed deadline cannot be shortened by another obse
   const response=await cold.history('records','test-key',true);
   assert.equal(response.status,503);assert.equal(cold.probes(),0);
   assert.equal(Number(response.headers.get('Retry-After')),Math.ceil((until-now)/1000));
+});
+
+test('ordinary cron and alarm recover without a user after a delayed rollover and a failed first check',async t=>{
+  const midnight=utcReset-5000;
+  let now=midnight-minute;t.mock.method(Date,'now',()=>now);
+  let network=0;
+  t.mock.method(globalThis,'fetch',async()=>{network++;throw Error('offline test');});
+  const db=markerDB(),fault={message:''};
+  let f=liveFixture(db,fault,true);
+  // Seed an ordinary stored installation with both account slots paused.
+  const records=await f.app.scheduler.fetch(new Request('https://scheduler.internal/desk/admin',{method:'POST',body:'{"action":"production_test_records"}'}));
+  assert.equal(records.status,200);
+  f.app.scheduler.desk.init();
+  f.app.sqlite.exec('UPDATE desk_cfg SET enabled=0');
+  fault.message=limit;
+  const cron=async fixture=>{
+    const ctx=newContext();
+    await worker.scheduled({},fixture.env,ctx);
+    await ctx.drain();await fixture.app.ctx.drain();
+  };
+  await f.app.scheduler.alarm();await f.app.ctx.drain();
+  assert.equal(f.app.storage.alarms.at(-1),utcReset);
+  now=midnight+8*minute; // The reset alarm itself ran late.
+  await f.app.scheduler.alarm();await f.app.ctx.drain();
+  const inferred=utcReset+day;
+  assert.equal(f.app.storage.alarms.at(-1),inferred);
+  now=midnight+16*minute;
+  await Promise.all([cron(f),cron(f)]);
+  assert.equal(f.probes(),1);
+  assert.equal(db.sqlite.prepare('SELECT released FROM nh_do_read_state').get().released,0);
+  f=liveFixture(db,fault,true,f); // Cold instance, same durable databases.
+  f.app.storage.alarms.push(inferred);
+  fault.message='';
+  now=midnight+28*minute;
+  await cron(f);assert.equal(f.probes(),0);
+  now=midnight+32*minute;
+  await Promise.all([cron(f),cron(f)]);
+  assert.equal(f.probes(),1);
+  assert.equal(f.app.storage.alarms.at(-1),now+1000);
+  now+=1000;
+  await f.app.scheduler.alarm();await f.app.ctx.drain();
+  assert.equal(db.sqlite.prepare('SELECT heartbeat FROM nh_v15_runtime WHERE id=1').get().heartbeat,now);
+  assert.ok(f.app.storage.alarms.at(-1)>now && f.app.storage.alarms.at(-1)<now+5*minute);
+  assert.equal(network,0);
+});
+
+test('persistent rollover refusal costs at most three real reads and a probe honors provider Retry-After',async t=>{
+  const midnight=utcReset-5000;
+  let now=midnight-minute;t.mock.method(Date,'now',()=>now);
+  const db=markerDB(),fault={message:limit},f=liveFixture(db,fault);
+  await f.app.guard();await f.app.ctx.drain();
+  now=utcReset;await f.app.guard();await f.app.ctx.drain();
+  const cronCtx=newContext(),cron=async()=>{await worker.scheduled({},f.env,cronCtx);await cronCtx.drain();};
+  now=midnight+12*minute;fault.retryAfter='2400';await cron();
+  assert.equal(f.probes(),1);
+  now=midnight+32*minute;await cron();assert.equal(f.probes(),1);
+  now=midnight+52*minute;delete fault.retryAfter;await cron();assert.equal(f.probes(),2);
+  now=midnight+92*minute;await cron();assert.equal(f.probes(),3);
+  now=midnight+18*60*minute;await cron();assert.equal(f.probes(),3);
+  assert.equal((await f.app.guard()).status,503);
+});
+
+test('a failed read of the cold magazine handoff leaves the ordinary alarm fallback running',async()=>{
+  const db=markerDB(),s=makeScheduler(db,{message:''});
+  await s.scheduler.fetch(new Request('https://scheduler.internal/desk/admin',{
+    method:'POST',body:'{"action":"production_test_records"}'
+  }));
+  let failures=0,fallbacks=0;
+  s.scheduler.desk.accountJoinDue16943=()=>{failures++;throw Error('fixture: unavailable handoff row');};
+  s.scheduler.startDeskTick16916=async()=>{fallbacks++;};
+  await s.scheduler.alarm();
+  await s.ctx.drain();
+  assert.equal(failures,1);
+  assert.equal(fallbacks,1);
+  assert.ok(s.storage.alarms.at(-1)>Date.now());
+  db.sqlite.close();
+  s.sqlite.close();
 });

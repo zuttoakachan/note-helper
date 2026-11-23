@@ -1,4 +1,4 @@
-const VERSION = 'v16.9.42';
+const VERSION = 'v16.9.43';
 const MAX_AUTHOR_HOURS = 365 * 24;
 const SLOTS = ['1', '2'];
 const DEFAULT_TAGS = ['小説', '短編小説', '創作', '散文', 'エッセイ', '詩', '日記', 'ショートショート', '掌編小説', '詩のようなもの', '自由詩', '独白', '希死念慮', '鬱', '恋愛', '恋愛エッセイ', '人間関係', '恋愛小説', '家族', '孤独', '生き方', '愛', '記憶', '喪失', '文学'];
@@ -483,7 +483,7 @@ async function acquire(env, automatic, background = false) {
     ' WHERE id=1 AND lease<=?' + (automatic ? ' AND enabled=1 AND next_at<=?' : '') +
     (background ? " AND (enabled=0 OR (next_at>? AND inflight=''))" : '') +
     ' AND NOT EXISTS (SELECT 1 FROM nh_v13_connection WHERE slot=? AND hold_until>?)',
-    token, now + LEASE, ...(automatic ? [now,now + 2*HOUR] : []), now, ...(automatic ? [now] : []), ...(background ? [now+30000] : []), env.SLOT, now
+    token, now + LEASE, ...(automatic ? [now,now + 2*HOUR] : []), now, ...(automatic ? [now] : []), ...(background ? [now+PATROL_HEAD_START] : []), env.SLOT, now
   ).run();
   return result.meta.changes ? token : null;
 }
@@ -825,14 +825,21 @@ async function queuedReader1699(env,state,settings,token,ownIds,bump,origin=null
     throw error;
   }
   if(!Array.isArray(data?.contents))return null;
-  const notes=data.contents.slice(0,30).filter(n=>publicFiction1697(n) && n.user.urlname===row.owner &&
-    /^[1-9]\d{0,19}$/.test(String(n.user.id)) && !ownIds.has(String(n.user.id)) && n.is_liked!==true).slice(0,settings.scan_notes);
+  const cards=data.contents.slice(0,30).filter(n=>n?.status==='published' && /^n[a-z0-9]{1,64}$/.test(n.key) &&
+    n.user?.urlname===row.owner && /^[1-9]\d{0,19}$/.test(String(n.user.id)) && !ownIds.has(String(n.user.id)) && n.is_liked!==true);
+  const notes=cards.filter(publicFiction1697).slice(0,settings.scan_notes);
+  if(!notes.length && settings.scan_notes>0){
+    // Creator lists can omit hashtags. The patrol verifies the detailed article
+    // within its existing scan budget before reserving or sending a like.
+    const incomplete=cards.find(n=>!Object.hasOwn(n,'hashtags'));
+    if(incomplete)notes.push(incomplete);
+  }
   if(notes.length){
     const ids=new Set(notes.map(n=>String(n.user.id)));
     if(ids.size!==1)return null;
     await sql(env,'UPDATE nh_v1699_readers SET author=? WHERE slot=? AND owner=?',String(notes[0].user.id),env.SLOT,row.owner).run();
     await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',
-      (row.origin==='returning'?'自分の作品に反応した読者':row.origin==='overlap'?'近い3作品以上に共通して反応した読者':row.origin==='curator'?'他者の作品の紹介活動を確認した作者':'文芸記事に反応した読者')+'の公開記事を確認・送信結果は通常巡回欄に記録',env.SLOT).run();
+      (row.origin==='returning'?'自分の作品に反応した読者':row.origin==='overlap'?'近い3作品以上に共通して反応した読者':row.origin==='curator'?'他者の作品の紹介活動を確認した作者':'文芸記事に反応した読者')+'の公開記事候補・詳細照合後の結果は通常巡回欄に記録',env.SLOT).run();
   }
   if(notes.length && env.TRACE)env.TRACE.readerOrigin=row.origin;
   return notes.length?notes:null;
@@ -856,13 +863,13 @@ async function ownReaderSeed1699(env,state,turn) {
 async function readerOpportunity1697(env,state,settings,token,ownIds,markSending,bump) {
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
   const s=await auxReadWrite16919(env,'discovery_read',()=>sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT).first());
+  if(!s.pending && s.due>now)return null;
   const deferred=browserWait16916(env.BROWSER);
   if(deferred){
-    await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',deferred.message,env.SLOT).run();
+    if(s.message!==deferred.message)await sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',deferred.message,env.SLOT).run();
     return s.pending?{handled:true,message:'前回操作は再送せず・'+deferred.message}:null;
   }
   const returning=!s.pending && (!s.seed || s.turn%4===3);
-  if(!s.pending && ((!s.seed && !returning) || s.due>now))return null;
   const record=async message=>auxReadWrite16919(env,'discovery_message',()=>sql(env,'UPDATE nh_v1697_discovery SET message=? WHERE slot=?',message,env.SLOT).run());
   if(typeof env.BROWSER?.acquire!=='function'){
     await sql(env,"UPDATE nh_v1697_discovery SET due=?,message='BROWSER未設定・追加巡回は待機中' WHERE slot=?",now+6*HOUR,env.SLOT).run();
@@ -1281,7 +1288,7 @@ async function dashboard(original, settings, prefix = '') {
     blocks.push('アカウント ' + slot + '\n状態：' + status +
       '\n今日のスキ確認成功：' + h.today + '件（日本時間）' +
       '\n累計：' + s.total + '件\n最終自動実行：' + time(s.checked) + '\n最終送信成功：' + time(h.success_at) +
-      (s.enabled ? '\n次回：' + (next > now ? time(next)+'以降の実行予約' : '次の実行予約') : '') +
+      (s.enabled ? '\n次回：' + (s.lease>now ? '実行中の処理が終わると次回時刻が確定します' : next > now ? time(next)+'以降の実行予約' : '次の実行予約') : '') +
       '\n失敗回数：' + h.errors + '\n429回数：' + h.rate_fail +
       '\n\n【手動の接続確認・Cookie更新】\n確認日時：' + time(h.connection_checked) + '\n' + h.connection_message +
       '\n※この確認日時時点の結果です。\nCookie保存先：' + (h.cookie_updated!=null ? '暗号化保存済み（管理画面の設定を優先）' : 'CloudflareのSecret') +
@@ -1396,6 +1403,10 @@ function dailyObjectReadsExceeded(error){
 const readGateSchema=`CREATE TABLE IF NOT EXISTS nh_do_read_state(
   id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,seen INTEGER NOT NULL,
   probe_at INTEGER NOT NULL,claimed INTEGER NOT NULL,released INTEGER NOT NULL)`;
+function quotaProbeFailure(error){
+  const wait=retryDelay16929(error?.retryAfter??error?.headers?.get?.('Retry-After'));
+  return new Response(null,{status:503,headers:wait?{'Retry-After':String(Math.ceil(wait/1000))}:{}});
+}
 class ObjectReadGate {
   constructor(db,ctx=null){
     this.ctx=ctx;this.db=db;this.until=0;this.seen=0;this.probeAt=0;this.releasedDeadline=0;
@@ -1438,11 +1449,11 @@ class ObjectReadGate {
     const midnight=Math.floor(now/86400000)*86400000;
     const providerWait=retryDelay16929(error?.retryAfter??error?.headers?.get?.('Retry-After'));
     const until=providerWait?now+providerWait:midnight+86400000+5000;
-    // A single refusal just after yesterday's inferred reset can be rollover
-    // lag. Schedule one shared storage check, without probing ordinary holds.
-    const rollover=this.until===midnight+5000 && now<midnight+5*60000;
+    // Yesterday's quota can still be enforced when the alarm or cron first
+    // runs after UTC midnight. Only these rollover refusals get early checks.
+    const rollover=this.until>=midnight && this.until<=midnight+5000 && now<midnight+30*60000;
     // A negative D1 probe_at denotes a provider-directed hard deadline.
-    const probe=providerWait?-1:rollover?midnight+10*60000:0;
+    const probe=providerWait?-1:rollover?Math.max(midnight+10*60000,now+5*60000):0;
     this.until=until;this.seen=now;this.probeAt=Math.max(probe,0);this.releasedDeadline=0;
     ctx.waitUntil((async()=>{
       try{
@@ -1472,18 +1483,33 @@ class ObjectReadGate {
         this.db.prepare(`INSERT OR IGNORE INTO nh_do_read_state
           SELECT 1,resume_at,0,0,0,0 FROM nh_do_read_limit WHERE id=1 AND resume_at=?`).bind(deadline)
       ]);
-      // Conditional D1 update serializes the one real SQLite read across all
-      // instances, including the case where the provider rejects the fetch.
-      const claim=await this.db.prepare(`UPDATE nh_do_read_state SET claimed=1 WHERE id=1 AND deadline=?
+      // Reserve the next slot before the single-row read so a rejection, lost
+      // response or cold start cannot consume all recovery opportunities.
+      // Only rollover checks have follow-ups. The operator's legacy probe is once.
+      const midnight=Math.floor(now/86400000)*86400000;
+      const nextProbe=manual?0:[30,90].map(m=>midnight+m*60000).find(at=>at>=now+10*60000)||0;
+      const terminal=nextProbe?0:1;
+      const claim=await this.db.prepare(`UPDATE nh_do_read_state SET claimed=?,probe_at=? WHERE id=1 AND deadline=?
         AND released=0 AND claimed=0 AND ((seen=0 AND ?=1) OR (probe_at>0 AND probe_at<=? AND ?=0)) RETURNING seen`)
-        .bind(deadline,+manual,now,+manual).first();
-      this.probeAt=0;
+        .bind(terminal,nextProbe,deadline,+manual,now,+manual).first();
+      this.probeAt=claim?nextProbe:0;
       if(!claim)return false;
-      const result=await stub520(env).fetch(new Request('https://scheduler.internal/quota/read-probe',{method:'POST'}));
-      if(!result.ok)return false;
-      const cleared=await this.db.prepare(`UPDATE nh_do_read_state SET released=1,seen=MAX(seen+1,?),probe_at=0
-        WHERE id=1 AND deadline=? AND seen=? AND claimed=1 AND released=0 RETURNING seen`)
-        .bind(Date.now(),deadline,claim.seen).first();
+      const result=await stub520(env).fetch(new Request('https://scheduler.internal/quota/read-probe',{method:'POST'})).catch(quotaProbeFailure);
+      if(!result.ok){
+        const wait=retryDelay16929(result.headers.get('Retry-After'));
+        const retryAt=Date.now()+wait;
+        if(wait && ((nextProbe && retryAt>nextProbe) || retryAt>deadline)){
+          const next=nextProbe && retryAt<deadline?retryAt:-1;
+          const held=await this.db.prepare(`UPDATE nh_do_read_state SET deadline=MAX(deadline,?),seen=MAX(seen+1,?),probe_at=?,claimed=?
+            WHERE id=1 AND deadline=? AND seen=? AND claimed=? AND probe_at=? AND released=0 RETURNING deadline,seen`)
+            .bind(retryAt,Date.now(),next,+(next<0),deadline,claim.seen,terminal,nextProbe).first();
+          if(held){this.until=held.deadline;this.seen=held.seen;this.probeAt=Math.max(next,0);}
+        }
+        return false;
+      }
+      const cleared=await this.db.prepare(`UPDATE nh_do_read_state SET released=1,seen=MAX(seen+1,?),probe_at=0,claimed=1
+        WHERE id=1 AND deadline=? AND seen=? AND claimed=? AND probe_at=? AND released=0 RETURNING seen`)
+        .bind(Date.now(),deadline,claim.seen,terminal,nextProbe).first();
       if(!cleared)return false;
       this.until=0;this.seen=cleared.seen;this.releasedDeadline=deadline;
       return true;
@@ -1515,7 +1541,7 @@ export class NoteScheduler {
       try{
         const [table]=this.ctx.storage.sql.exec("SELECT name FROM sqlite_schema WHERE type='table' LIMIT 1").toArray();
         if(!table?.name)return new Response(null,{status:503});
-      }catch{return new Response(null,{status:503});}
+      }catch(error){return quotaProbeFailure(error);}
       this.readGate.refreshAt=0;
       return new Response(null,{status:204});
     }
@@ -1621,7 +1647,14 @@ export class NoteScheduler {
             // Use a separate alarm invocation from an ordinary account run so
             // its request budget is not combined with the production probe.
             if(!due)await this.desk.pumpProductionTest16920();
-          }else this.ctx.waitUntil(this.startDeskTick16916(true).catch(()=>{}));
+          }else{
+            // The cached zero skips idle alarms; an evicted object restores its turn inside the guarded task.
+            const joinAt=this.desk.accountJoinAt;
+            if(joinAt===undefined || (joinAt>0 && joinAt<=Date.now())){
+              this.ctx.waitUntil(this.desk.task520('参加申請・招待の承認',()=>this.desk.joinTick520(Date.now(),null,true)));
+            }
+            this.ctx.waitUntil(this.startDeskTick16916(true).catch(()=>{}));
+          }
         }
         catch {console.error('note-helper: desk fallback deferred');}
       }
@@ -1994,7 +2027,7 @@ async function inNoteBrowser(binding,cookie,allowEditor,action,requestTrace=null
     return denied || retry>0?{code:denied,message:'note側で待機・操作結果は未確認',hold:Math.max(2*HOUR,retry)}:{message:stage+'を完了できず・再確認待ち'};
   } finally {
     try {socket?.close();} catch {}
-    if(session?.sessionId)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
+    if(session?.sessionId)await boundedBrowserCall16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
 }
 
@@ -3103,7 +3136,16 @@ class Desk520 {
   }
   async measure(now) {
     this.rows("UPDATE desk_sample SET state='欠測' WHERE state='待機' AND due<=?",now-WINDOW520);
-    const due=this.rows("SELECT s.seq,s.age,s.due,w.article FROM desk_sample s JOIN desk_entries w ON w.seq=s.seq WHERE s.state='待機' AND s.due<=? AND s.last_try<=? ORDER BY s.last_try,s.due,s.seq LIMIT 8",now,now-2*M520);
+    // Look up only due samples. A work gets its release's negative sequence once linked.
+    const due=this.rows(`WITH pending AS MATERIALIZED (
+        SELECT seq,age,due,last_try FROM desk_sample WHERE state='待機' AND due<=? AND last_try<=?
+      ), articles AS (
+        SELECT p.*,w.article FROM pending p CROSS JOIN desk_work w ON w.seq=p.seq
+        WHERE w.pub IS NOT NULL AND NOT EXISTS (SELECT 1 FROM desk_release r WHERE r.article=w.article)
+        UNION ALL
+        SELECT p.*,r.article FROM pending p CROSS JOIN desk_release r ON r.id=-p.seq
+        LEFT JOIN desk_work w ON w.article=r.article WHERE w.seq IS NULL OR w.pub IS NOT NULL
+      ) SELECT seq,age,due,article FROM articles ORDER BY last_try,due,seq LIMIT 8`,now,now-2*M520);
     // Independent public reads in small batches; leave capacity for the existing watchdog.
     for(let i=0;i<due.length;i+=4) {
       await Promise.all(due.slice(i,i+4).map(async s=>{
@@ -3386,7 +3428,8 @@ class Desk520 {
   archiveFits(article,magazines,now) {
     if(!article.verified || article.verified<now-8*D520)return [];
     const genre=article.work_genre??article.genre,chars=article.work_chars??article.chars;
-    return magazines.filter(({p})=>
+    const candidates=typeof magazines==='function'?magazines():magazines;
+    return candidates.filter(({p})=>
       validPolicy16928(p) && (genre?p.genres.includes(genre):genre520.every(g=>p.genres.includes(g))) &&
       (article.method?p.methods.includes(article.method):method520.every(m=>p.methods.includes(m))) &&
       (chars!==null?chars>=p.min && chars<=p.max:p.min===0 && p.max===1000000));
@@ -3394,12 +3437,13 @@ class Desk520 {
   planArchive(now) {
     const rev=this.one('SELECT rev FROM desk_pick_meta WHERE id=1').rev;
     const keys=this.rows('SELECT article FROM desk_archive WHERE pick_rev<? ORDER BY pick_rev,article LIMIT 8',rev);
-    if(keys.length<8)keys.push(...this.rows('SELECT article FROM desk_archive WHERE pick_due<=? AND pick_rev=? ORDER BY pick_due,article LIMIT ?',now,rev,8-keys.length));
+    // Once older revisions are exhausted, the next due time is more selective than the shared revision.
+    if(keys.length<8)keys.push(...this.rows('SELECT article FROM desk_archive INDEXED BY desk_archive_pick_due WHERE pick_due<=? AND pick_rev=? ORDER BY pick_due,article LIMIT ?',now,rev,8-keys.length));
     const fresh=this.circulationTry16932(()=>this.rows(`SELECT article FROM desk_archive WHERE pub BETWEEN ? AND ? AND verified>0 AND mag_at=0
       AND (pick_rev<? OR pick_due<=?) ORDER BY pub DESC,article LIMIT 2`,now-3*D520,now,rev,now),[]);
     if(fresh.length)keys.splice(0,keys.length,...[...new Map([...fresh,...keys].map(r=>[r.article,r])).values()].slice(0,8));
     if(!keys.length)return;
-    const mags=this.eligibleMags(now);
+    const mags=this.batchMagazines(now);
     for(const {article} of keys){
       const row=this.one(`SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?`,article);
       const fits=this.placementCandidates16918(row,mags,now);
@@ -3430,6 +3474,11 @@ class Desk520 {
       AND role.mode='auto' AND role.checked>? ORDER BY m.url`,now-60*D520,now-2*D520)
       .flatMap(m=>{try{const p=JSON.parse(m.policy);return validPolicy16928(p)?[{...m,p}]:[];}catch{return [];}}).sort((a,b)=>a.p.genres.length-b.p.genres.length ||
         (a.p.max-a.p.min)-(b.p.max-b.p.min) || b.recent-a.recent || a.url.localeCompare(b.url));
+  }
+  // A synchronous planner reads magazine eligibility once, only if a verified work needs it.
+  batchMagazines(now) {
+    let magazines;
+    return ()=>(magazines??=this.eligibleMags(now));
   }
 
   rememberMagazine(link,label) {
@@ -3629,12 +3678,14 @@ class Desk520 {
     }
     if(!id)return null;
     const rows=await this.env.DB.batch(SLOTS.map(slot=>sql(scoped(this.env,slot),
-      'SELECT c.lease,c.next_at,h.kind,n.hold_until FROM nh_control c JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1 AND c.account=?',slot,id)));
+      `SELECT c.lease,c.next_at,c.enabled,c.inflight<>'' AS pending,h.kind,n.hold_until FROM nh_control c
+        JOIN nh_health h ON h.id=c.id JOIN nh_v13_connection n ON n.slot=? WHERE c.id=1 AND c.account=?`,slot,id)));
     const matches=SLOTS.filter((_,i)=>rows[i].results.length===1);
     if(matches.length!==1)return null;
     const slot=matches[0],gate=rows[SLOTS.indexOf(slot)].results[0];
     const hold=Math.max(gate.hold_until,gate.kind?gate.next_at:0);
-    return {id,slot,hold,until:Math.max(gate.lease,hold)};
+    const patrolFirst=!!this.env[PATROL_LOCAL16931] && !!gate.enabled && (gate.pending || gate.next_at<=Date.now()+PATROL_HEAD_START);
+    return {id,slot,hold,until:Math.max(gate.lease,hold),patrolFirst};
   }
   rememberDraftMetadata(n,key){
     this.rows('UPDATE desk_link_plan SET title=? WHERE article=? AND pub IS NULL',n.name,key);
@@ -3748,7 +3799,7 @@ class Desk520 {
     if(!lease)return '520が処理中です。';
     try {
       const credential=await loadCookie(env,account.id);
-      const result=await browserDelivery(this.env.BROWSER,account.id,cleanCookie(credential.NOTE_SESSION),preview,async()=>false);
+      const result=await browserDelivery(browserPurpose16916(this.env.BROWSER,'preview'),account.id,cleanCookie(credential.NOTE_SESSION),preview,async()=>false);
       if(result.hold){
         const until=Date.now()+result.hold;
         this.rows('UPDATE desk_cfg SET blocked=MAX(blocked,?) WHERE id=1',until);
@@ -4149,7 +4200,7 @@ class Desk520 {
     if(publication)await task('予約作品の公開',()=>this.dispatch(now));
     // A due check that lost the browser to another task gets one turn on
     // the next ordinary tick. Its own gates are checked again before use.
-    const joinTurn=!publication && this.one('DELETE FROM desk_join_turn WHERE id=1 AND due<=? RETURNING id',now);
+    const joinTurn=!publication && this.one('DELETE FROM desk_join_turn WHERE id=? AND due<=? RETURNING id',JOIN_BROWSER_TURN,now);
     if(joinTurn)await checkJoins();
     await Promise.allSettled([
       task('作品とフォロワーの記録',()=>this.tickRecords()),
@@ -4561,6 +4612,12 @@ function deskRecordText(s) {
     lines.push('【自動処理の確認】',r.message,'最終開始 '+tm(r.started)+' ／ 最終巡回完了 '+tm(r.finished)+(r.fallback?' ／ 補助起動による確認':''));
     if(b)lines.push('ブラウザー：'+(b.hold_until>Date.now()?(BROWSER_WAIT16916[b.reason]||BROWSER_WAIT16916.startup)+' ／ '+tm(b.hold_until)+'以降':b.lease>Date.now()?'処理中':b.next_at>Date.now()?'起動間隔待ち ／ '+tm(b.next_at)+'以降':b.background_retry_at>Date.now()?'予約公開の共通待機終了':'起動待機なし')+' ／ 最終起動 '+tm(b.started));
     if(b?.background_retry_at>Date.now() && b.background_retry_at>b.hold_until)lines.push('ブラウザーの通常処理：回数制限が続いたため '+tm(b.background_retry_at)+' 以降に再試行');
+    if(b?.budget){
+      const value=b.budget,sec=ms=>Math.ceil(ms/1000);
+      lines.push('ブラウザー時間（UTC日別・アプリの計画値） 使用見積もり '+sec(value.used_ms)+'秒 ／ 目安 '+sec(BROWSER_TIME16943.daily)+'秒、うち予約公開等の余裕 '+sec(BROWSER_TIME16943.reserve)+'秒',
+        '通常 '+sec(value.normal_ms)+'／'+sec(BROWSER_TIME16943.normal.share)+'秒'+(value.normal_retry_at>Date.now()?'（補充 '+tm(value.normal_retry_at)+'）':'')+
+        ' ／ 共同誌の自動参加確認 '+sec(value.join_ms)+'／'+sec(BROWSER_TIME16943.join.share)+'秒'+(value.join_retry_at>Date.now()?'（補充 '+tm(value.join_retry_at)+'）':''));
+    }
   }
   if(s.audience)lines.push(networkRecord16922(s.audience));
   if(s.repeat)lines.push(repeatRecord16923(s.repeat));
@@ -5450,11 +5507,16 @@ Object.assign(Desk520.prototype,{
     const n=(await this.publicRead('https://note.com/api/v3/notes/'+target.article,'json'))?.data;
     return joinFree520(payload,html,target,n);
   },
-  rememberJoinTurn(due){
-    this.rows('INSERT INTO desk_join_turn(id,due) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET due=MAX(due,excluded.due)',due);
+  rememberJoinTurn(due,turn=JOIN_BROWSER_TURN){
+    this.rows('INSERT INTO desk_join_turn(id,due) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET due=MAX(due,excluded.due)',turn,due);
+    if(turn===JOIN_ACCOUNT_TURN)this.accountJoinAt=Math.max(this.accountJoinAt||0,due);
   },
-  async joinTickUnlocked16920(now,probe=null) {
-    const wait=browserWait16916(this.env.BROWSER);
+  accountJoinDue16943(){
+    return this.accountJoinAt??=(this.one('SELECT due FROM desk_join_turn WHERE id=?',JOIN_ACCOUNT_TURN)?.due||0);
+  },
+  async joinTickUnlocked16920(now,probe=null,retryingAccount=false) {
+    const browser=browserPurpose16916(this.env.BROWSER,probe?'normal':'join');
+    const wait=browserWait16916(browser);
     if(wait && (probe || !['spacing','busy'].includes(wait.browserReason)))return;
     const cfg=this.one('SELECT * FROM desk_join_cfg WHERE id=1');
     if((!probe && cfg.due>now) || !this.joinActive520(''))return;
@@ -5495,6 +5557,19 @@ Object.assign(Desk520.prototype,{
       const kind=pending?'invite':row.phase==='joined'||row.phase==='accepting'||(recent && recent.at>=now-2*HOUR)?'verify':row.phase==='wait'?'apply':'check';
       if(kind==='apply' && (this.one('SELECT applications FROM desk_join_budget WHERE day=?',today)?.applications||0)>=DISTRIBUTION16918.applications){message='本日の参加申請枠を使用済み・翌日に続けます';due=jstStart(today)+D520+M520;return;}
       if(kind==='apply' && target.restricted){reason='eligibility';message='AI生成文・応募中作品・R18の条件があるため自動申請対象外。作品の資格を未確認です。待機時間だけでは申請に進みません';due=now+7*D520;return;}
+      const accountInfo=await this.deliveryAccount();
+      if(!accountInfo || accountInfo.hold>Date.now()){reason='account_wait';message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.hold+M520):now+2*HOUR;return;}
+      if(row.account && row.account!==accountInfo.id){message='登録時の520本人と一致せず・操作を保留';return;}
+      const waitForPatrol=()=>{
+        reason='account_busy';message='520の処理終了を確認待ち';due=Date.now()+4*M520;
+        if(!probe)this.storage.transactionSync(()=>{
+          // A continuously occupied account gets one early handoff and then the ordinary cadence.
+          const next=retryingAccount?now+15*M520:due;
+          if(!retryingAccount)this.rows('UPDATE desk_join_cfg SET due=? WHERE id=1 AND due=?',next,now+15*M520);
+          this.rememberJoinTurn(next,JOIN_ACCOUNT_TURN);
+        });
+      };
+      if(accountInfo.until>Date.now() || accountInfo.patrolFirst){waitForPatrol();return;}
       const sources=await Promise.allSettled([
         this.publicRead('https://note.com/api/v1/magazines/'+target.id,'json'),
         this.publicRead(target.url,'html'),
@@ -5515,11 +5590,19 @@ Object.assign(Desk520.prototype,{
         message='現在の募集方法を照合できず・参加申請を保留：'+(failed.length?failed.join('・')+'の取得に失敗。条件不一致とは判定していません':failure.detail);
         due=now+(failed.length || reason==='recruitment_response'?2*HOUR:D520);return;
       }
-      const accountInfo=await this.deliveryAccount();
-      if(!accountInfo || accountInfo.until>Date.now()){reason='account_wait';message='520本人の接続・待機の終了を確認待ち';due=accountInfo?Math.max(now+4*M520,accountInfo.until+M520):now+2*HOUR;return;}
-      if(row.account && row.account!==accountInfo.id){message='登録時の520本人と一致せず・操作を保留';return;}
+      const stillActive=()=>{
+        if(this.joinActive520(target.id))return true;
+        const blocked=this.one('SELECT blocked FROM desk_cfg WHERE id=1').blocked;
+        reason=blocked>Date.now()?'server_wait':'inactive';
+        message=reason==='server_wait'?'通信の指定待機中・参加確認を保留':'自動確認の停止・対象誌の除外により参加確認を保留';
+        due=Math.max(blocked,Date.now()+4*M520);
+        return false;
+      };
+      const hash=note?.data?await draftBodyHash(note.data.body):null;
+      // A source may have set a wait or an operator may have stopped the job during the reads.
+      if(!stillActive())return;
       env=scoped(this.env,accountInfo.slot);lease=await acquireBackground16931(env);
-      if(!lease){message='520の処理終了を確認待ち';due=now+4*M520;return;}
+      if(!lease){waitForPatrol();return;}
       const credential=await loadCookie(env,accountInfo.id);
       let link=null;
       if(kind==='invite') {
@@ -5533,10 +5616,11 @@ Object.assign(Desk520.prototype,{
         const t=Date.now();
         return !!c && c.account===accountInfo.id && c.token===lease && c.lease>t && c.hold_until<=t && (!c.kind || c.next_at<=t);
       };
+      if(!stillActive())return;
       const marker=crypto.randomUUID();
       this.rows('UPDATE desk_join_cfg SET day=?,used=? WHERE id=1',today,used+1);
-      const result=await browserJoin520(this.env.BROWSER,accountInfo.id,cleanCookie(credential.NOTE_SESSION),
-        {kind,phase:row.phase,target:target.id,definition:target,feeNote:note?.data,feeHtml:html||'',hash:note?.data?await draftBodyHash(note.data.body):null,url:link,
+      const result=await browserJoin520(browser,accountInfo.id,cleanCookie(credential.NOTE_SESSION),
+        {kind,phase:row.phase,target:target.id,definition:target,feeNote:note?.data,feeHtml:html||'',hash,url:link,
           steps:Object.fromEntries(this.rows('SELECT step,at FROM desk_join_steps WHERE id=?',target.id).map(r=>[r.step,r.at]))},async(step=null)=>{
           if(!await live())return false;
           return this.storage.transactionSync(()=>{
@@ -6499,7 +6583,7 @@ async function readTuta520(binding,credential,callbacks) {
   }
   finally {
     try{socket?.close();}catch{}
-    if(session)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
+    if(session)await boundedBrowserCall16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
 }
 
@@ -6821,7 +6905,7 @@ async function readObservation1698(binding,jobs) {
   }
   finally {
     clearTimeout(deadline);try{socket?.close();}catch{}
-    if(session)await boundedClose16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
+    if(session)await boundedBrowserCall16916(()=>binding.closeSession(session.sessionId)).catch(()=>{});
   }
   return {results,hold,denied};
 }
@@ -7219,9 +7303,10 @@ async function outreachOpportunity16910(env,state,settings,token,ownIds,markSend
   const now=Date.now(),utc=Math.floor(now/(24*HOUR));
   const [states,discoveries]=await env.DB.batch([sql(env,'SELECT * FROM nh_v16910_state WHERE slot=?',env.SLOT),sql(env,'SELECT * FROM nh_v1697_discovery WHERE slot=?',env.SLOT)]);
   const s=states.results[0],d=discoveries.results[0];
+  if(!s.pending && (d.pending || d.due>now))return null;
   const deferred=browserWait16916(env.BROWSER);
   if(deferred)return s.pending?{handled:true,message:'前回操作は再送せず・'+deferred.message}:null;
-  if(d.pending || (!s.pending && d.due>now))return null;
+  if(d.pending)return null;
   let job=s.pending?await sql(env,'SELECT * FROM nh_v16910_actions WHERE key=? AND slot=?',s.pending,env.SLOT).first():null;
   if(s.pending && !job)throw new Trouble('追加操作の確認記録を読み出せません','config');
   if(job){job.recover=true;markSending();}
@@ -7903,8 +7988,11 @@ Object.assign(Desk520.prototype,{
   },
   trafficView16913(){
     const row=this.one('SELECT * FROM desk_traffic16913 WHERE id=1');
-    const payload=savedJson16936(row.payload,null,p=>!!p&&!Array.isArray(p)&&Object.hasOwn(p,'current')&&(!p.current||trafficValid16913(p.current))&&(!p.previous||trafficValid16913(p.previous)));
-    return {...row,message:payload?row.message:'保存されたアクセス集計を読み戻せず・再取得待ち',payload:payload||{current:null,previous:null}};
+    const payload=savedJson16936(row.payload,null,p=>p!==null&&typeof p==='object'&&!Array.isArray(p));
+    if(payload && trafficValid16913(payload.current) && (payload.previous==null || trafficValid16913(payload.previous)))return {...row,payload};
+    // Before the first successful collection, each attempt only updates the reason and deadline.
+    const awaitingFirst=row.checked===0 && payload && Object.keys(payload).length===0;
+    return {...row,message:awaitingFirst?row.message:'保存されたアクセス集計を読み戻せず・再取得待ち',payload:{current:null,previous:null}};
   }
 });
 function trafficRecord16913(row) {
@@ -8095,7 +8183,7 @@ async function auxRecord16917(env){
 class BrowserWait16916 extends Error {
   constructor(reason,at) { super('browser deferred');this.reason=reason;this.at=at; }
 }
-const BROWSER_WAIT16916={spacing:'前のブラウザー起動との間隔待ち',busy:'別のブラウザー処理の終了待ち',publication:'予約作品の公開を優先して待機中',daily:'Cloudflareのブラウザー日次枠の更新待ち',rate:'Cloudflareのブラウザー回数制限・再試行待ち',startup:'Cloudflareのブラウザー起動を確認できず・再試行待ち',storage:'ブラウザーの予約記録を確認できず・再試行待ち'};
+const BROWSER_WAIT16916={budget:'ブラウザーの計画使用枠の補充待ち',spacing:'前のブラウザー起動との間隔待ち',busy:'別のブラウザー処理の終了待ち',publication:'予約作品の公開を優先して待機中',daily:'Cloudflareのブラウザー日次枠の更新待ち',rate:'Cloudflareのブラウザー回数制限・再試行待ち',startup:'Cloudflareのブラウザー起動を確認できず・再試行待ち',storage:'ブラウザーの予約記録を確認できず・再試行待ち'};
 function browserDeferred16916(error) {
   return error instanceof BrowserWait16916?{browserDeferred:true,browserReason:error.reason,retryAt:error.at,message:BROWSER_WAIT16916[error.reason]||BROWSER_WAIT16916.startup}:null;
 }
@@ -8117,9 +8205,9 @@ function browserWait16916(binding,purpose) {
 function browserPurpose16916(binding,purpose) {
   return LOCAL_BROWSERS16921.get(binding)?.purpose(purpose)||binding;
 }
-function boundedClose16916(work) {
+function boundedBrowserCall16916(work,timeout=5000) {
   let timer;
-  return Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('close timeout')),5000);})]).finally(()=>clearTimeout(timer));
+  return Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('browser binding timeout')),timeout);})]).finally(()=>clearTimeout(timer));
 }
 function browserDailyTimeLimit(detail){
   let messages=[detail];
@@ -8160,9 +8248,42 @@ async function acquireBrowserWithRetryInfo(raw,options){
   try{return JSON.parse(await read520body(response,8192));}
   catch{throw Error('Invalid browser acquisition response');}
 }
+// Application planning targets in milliseconds, independent of provider entitlements.
+// Normal/automatic joins earn separate shares through the UTC day. A real due
+// publication still obeys the common lease, launch interval and provider waits.
+const BROWSER_TIME16943={
+  daily:600000,reserve:90000,minimum:10000,sampleInterval:30*M520,
+  normal:{share:360000,burst:60000},join:{share:150000,burst:45000}
+};
+function browserTime16943(row,now){
+  const day=Math.floor(now/D520)*D520, current=row.budget_day===day;
+  const usage={day,used:current?row.budget_used:0,normal:current?row.budget_normal:0,join:current?row.budget_join:0};
+  // Include elapsed time for an open session in status reads. If the isolate
+  // disappears, the next admission persists this charge once with token takeover.
+  if(row.token && row.budget_purpose)
+    chargeBrowserTime16943(usage,row.budget_purpose,row.started,Math.min(now,row.lease));
+  if(row.budget_sampled>=day)usage.used=Math.max(usage.used,row.budget_provider);
+  return usage;
+}
+function chargeBrowserTime16943(usage,purpose,start,end){
+  const day=Math.floor(end/D520)*D520;
+  if(day>usage.day)Object.assign(usage,{day,used:0,normal:0,join:0});
+  const measured=Math.max(0,end-Math.max(start,usage.day));
+  usage.used+=measured;
+  if(purpose!=='publish')usage[purpose==='join'?'join':'normal']+=measured;
+}
+function browserBudgetRetry16943(usage,purpose,now){
+  if(purpose==='publish')return 0;
+  const plan=BROWSER_TIME16943,group=purpose==='join'?'join':'normal';
+  const {share,burst}=plan[group], needed=usage[group]+plan.minimum;
+  if(usage.used+plan.minimum>plan.daily-plan.reserve||needed>share)return usage.day+D520;
+  if(purpose==='preview')return 0;
+  const at=usage.day+Math.ceil((needed-burst)*D520/(share-burst));
+  return at>now?at:0;
+}
 function coordinatedBrowser16916(raw,storage,priority=()=>false) {
   if(LOCAL_BROWSERS16921.has(raw)||typeof raw?.acquire!=='function')return raw;
-  let ready=false;
+  let ready=false,sampling=null;
   const sessions=new Map();
   const rows=(q,...a)=>objectRows(storage,q,...a);
   const one=(q,...a)=>rows(q,...a)[0];
@@ -8175,6 +8296,14 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
       if(!Object.hasOwn(s,'rate_backoff_ms')){
         rows('ALTER TABLE desk_browser16916 ADD COLUMN rate_backoff_ms INTEGER NOT NULL DEFAULT 0');
         s.rate_backoff_ms=0;
+      }
+      if(!Object.hasOwn(s,'budget_day')){
+        for(const column of ['budget_day','budget_used','budget_normal','budget_join','budget_sampled','budget_provider']){
+          rows('ALTER TABLE desk_browser16916 ADD COLUMN '+column+' INTEGER NOT NULL DEFAULT 0');
+          s[column]=0;
+        }
+        rows("ALTER TABLE desk_browser16916 ADD COLUMN budget_purpose TEXT NOT NULL DEFAULT ''");
+        s.budget_purpose='';
       }
       return s;
     });
@@ -8190,24 +8319,48 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
     else if(s.lease>now){reason='busy';at=s.lease;}
     else if(s.next_at>now){reason='spacing';at=s.next_at;}
     else if(purpose!=='publish' && s.reason==='rate' && s.started+s.rate_backoff_ms>now){reason='rate';at=s.started+s.rate_backoff_ms;}
-    else if(purpose!=='publish'&&priority()){reason='publication';at=now+60000;}
+    else if(purpose!=='publish'){
+      at=browserBudgetRetry16943(browserTime16943(s,now),purpose,now);
+      if(at)reason='budget';
+      else if(priority()){reason='publication';at=now+60000;}
+    }
     return reason?browserDeferred16916(new BrowserWait16916(reason,at)):null;
+  };
+  const refreshUsage=async now=>{
+    const day=Math.floor(now/D520)*D520;
+    let measured=0;
+    try{
+      const value=(await boundedBrowserCall16916(()=>raw.limits(),2000))?.usedBrowserTimeSeconds;
+      if(Number.isFinite(value)&&value>=0&&Number.isSafeInteger(Math.ceil(value*1000)))measured=Math.ceil(value*1000);
+    }catch{ /* A failed sample leaves the persisted measurement and local charges intact. */ }
+    if(Math.floor(Date.now()/D520)*D520===day)
+      rows('UPDATE desk_browser16916 SET budget_provider=MAX(CASE WHEN budget_sampled>=? THEN budget_provider ELSE 0 END,?),budget_sampled=? WHERE id=1',day,measured,Date.now());
   };
   const binding=purpose=>{const wrapped={
     available16916:(kind=purpose)=>available(kind),purpose16916:binding,
     state16916:()=>{
-      const {next_at,hold_until,lease,started,closed,reason,attempts,sessions,rate_backoff_ms}=state();
-      return {next_at,hold_until,lease,started,closed,reason,attempts,sessions,background_retry_at:rate_backoff_ms?started+rate_backoff_ms:0};
+      const row=state(),now=Date.now(),usage=browserTime16943(row,now);
+      const {next_at,hold_until,lease,started,closed,reason,attempts,sessions,rate_backoff_ms}=row;
+      return {next_at,hold_until,lease,started,closed,reason,attempts,sessions,background_retry_at:rate_backoff_ms?started+rate_backoff_ms:0,
+        budget:{used_ms:usage.used,normal_ms:usage.normal,join_ms:usage.join,normal_retry_at:browserBudgetRetry16943(usage,'normal',now),join_retry_at:browserBudgetRetry16943(usage,'join',now)}};
     },
     devtools:raw.devtools,
     connectSession:(...args)=>raw.connectSession(...args),
     async acquire(options){
-      const s=state();
-      const wait=available(purpose,s);if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
-      const at=Date.now(),token=crypto.randomUUID();
+      let s=state(),wait=available(purpose,s);
+      if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
+      const check=Date.now();
+      if(typeof raw.limits==='function' && (s.budget_sampled<Math.floor(check/D520)*D520 || check-s.budget_sampled>=BROWSER_TIME16943.sampleInterval)){
+        sampling ||= refreshUsage(check).finally(()=>{sampling=null;});
+        await sampling;
+        s=state();wait=available(purpose,s);
+        if(wait)throw new BrowserWait16916(wait.browserReason,wait.retryAt);
+      }
+      const at=Date.now(),token=crypto.randomUUID(),usage=browserTime16943(s,at);
       // Reserve synchronously before yielding. An interrupted isolate leaves a
       // finite lease, while the provider's 15-second keepAlive closes its session.
-      rows("UPDATE desk_browser16916 SET next_at=?,lease=?,token=?,started=?,attempts=attempts+1 WHERE id=1",at+21000,at+4*60000,token,at);
+      rows("UPDATE desk_browser16916 SET next_at=?,lease=?,token=?,started=?,attempts=attempts+1,budget_day=?,budget_used=?,budget_normal=?,budget_join=?,budget_purpose=? WHERE id=1",
+        at+21000,at+4*60000,token,at,usage.day,usage.used,usage.normal,usage.join,purpose);
       let session;
       try {
         session=await acquireBrowserWithRetryInfo(raw,options);
@@ -8216,13 +8369,13 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
         if(held?.token!==token||held.lease<=Date.now())
           throw new BrowserWait16916('busy',Math.max(Date.now()+21000,held?.lease||0));
         rows("UPDATE desk_browser16916 SET sessions=sessions+1,reason='',rate_backoff_ms=0 WHERE id=1 AND token=?",token);
-        sessions.set(session.sessionId,token);
+        sessions.set(session.sessionId,{token,usage,at,purpose});
         return session;
       }catch(error){
         // A session may already exist even though its local bookkeeping failed.
         // The caller has not received it and cannot perform this cleanup.
         const created=typeof session?.sessionId==='string'&&!!session.sessionId;
-        if(created)await boundedClose16916(()=>raw.closeSession(session.sessionId)).catch(()=>{});
+        if(created)await boundedBrowserCall16916(()=>raw.closeSession(session.sessionId)).catch(()=>{});
         const text=errorText(error);
         const daily=browserDailyTimeLimit(text);
         const rate=Number(error?.status??error?.statusCode??error?.code)===429||/\b429\b|too many|rate.?limit|concurrent.*limit/i.test(text);
@@ -8236,7 +8389,9 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
         let until=Math.max(failed+M520,failed+providerDelay,daily?(Math.floor(failed/D520)+1)*D520+5000:0,
           error instanceof BrowserWait16916?error.at:0,backoff && earlyPublish?failed+5*M520+1:0);
         try{
-          rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=?,rate_backoff_ms=? WHERE id=1 AND token=?",until,reason,backoff,token);
+          chargeBrowserTime16943(usage,purpose,at,failed);
+          rows("UPDATE desk_browser16916 SET hold_until=MAX(hold_until,?),lease=0,token='',reason=?,rate_backoff_ms=?,budget_day=?,budget_used=?,budget_normal=?,budget_join=?,budget_purpose='' WHERE id=1 AND token=?",
+            until,reason,backoff,usage.day,usage.used,usage.normal,usage.join,token);
           if(purpose!=='publish')until=Math.max(until,at+backoff);
         }
         catch{reason='storage';until=Math.max(until,at+4*60000);}
@@ -8244,11 +8399,21 @@ function coordinatedBrowser16916(raw,storage,priority=()=>false) {
       }
     },
     async closeSession(id){
-      const token=sessions.get(id);let closed=false;
-      try {await boundedClose16916(()=>raw.closeSession(id));closed=true;}
+      const held=sessions.get(id);let closed=false;
+      try {await boundedBrowserCall16916(()=>raw.closeSession(id));closed=true;}
       finally {
         sessions.delete(id);
-        if(token)rows("UPDATE desk_browser16916 SET lease=0,token='',closed=?,next_at=MAX(next_at,?) WHERE id=1 AND token=?",Date.now(),closed?0:Date.now()+21000,token);
+        if(held){
+          const now=Date.now(),{token,usage,at,purpose}=held;
+          if(closed){
+            chargeBrowserTime16943(usage,purpose,at,now);
+            rows("UPDATE desk_browser16916 SET lease=0,token='',closed=?,budget_day=?,budget_used=?,budget_normal=?,budget_join=?,budget_purpose='' WHERE id=1 AND token=?",
+              now,usage.day,usage.used,usage.normal,usage.join,token);
+          }else{
+            // Keep the token so takeover accounts for the provider's idle timeout.
+            rows("UPDATE desk_browser16916 SET lease=?,closed=?,next_at=MAX(next_at,?) WHERE id=1 AND token=?",now+15000,now,now+21000,token);
+          }
+        }
       }
     }
   };
@@ -8366,12 +8531,12 @@ Object.assign(Desk520.prototype,{
         (!job || job.phase==='wait' && (job.next<=now || activeTarget===link.id));
     });
   },
-  eligiblePlacement(key,now,activeTarget=null,magazines=null){
+  eligiblePlacement(key,now,activeTarget=null,magazines=this.batchMagazines(now)){
     const a=this.one('SELECT a.*,w.genre work_genre,w.chars work_chars,w.method FROM desk_archive a LEFT JOIN desk_work w ON w.article=a.article WHERE a.article=?',key);
     if(!a?.choice || a.title.trim()==='521' || !activeTarget && a.mag_due>now)return null;
     const pacing=this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1');
     if(pacing.mag_next>now)return null;
-    const mag=this.chooseMagazine520(this.placementCandidates16918(a,magazines??this.eligibleMags(now),now,activeTarget),a.work_genre||a.genre,now,a);
+    const mag=this.chooseMagazine520(this.placementCandidates16918(a,magazines,now,activeTarget),a.work_genre||a.genre,now,a);
     const link=noteLink161(mag?.url);
     if(!link || link.owner==='43__')return null;
     const prior=this.one("SELECT subject FROM desk_job WHERE kind='mag' AND article=? AND target=?",key,link.id);
@@ -8382,14 +8547,14 @@ Object.assign(Desk520.prototype,{
   nextPlacement(now,oldFirst){
     if(this.one('SELECT mag_next FROM desk_distribution16918 WHERE id=1').mag_next>now)return null;
     // Least recently circulated works go first. New works and backlist alternate.
-    let magazines; // One synchronous selection only. The pre-send check reads eligibility again.
+    const magazines=this.batchMagazines(now);
     for(const old of [oldFirst,!oldFirst]){
       const keys=this.circulationTry16932(()=>this.circulationCandidates16932(now,old))||
         this.rows('SELECT article FROM desk_archive WHERE choice IS NOT NULL AND mag_due<=? AND pub '+(old?'<=?':'>?')+
           ' ORDER BY mag_at,'+(old?'pub ASC':'pub DESC')+',article LIMIT 8',now,now-30*D520);
       for(const candidate of keys){
         const {article}=candidate;
-        const job=this.eligiblePlacement(article,now,null,magazines??=this.eligibleMags(now));
+        const job=this.eligiblePlacement(article,now,null,magazines);
         if(job){this.circulationTry16932(()=>this.recordCirculation16932(job,candidate,now));return job;}
         // A blocked publisher cannot monopolize the head of the queue.
         this.rows('UPDATE desk_archive SET mag_due=?,pick_due=MIN(pick_due,?) WHERE article=?',now+HOUR,now+HOUR,article);
@@ -8698,9 +8863,20 @@ Object.assign(Desk520.prototype,{
       throw error;
     }finally{await release(env,lease);}
   },
-  async joinTick520(now,probe=null){
+  async joinTick520(now,probe=null,afterPatrol=false){
     if(this.joinTask16920)return;
-    const work=this.joinTickUnlocked16920(now,probe);this.joinTask16920=work;
+    const due=probe?0:this.accountJoinDue16943();
+    if(!probe){
+      if(afterPatrol && !due)return;
+      // Give the existing two-minute patrol alarm first turn after the four-minute
+      // account wait. An ordinary tick can take over if that alarm was delayed.
+      if(due && now<due+(afterPatrol?0:2*M520))return;
+      if(due){
+        this.rows('DELETE FROM desk_join_turn WHERE id=?',JOIN_ACCOUNT_TURN);
+        this.accountJoinAt=0;
+      }
+    }
+    const work=this.joinTickUnlocked16920(now,probe,!!due);this.joinTask16920=work;
     try{return await work;}finally{if(this.joinTask16920===work)this.joinTask16920=null;}
   },
   async testJoin16920(r){
@@ -10276,6 +10452,8 @@ const BROWSER_SOURCES520 = Object.freeze({
 
 // Ordinary patrol has first claim on an account when its timer is due.
 // Symbols contain only local scheduler state, never a remote RPC binding.
+const PATROL_HEAD_START=30000;
+const JOIN_BROWSER_TURN=1,JOIN_ACCOUNT_TURN=2;
 const PATROL_LOCAL16931=Symbol('patrol-coordinator-16931');
 const PATROL_RELEASE16931=Symbol('patrol-release-16931');
 async function acquireBackground16931(env,urgent=false){

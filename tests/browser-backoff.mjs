@@ -114,6 +114,14 @@ test('explicit provider deadlines and daily quota are observed by all purposes a
   const n=f.attempts();
   await failedAt(f.cold().purpose16916('publish'),reset,'daily');
   assert.equal(f.attempts(),n);
+  t.mock.timers.tick(reset-Date.now());
+  f.reply(null);
+  const resumed=f.cold();
+  assert.equal(resumed.available16916(),null);
+  const session=await resumed.acquire({});
+  assert.equal(session.sessionId,'fixture');
+  assert.equal(f.attempts(),n+1);
+  await resumed.closeSession(session.sessionId);
 });
 
 test('upgrading a legacy gate preserves its deadline, counters and lease',async t => {
